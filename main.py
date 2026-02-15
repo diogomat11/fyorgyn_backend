@@ -55,6 +55,8 @@ app.include_router(jobs.router)
 app.include_router(guias.router)
 app.include_router(logs.router, prefix="/api/logs")
 app.include_router(dashboard.router)
+from routes import workers
+app.include_router(workers.router)
 from routes import pei
 app.include_router(pei.router)
 app.include_router(debug_optimization.router)

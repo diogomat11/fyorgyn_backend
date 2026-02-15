@@ -105,7 +105,23 @@ class Log(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     job_rel = relationship("Job", back_populates="logs")
+    job_rel = relationship("Job", back_populates="logs")
     carteirinha_rel = relationship("Carteirinha", back_populates="logs")
+
+class Worker(Base):
+    __tablename__ = "workers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    hostname = Column(Text, unique=True, nullable=False)
+    status = Column(Text, default="offline") # idle, processing, offline, error
+    last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())
+    current_job_id = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    command = Column(Text, nullable=True) # restart, stop, etc.
+    meta = Column(Text, nullable=True) # JSON string for CPU, RAM, Version
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    current_job = relationship("Job")
 
 # Update relationships in Job and Carteirinha (monkey-patching or manual update below)
 # We need to add 'logs' relationship to Job and Carteirinha classes above.
