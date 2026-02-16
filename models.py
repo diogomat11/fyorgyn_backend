@@ -118,6 +118,7 @@ class Worker(Base):
     current_job_id = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
     command = Column(Text, nullable=True) # restart, stop, etc.
     meta = Column(Text, nullable=True) # JSON string for CPU, RAM, Version
+    first_error_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

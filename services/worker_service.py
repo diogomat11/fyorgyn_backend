@@ -23,6 +23,21 @@ def register_heartbeat(db: Session, hostname: str, status: str, current_job_id: 
     worker.current_job_id = current_job_id
     if meta:
         worker.meta = json.dumps(meta)
+
+    # Auto-Restart Logic for stuck Error state
+    if status == 'error':
+        if not worker.first_error_at:
+            worker.first_error_at = now
+        else:
+            # Check duration
+            diff = now - worker.first_error_at
+            if diff > timedelta(minutes=15):
+                worker.command = "restart"
+                worker.first_error_at = None # Reset timer after queuing restart
+    else:
+        # If status is NOT error (idle, processing), clear the error timer
+        if worker.first_error_at:
+            worker.first_error_at = None
     
     # Check for pending command
     command = worker.command
