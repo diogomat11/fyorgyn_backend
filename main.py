@@ -49,14 +49,19 @@ async def startup_event():
     asyncio.create_task(run_cleanup_loop())
 
 # Include routers
-app.include_router(auth.router, prefix="/auth", tags=["auth"])
-app.include_router(carteirinhas.router)
-app.include_router(jobs.router)
-app.include_router(guias.router)
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(carteirinhas.router, prefix="/api")
+app.include_router(jobs.router, prefix="/api")
+app.include_router(guias.router, prefix="/api")
 app.include_router(logs.router, prefix="/api/logs")
-app.include_router(dashboard.router)
-from routes import workers
-app.include_router(workers.router)
-from routes import pei
-app.include_router(pei.router)
-app.include_router(debug_optimization.router)
+app.include_router(dashboard.router, prefix="/api")
+
+from routes import workers, pei, convenios, prio_rules, metrics, agendamentos, server_configs
+app.include_router(workers.router, prefix="/api")
+app.include_router(pei.router, prefix="/api")
+app.include_router(debug_optimization.router, prefix="/api")
+app.include_router(convenios.router, prefix="/api/convenios", tags=["convenios"])
+app.include_router(prio_rules.router, prefix="/api/priority-rules", tags=["priority-rules"])
+app.include_router(server_configs.router, prefix="/api/server-configs", tags=["server-configs"])
+app.include_router(agendamentos.router, prefix="/api")
+app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])

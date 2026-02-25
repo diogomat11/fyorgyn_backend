@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Log, Carteirinha, Job
 from typing import List, Optional
+from dependencies import get_current_user
 
 router = APIRouter(
     tags=["Logs"]
@@ -14,9 +16,23 @@ def list_logs(
     limit: int = 50, 
     level: Optional[str] = None, 
     job_id: Optional[int] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
 ):
     query = db.query(Log).join(Job, isouter=True).join(Carteirinha, isouter=True)
+    
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(current_user)
+    
+    # Isolation: if current_user has a convenio, filter logs
+    if allowed_ids:
+        query = query.filter(
+            or_(
+                Carteirinha.id_convenio.in_(allowed_ids),
+                Job.id_convenio.in_(allowed_ids)
+            )
+        )
+    
     
     if level:
         query = query.filter(Log.level == level)

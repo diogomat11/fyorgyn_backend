@@ -20,12 +20,6 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             detail="Chave de acesso inválida."
         )
     
-    # Check if active
-    if user.status != "Ativo":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuário inativo."
-        )
 
     # Check validity
     if user.validade and user.validade < datetime.now().date():

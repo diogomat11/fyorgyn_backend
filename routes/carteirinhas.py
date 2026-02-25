@@ -53,9 +53,14 @@ def normalize_header(header):
 async def upload_carteirinhas(
     file: UploadFile = File(...),
     overwrite: bool = Form(False),
+    id_convenio: Optional[int] = Form(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(user)
+    target_convenio = id_convenio if id_convenio else (allowed_ids[0] if allowed_ids else None)
+    
     try:
         contents = await file.read()
         rows = []
@@ -139,6 +144,16 @@ async def upload_carteirinhas(
              pass 
 
         for index, row in enumerate(rows):
+            # ... existing parsing logic ...
+            # Add id_convenio to items
+            item_data = {
+                "carteirinha": str(row.get('Carteirinha', '')).strip(),
+                "paciente": str(row.get('Paciente', '')).strip(),
+                "id_paciente": None, # parsed below
+                "id_pagamento": None, # parsed below
+                "status": row.get('status', 'ativo'),
+                "id_convenio": target_convenio
+            }
             cart_raw = row.get('Carteirinha')
             cart = str(cart_raw).strip() if cart_raw is not None else ""
             
@@ -188,8 +203,18 @@ async def upload_carteirinhas(
         count_added = 0
         count_updated = 0
         
+
+        from models import Convenio
+        valid_convenios = {c.id_convenio for c in db.query(Convenio).all()}
         for item in carteirinhas_data:
-            existing = db.query(Carteirinha).filter(Carteirinha.carteirinha == item['carteirinha']).first()
+            derived_convenio = target_convenio
+            if item.get('id_pagamento') in valid_convenios:
+                derived_convenio = item['id_pagamento']
+
+            existing = db.query(Carteirinha).filter(
+                Carteirinha.carteirinha == item['carteirinha']
+            ).first()
+            
             if existing:
                 # Update existing record
                 changed = False
@@ -202,16 +227,13 @@ async def upload_carteirinhas(
                 if existing.id_pagamento != item['id_pagamento']:
                    existing.id_pagamento = item['id_pagamento']
                    changed = True
-                
-                # Update status if provided in CSV (it defaults to 'ativo' in parsing if missing, 
-                # but if CSV has a column 'status', we want to use it).
-                # The parsing logic above sets 'status' to 'ativo' if missing/nan.
-                # So we effectively overwrite status with CSV or 'ativo'. 
-                # If we want to PRESERVE existing status if CSV is empty, we need to change parsing logic.
-                # User requirement: "ignore ou apenas atualize se tive algo diferente, staus, id,.."
-                # Assuming CSV is the source of truth for status too.
                 if existing.status != item['status']:
                     existing.status = item['status']
+                    changed = True
+                
+                # Isolation update: if it didn't have a convenio or was different, set it
+                if existing.id_convenio != derived_convenio and derived_convenio:
+                    existing.id_convenio = derived_convenio
                     changed = True
                 
                 if changed:
@@ -222,7 +244,8 @@ async def upload_carteirinhas(
                      paciente=item['paciente'],
                      id_paciente=item.get('id_paciente'),
                      id_pagamento=item.get('id_pagamento'),
-                     status=item.get('status', 'ativo')
+                     status=item.get('status', 'ativo'),
+                     id_convenio=derived_convenio
                  )
                  db.add(new_cart)
                  count_added += 1
@@ -243,18 +266,30 @@ async def upload_carteirinhas(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
-@router.get("/")
+@router.get("", response_model=None)
+@router.get("/", include_in_schema=False)
 def list_carteirinhas(
     skip: int = 0, 
     limit: int = 100, 
     search: Optional[str] = None, 
     status: Optional[str] = None,
     id_pagamento: Optional[str] = None,
+    id_convenio: Optional[int] = None,
     paciente: Optional[str] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
     query = db.query(Carteirinha)
+    
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(user)
+    
+    if id_convenio:
+        if allowed_ids and id_convenio not in allowed_ids:
+             raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+        query = query.filter(Carteirinha.id_convenio == id_convenio)
+    elif allowed_ids:
+        query = query.filter(Carteirinha.id_convenio.in_(allowed_ids))
     
     # Text Search (General)
     if search:
@@ -292,7 +327,8 @@ def list_carteirinhas(
         "limit": limit
     }
 
-@router.post("/")
+@router.post("", response_model=None)
+@router.post("/", include_in_schema=False)
 def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Create a new carteirinha"""
     if 'carteirinha' not in item:
@@ -306,12 +342,17 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
     if existing:
         raise HTTPException(status_code=400, detail=f"Carteirinha {item['carteirinha']} already exists")
     
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(user)
+    target_convenio = item.get('id_convenio') if item.get('id_convenio') else (allowed_ids[0] if allowed_ids else None)
+
     new_cart = Carteirinha(
         carteirinha=item['carteirinha'],
         paciente=item.get('paciente', ''),
         id_paciente=item.get('id_paciente'),
         id_pagamento=item.get('id_pagamento'),
-        status=item.get('status', 'ativo')
+        status=item.get('status', 'ativo'),
+        id_convenio=target_convenio
     )
     
     db.add(new_cart)

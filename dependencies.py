@@ -29,12 +29,7 @@ async def get_current_user(authorization: str = Header(None), db: Session = Depe
             detail="Token inválido ou usuário não encontrado."
         )
         
-    if user.status != "Ativo":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Usuário inativo. Entre em contato com o suporte."
-        )
-        
+    # Validade check
     if user.validade and user.validade < datetime.now().date():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -42,3 +37,11 @@ async def get_current_user(authorization: str = Header(None), db: Session = Depe
         )
         
     return user
+
+def get_allowed_convenio_ids(user: User):
+    """Retorna a lista de IDs de convênio permitidos para este usuário."""
+    if user.convenio_rel:
+        return [c.id_convenio for c in user.convenio_rel]
+    if user.id_convenio: # Fallback legado
+        return [user.id_convenio]
+    return [] # Se vazio, assumimos Admin para rotas que verificam 'if allowed_ids'

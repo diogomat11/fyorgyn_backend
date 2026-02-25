@@ -59,6 +59,7 @@ def apply_filters(query, search, status, validade_start, validade_end, venciment
 
 @router.get("/dashboard")
 def get_dashboard_stats(
+    id_convenio: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
@@ -67,26 +68,38 @@ def get_dashboard_stats(
     # Base query for active patients? Or just all?
     # Stats: Vencidos, Vence D+7, Vence D+30
     
+    # Isolation
+    query_base = db.query(func.count(PatientPei.id)).join(Carteirinha)
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(current_user)
+    
+    if id_convenio:
+        if allowed_ids and id_convenio not in allowed_ids:
+             raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+        query_base = query_base.filter(Carteirinha.id_convenio == id_convenio)
+    elif allowed_ids:
+        query_base = query_base.filter(Carteirinha.id_convenio.in_(allowed_ids))
+    
     # Vencidos
-    vencidos = db.query(func.count(PatientPei.id)).filter(PatientPei.validade < today).scalar()
+    vencidos = query_base.filter(PatientPei.validade < today).scalar()
     
     # Vence D+7
     d7_end = today + timedelta(days=7)
-    vence_d7 = db.query(func.count(PatientPei.id)).filter(
+    vence_d7 = query_base.filter(
         PatientPei.validade >= today, 
         PatientPei.validade <= d7_end
     ).scalar()
     
     # Vence D+30
     d30_end = today + timedelta(days=30)
-    vence_d30 = db.query(func.count(PatientPei.id)).filter(
+    vence_d30 = query_base.filter(
         PatientPei.validade >= today, 
         PatientPei.validade <= d30_end
     ).scalar()
     
-    total = db.query(func.count(PatientPei.id)).scalar()
-    pendentes = db.query(func.count(PatientPei.id)).filter(PatientPei.status == 'Pendente').scalar()
-    validados = db.query(func.count(PatientPei.id)).filter(PatientPei.status == 'Validado').scalar()
+    total = query_base.scalar()
+    pendentes = query_base.filter(PatientPei.status == 'Pendente').scalar()
+    validados = query_base.filter(PatientPei.status == 'Validado').scalar()
 
     return {
         "total": total,
@@ -106,6 +119,7 @@ def list_pei(
     validade_start: Optional[date] = None,
     validade_end: Optional[date] = None,
     vencimento_filter: Optional[str] = None, # vencidos, vence_d7, vence_d30
+    id_convenio: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
@@ -126,6 +140,17 @@ def list_pei(
         Carteirinha.id_paciente # For export matching if needed
     ).join(Carteirinha, PatientPei.carteirinha_id == Carteirinha.id)\
      .outerjoin(BaseGuia, PatientPei.base_guia_id == BaseGuia.id)
+    
+    # Isolation
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(current_user)
+    
+    if id_convenio:
+        if allowed_ids and id_convenio not in allowed_ids:
+             raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+        query = query.filter(Carteirinha.id_convenio == id_convenio)
+    elif allowed_ids:
+        query = query.filter(Carteirinha.id_convenio.in_(allowed_ids))
     
     query = apply_filters(query, search, status, validade_start, validade_end, vencimento_filter)
     
@@ -166,6 +191,7 @@ def export_pei(
     validade_start: Optional[date] = None,
     validade_end: Optional[date] = None,
     vencimento_filter: Optional[str] = None,
+    id_convenio: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
@@ -277,15 +303,13 @@ def export_pei(
             "Guia Vinculada", "Data Autorização", "Senha", "Qtd Autorizada",
             "PEI Semanal", "Validade", "Status", "Atualizado Em"
         ])
-        
-        print("DEBUG: Executing Query (Raw Tuples)...")
-        # Optimization: Select ONLY the columns we need as a tuple
-        # This prevents SQLAlchemy from creating thousands of objects and doing N+1 loads
+
+        # Base query joining for isolation
         query = db.query(
             Carteirinha.id_paciente,          # 0
             Carteirinha.paciente,             # 1
             Carteirinha.carteirinha,          # 2
-            Carteirinha.id_pagamento,         # 3 - REQUESTED FIELD
+            Carteirinha.id_pagamento,         # 3
             PatientPei.codigo_terapia,        # 4
             BaseGuia.guia,                    # 5
             BaseGuia.data_autorizacao,        # 6
@@ -298,6 +322,17 @@ def export_pei(
         ).select_from(PatientPei)\
          .join(Carteirinha, PatientPei.carteirinha_id == Carteirinha.id)\
          .outerjoin(BaseGuia, PatientPei.base_guia_id == BaseGuia.id)
+        
+        # Isolation
+        from dependencies import get_allowed_convenio_ids
+        allowed_ids = get_allowed_convenio_ids(current_user)
+        
+        if id_convenio:
+            if allowed_ids and id_convenio not in allowed_ids:
+                 raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+            query = query.filter(Carteirinha.id_convenio == id_convenio)
+        elif allowed_ids:
+            query = query.filter(Carteirinha.id_convenio.in_(allowed_ids))
         
         query = apply_filters(query, search, status, validade_start, validade_end, vencimento_filter)
         
@@ -354,6 +389,17 @@ def override_pei(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    # Validation: check if the guia belongs to the user's convenio
+    guia = db.query(BaseGuia).join(Carteirinha).filter(BaseGuia.id == req.guia_id)
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(current_user)
+    if allowed_ids:
+        guia = guia.filter(Carteirinha.id_convenio.in_(allowed_ids))
+    
+    guia_obj = guia.first()
+    if not guia_obj:
+        raise HTTPException(status_code=403, detail="Acesso negado ou Guia não encontrada")
+
     # Upsert PeiTemp
     temp = db.query(PeiTemp).filter(PeiTemp.base_guia_id == req.guia_id).first()
     if not temp:

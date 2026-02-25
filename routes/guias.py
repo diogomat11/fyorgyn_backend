@@ -21,12 +21,24 @@ def list_guias(
     created_at_start: Optional[date] = None, 
     created_at_end: Optional[date] = None,
     carteirinha_id: Optional[int] = None,
+    id_convenio: Optional[int] = None,
     limit: int = 25,
     skip: int = 0,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
     query = db.query(BaseGuia)
+    
+    # Isolation: if user has a convenio, only show guias from that convenio
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(current_user)
+    
+    if id_convenio:
+        if allowed_ids and id_convenio not in allowed_ids:
+             raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+        query = query.filter(BaseGuia.id_convenio == id_convenio)
+    elif allowed_ids:
+        query = query.filter(BaseGuia.id_convenio.in_(allowed_ids))
     
     if created_at_start:
         query = query.filter(BaseGuia.updated_at >= created_at_start)
@@ -47,6 +59,7 @@ def export_guias(
     created_at_start: Optional[str] = Query(None, description="Start Date (YYYY-MM-DD)"),
     created_at_end: Optional[str] = Query(None, description="End Date (YYYY-MM-DD)"),
     carteirinha_id: Optional[int] = Query(None, description="Filter by Carteirinha ID"),
+    id_convenio: Optional[int] = Query(None, description="Filter by Convenio ID"),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
@@ -78,6 +91,17 @@ def export_guias(
             BaseGuia.sessoes_autorizadas,    # 8
             BaseGuia.created_at              # 9
         ).select_from(BaseGuia).join(Carteirinha, BaseGuia.carteirinha_id == Carteirinha.id)
+
+        # Isolation: if user has a convenio, only show guias from that convenio
+        from dependencies import get_allowed_convenio_ids
+        allowed_ids = get_allowed_convenio_ids(current_user)
+        
+        if id_convenio:
+            if allowed_ids and id_convenio not in allowed_ids:
+                 raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+            query = query.filter(BaseGuia.id_convenio == id_convenio)
+        elif allowed_ids:
+            query = query.filter(BaseGuia.id_convenio.in_(allowed_ids))
 
         if created_at_start:
             query = query.filter(BaseGuia.updated_at >= created_at_start)

@@ -7,36 +7,43 @@ def update_patient_pei(db: Session, carteirinha_id: int, codigo_terapia: str, gu
     Recalculates and updates the PatientPei record for a specific patient and therapy.
     Triggered automatically by changes in BaseGuia or PeiTemp.
     """
+    # 0. Check for Convenio Restriction (Only Unimed)
+    # Get id_convenio from carteirinha
+    from models import Carteirinha, Convenio
+    cart = db.query(Carteirinha).filter(Carteirinha.id == carteirinha_id).first()
+    if not cart:
+        return
+    
+    # Dynamic check: Find ID of UNIMED
+    unimed = db.query(Convenio).filter(Convenio.nome.ilike("%UNIMED%")).first()
+    unimed_id = unimed.id_convenio if unimed else 2 # Default to 2 based on seed
+    
+    if cart.id_convenio != unimed_id:
+        # PEI not applicable to other convenios
+        return
+
     # 1. Find the latest Guia for this patient + therapy
     # Logic: Newest data_autorizacao, then newest ID (tie-breaker)
     # Note: If valid_instance is provided (from before_flush), we must consider it.
     
     db_latest = db.query(BaseGuia).filter(
         BaseGuia.carteirinha_id == carteirinha_id,
-        BaseGuia.codigo_terapia == codigo_terapia
+        BaseGuia.codigo_terapia == codigo_terapia,
+        BaseGuia.status_guia.ilike('Autorizado')
     ).order_by(BaseGuia.data_autorizacao.desc(), BaseGuia.id.desc()).first()
     
     latest_guia = db_latest
 
-    if guia_instance:
-        # Compare db_latest and guia_instance to see which is newer.
-        # ID might be None for guia_instance (if insert). 
-        # But usually we assume the one being touched is the "latest" content-wise if dates match?
-        # Let's simplify: append to list and sort.
+    if guia_instance and getattr(guia_instance, 'status_guia', 'Autorizado').upper() == 'AUTORIZADO':
         candidate_list = []
         if db_latest:
             candidate_list.append(db_latest)
         
-        # Check if guia_instance is already db_latest (if we queried it back?)
-        # If in before_flush, db_latest from query might be None or old.
         if guia_instance not in candidate_list:
             candidate_list.append(guia_instance)
             
-        # Sort logic
         def sort_key(g):
             d = g.data_autorizacao or date.min
-            # ID might be None. Use infinity or 0? 
-            # If ID is None, it's very new (pending insert). Treat as highest ID?
             i = g.id if g.id is not None else float('inf')
             return (d, i)
             
@@ -44,8 +51,13 @@ def update_patient_pei(db: Session, carteirinha_id: int, codigo_terapia: str, gu
         latest_guia = candidate_list[0] if candidate_list else None
 
     if not latest_guia:
-        # If no guia exists anymore (e.g. deleted), we might need to remove the PEI or set to 0. 
-        # For now, we just return.
+        # Remove PEI if no Autorizado guia left
+        existing_pei = db.query(PatientPei).filter(
+            PatientPei.carteirinha_id == carteirinha_id,
+            PatientPei.codigo_terapia == codigo_terapia
+        ).first()
+        if existing_pei:
+            db.delete(existing_pei)
         return
 
 

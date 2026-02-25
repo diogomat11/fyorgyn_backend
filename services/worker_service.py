@@ -10,7 +10,11 @@ def register_heartbeat(db: Session, hostname: str, status: str, current_job_id: 
     Updates status, last_heartbeat, and other fields.
     Returns any pending command for the worker.
     """
-    worker = db.query(Worker).filter(Worker.hostname == hostname).first()
+    # Normalize hostname to title case for cleaner UI (Sama-9000 instead of sama-9000)
+    hostname = hostname.title() if hostname else "Unknown"
+    
+    # Use ilike to prevent case-sensitive duplicates just in case
+    worker = db.query(Worker).filter(Worker.hostname.ilike(hostname)).first()
     
     now = datetime.now(timezone.utc)
     
