@@ -55,6 +55,7 @@ class Job(Base):
     status = Column(Text, nullable=False, default="pending", index=True) # success, pending, processing, error
     attempts = Column(Integer, default=0)
     priority = Column(Integer, default=0)
+    depending_id = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
     locked_by = Column(Text) # Server URL
     timeout = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -79,6 +80,7 @@ class BaseGuia(Base):
     qtde_solicitada = Column(Integer)
     sessoes_autorizadas = Column(Integer)
     saldo = Column(Integer, default=0, nullable=False)
+    timestamp_captura = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -164,6 +166,9 @@ class Convenio(Base):
     nome = Column(Text, nullable=False)
     usuario = Column(Text)
     senha_criptografada = Column(Text)
+    biometria = Column(Boolean, default=False)
+    timeout_captura = Column(Boolean, default=False)
+    pei_automatico = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -359,3 +364,4 @@ class Agendamento(Base):
     numero_guia = Column(Text, nullable=True)
     data_update = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     Status = Column(Text, nullable=False, default="A Confirmar")
+    execucao_status = Column(Text, default="pendente")

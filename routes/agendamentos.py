@@ -163,7 +163,7 @@ def list_agendamentos(
     bg = aliased(BaseGuia)
     
     agendamentos = (
-        db.query(Agendamento, bg.saldo.label("saldo_guia"))
+        db.query(Agendamento, bg.saldo.label("saldo_guia"), bg.timestamp_captura.label("timestamp_captura"))
         .outerjoin(bg, Agendamento.numero_guia == bg.guia)
         .filter(*query.whereclause.clauses if hasattr(query.whereclause, 'clauses') else [query.whereclause] if query.whereclause is not None else [])
         .order_by(Agendamento.data.desc().nulls_last(), Agendamento.hora_inicio.desc().nulls_last())
@@ -174,9 +174,10 @@ def list_agendamentos(
     
     # Format the response map
     data = []
-    for ag, saldo in agendamentos:
+    for ag, saldo, ts_cap in agendamentos:
         dic = {c.name: getattr(ag, c.name) for c in ag.__table__.columns}
         dic["saldo_guia"] = saldo
+        dic["timestamp_captura"] = ts_cap
         data.append(dic)
         
     total_db_unfiltered = db.query(Agendamento).count()
@@ -209,6 +210,7 @@ def list_procedimentos(id_convenio: int, db: Session = Depends(get_db)):
 class BatchStatusRequest(BaseModel):
     ids: List[int]
     status: str
+    capturar_guias: bool = True
 
 @router.put("/batch-status")
 def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db)):
@@ -233,8 +235,48 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db)):
     else:
         db.query(Agendamento).filter(Agendamento.id_agendamento.in_(req.ids)).update({Agendamento.Status: req.status}, synchronize_session=False)
     
+    jobs_created = 0
+    if req.status == 'Confirmado' and req.capturar_guias:
+        from models import Convenio, Job, Carteirinha
+        import json
+        for ag in agendamentos_to_update:
+            if ag.id_convenio:
+                conv = db.query(Convenio).filter(Convenio.id_convenio == ag.id_convenio).first()
+                if conv and (conv.biometria or conv.pei_automatico):
+                    cart = db.query(Carteirinha).filter(
+                        Carteirinha.carteirinha == ag.carteirinha, 
+                        Carteirinha.id_convenio == ag.id_convenio
+                    ).first()
+                    if cart:
+                        # 1. Cria Captura
+                        new_job = Job(
+                            carteirinha_id=cart.id,
+                            id_convenio=ag.id_convenio,
+                            rotina="Captura",
+                            status="pending",
+                            params=json.dumps({"agendamento_id": ag.id_agendamento, "numero_guia": ag.numero_guia or ""})
+                        )
+                        db.add(new_job)
+                        db.commit()
+                        db.refresh(new_job)
+                        jobs_created += 1
+                        
+                        # 2. Se pei automático for ligado, Encadeia a Execução!
+                        if conv.pei_automatico:
+                            exec_job = Job(
+                                carteirinha_id=cart.id,
+                                id_convenio=ag.id_convenio,
+                                rotina="Execução",
+                                status="pending",
+                                depending_id=new_job.id,
+                                params=json.dumps({"agendamento_id": ag.id_agendamento, "numero_guia": ag.numero_guia or ""})
+                            )
+                            db.add(exec_job)
+                            ag.execucao_status = "pendente"
+                            jobs_created += 1
+
     db.commit()
-    return {"status": "success", "updated": len(req.ids)}
+    return {"status": "success", "updated": len(req.ids), "jobs_created": jobs_created}
 
 class BatchDeleteRequest(BaseModel):
     ids: List[int]
@@ -295,3 +337,70 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
         
     return {"status": "success", "message": f"{len(jobs_created)} Jobs de Faturamento criados", "jobs": jobs_created}
+
+class AgendamentoJobRequest(BaseModel):
+    agendamento_id: int
+    depending_id: Optional[int] = None
+
+@router.post("/capturar")
+def create_job_captura(req: AgendamentoJobRequest, db: Session = Depends(get_db)):
+    agenda = db.query(Agendamento).filter(Agendamento.id_agendamento == req.agendamento_id).first()
+    if not agenda:
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
+        
+    cart = db.query(Carteirinha).filter(
+        Carteirinha.carteirinha == agenda.carteirinha, 
+        Carteirinha.id_convenio == agenda.id_convenio
+    ).first()
+    
+    if not cart:
+        raise HTTPException(status_code=404, detail="Carteirinha vinculada não encontrada")
+        
+    from models import Job
+    import json
+    
+    new_job = Job(
+        carteirinha_id=cart.id,
+        id_convenio=agenda.id_convenio,
+        rotina="Captura",
+        status="pending",
+        params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""})
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+    return {"status": "success", "job_id": new_job.id}
+
+@router.post("/executar")
+def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db)):
+    agenda = db.query(Agendamento).filter(Agendamento.id_agendamento == req.agendamento_id).first()
+    if not agenda:
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
+        
+    cart = db.query(Carteirinha).filter(
+        Carteirinha.carteirinha == agenda.carteirinha, 
+        Carteirinha.id_convenio == agenda.id_convenio
+    ).first()
+    
+    if not cart:
+        raise HTTPException(status_code=404, detail="Carteirinha vinculada não encontrada")
+        
+    from models import Job
+    import json
+    
+    new_job = Job(
+        carteirinha_id=cart.id,
+        id_convenio=agenda.id_convenio,
+        rotina="Execução",
+        status="pending",
+        depending_id=req.depending_id,
+        params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""})
+    )
+    db.add(new_job)
+    
+    # Mark the agenda as pending execution
+    agenda.execucao_status = "pendente"
+    
+    db.commit()
+    db.refresh(new_job)
+    return {"status": "success", "job_id": new_job.id}
