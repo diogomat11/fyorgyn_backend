@@ -15,16 +15,9 @@ router = APIRouter(
 )
 
 def validate_carteirinha_format(code: str):
-    # Format: 0064.8000.400948.00-5
-    # Length: 21
-    # Check simple length first
-    if len(code) != 21:
-        raise HTTPException(status_code=400, detail=f"Carteirinha inválida: {code}. Deve conter exatamente 21 caracteres.")
-    
-    # Check punctuation positions
-    # Indices: 4, 9, 16 are '.', 19 is '-'
-    if code[4] != '.' or code[9] != '.' or code[16] != '.' or code[19] != '-':
-        raise HTTPException(status_code=400, detail=f"Carteirinha inválida: {code}. Formato incorreto de pontos e traços. Esperado: 0000.0000.000000.00-0")
+    # Removida validação rígida de 21 caracteres para suportar outros convênios (ex: IPASGO, Amil, etc).
+    # Apenas passa, confiando na importação/input do usuário.
+    pass
 
 def normalize_header(header):
     header = str(header).strip()
@@ -40,9 +33,10 @@ def normalize_header(header):
         'id': 'IdPaciente',
         'IdPaciente': 'IdPaciente',
         'id_paciente': 'IdPaciente',
-        'IdPagamento': 'IdPagamento',
-        'id_pagamento': 'IdPagamento',
-        'IDPAGAMENTO': 'IdPagamento',
+        'Codigo_beneficiario': 'Codigo_beneficiario',
+        'codigo_beneficiario': 'Codigo_beneficiario',
+        'id_convenio': 'id_convenio',
+        'IdConvenio': 'id_convenio',
         'status': 'status',
         'Status': 'status',
         'STATUS': 'status'
@@ -140,20 +134,16 @@ async def upload_carteirinhas(
              if 'Carteirinha' not in first_row_keys:
                   raise HTTPException(status_code=400, detail=f"Arquivo inválido. Coluna 'Carteirinha' não encontrada. Colunas encontradas: {list(first_row_keys)}")
         else:
-             # Empty file logic
              pass 
 
+        from models import Convenio
+        convenios_db = db.query(Convenio).all()
+        valid_convenios = {c.id_convenio for c in convenios_db}
+        convenio_digits_map = {c.id_convenio: c.digitos_carteirinha for c in convenios_db if c.digitos_carteirinha}
+
         for index, row in enumerate(rows):
-            # ... existing parsing logic ...
-            # Add id_convenio to items
-            item_data = {
-                "carteirinha": str(row.get('Carteirinha', '')).strip(),
-                "paciente": str(row.get('Paciente', '')).strip(),
-                "id_paciente": None, # parsed below
-                "id_pagamento": None, # parsed below
-                "status": row.get('status', 'ativo'),
-                "id_convenio": target_convenio
-            }
+            # Set dynamic fallback if available in column, else use default Form id_convenio
+            target_convenio = id_convenio
             cart_raw = row.get('Carteirinha')
             cart = str(cart_raw).strip() if cart_raw is not None else ""
             
@@ -172,44 +162,76 @@ async def upload_carteirinhas(
                 except (ValueError, TypeError):
                     pass
             
-            if 'IdPagamento' in row and row['IdPagamento']:
+            if 'id_convenio' in row and row['id_convenio']:
                 try:
-                    val = str(row['IdPagamento']).strip()
+                    val = str(row['id_convenio']).strip()
                     if val and val.lower() != 'nan' and val.lower() != 'none':
-                        id_pagamento = int(float(val))
+                        target_convenio = int(float(val))
                 except (ValueError, TypeError):
                     pass
+            
+            codigo_beneficiario = str(row.get('Codigo_beneficiario', '')).strip()
+            if codigo_beneficiario.lower() == 'nan' or codigo_beneficiario.lower() == 'none' or not codigo_beneficiario:
+                codigo_beneficiario = None
+            
             
             status_val = row.get('status', 'ativo')
             if not status_val or str(status_val).lower() == 'nan':
                 status_val = 'ativo'
 
             if cart and cart.lower() != 'nan' and cart.lower() != 'none':
-                try:
-                    validate_carteirinha_format(cart)
-                    carteirinhas_data.append({
-                        "carteirinha": cart,
-                        "paciente": paciente,
-                        "id_paciente": id_paciente,
-                        "id_pagamento": id_pagamento,
-                        "status": status_val
-                    })
-                except HTTPException as e:
-                    errors.append(f"Linha {index+2}: {e.detail}")
+                # Dynamic format validation
+                req_len = convenio_digits_map.get(target_convenio)
+                if req_len:
+                    digits_only = ''.join(filter(str.isdigit, cart))
+                    if len(digits_only) != req_len:
+                         errors.append(f"Linha {index+2}: Carteirinha {cart} inválida para este convênio. Esperado {req_len} dígitos, recebeu {len(digits_only)}.")
+                         continue
+                
+                carteirinhas_data.append({
+                    "carteirinha": cart,
+                    "paciente": paciente,
+                    "id_paciente": id_paciente,
+                    "codigo_beneficiario": codigo_beneficiario,
+                    "id_convenio": target_convenio,
+                    "status": status_val
+                })
 
-        if errors:
-            raise HTTPException(status_code=400, detail="Erros de validação encontrados:\n" + "\n".join(errors[:10]) + ("..." if len(errors) > 10 else ""))
+        warnings = errors.copy()
+        
+        # Dedup items in the CSV itself to avoid UniqueViolation on db.add()
+        # Report duplicates with different patients
+        unique_carteirinhas = {}
+        conflict_carteirinhas = set()
+        
+        for item in carteirinhas_data:
+            cart = item["carteirinha"]
+            
+            if cart in conflict_carteirinhas:
+                continue
+                
+            if cart in unique_carteirinhas:
+                existing_item = unique_carteirinhas[cart]
+                if str(existing_item.get("id_paciente")) != str(item.get("id_paciente")):
+                    warnings.append(f"Carteirinha duplicada para pacientes distintos: {cart} (Pacientes: {existing_item['paciente']} e {item['paciente']})")
+                    conflict_carteirinhas.add(cart)
+                    del unique_carteirinhas[cart]
+                # else: same patient, silently dedup
+            else:
+                unique_carteirinhas[cart] = item
+                
+        carteirinhas_data = list(unique_carteirinhas.values())
 
+        if not carteirinhas_data and warnings:
+             raise HTTPException(status_code=400, detail="Nenhuma carteirinha válida na importação.\n" + "\n".join(warnings[:15]))
+             
         count_added = 0
         count_updated = 0
         
-
-        from models import Convenio
-        valid_convenios = {c.id_convenio for c in db.query(Convenio).all()}
         for item in carteirinhas_data:
-            derived_convenio = target_convenio
-            if item.get('id_pagamento') in valid_convenios:
-                derived_convenio = item['id_pagamento']
+            derived_convenio = item.get('id_convenio') or target_convenio
+            if derived_convenio not in valid_convenios:
+                derived_convenio = target_convenio # Fallback to form/default
 
             existing = db.query(Carteirinha).filter(
                 Carteirinha.carteirinha == item['carteirinha']
@@ -224,8 +246,8 @@ async def upload_carteirinhas(
                 if existing.id_paciente != item['id_paciente']:
                     existing.id_paciente = item['id_paciente']
                     changed = True
-                if existing.id_pagamento != item['id_pagamento']:
-                   existing.id_pagamento = item['id_pagamento']
+                if existing.codigo_beneficiario != item['codigo_beneficiario']:
+                   existing.codigo_beneficiario = item['codigo_beneficiario']
                    changed = True
                 if existing.status != item['status']:
                     existing.status = item['status']
@@ -243,7 +265,7 @@ async def upload_carteirinhas(
                      carteirinha=item['carteirinha'],
                      paciente=item['paciente'],
                      id_paciente=item.get('id_paciente'),
-                     id_pagamento=item.get('id_pagamento'),
+                     codigo_beneficiario=item.get('codigo_beneficiario'),
                      status=item.get('status', 'ativo'),
                      id_convenio=derived_convenio
                  )
@@ -256,14 +278,21 @@ async def upload_carteirinhas(
             "message": "Upload processed successfully",
             "added": count_added,
             "updated": count_updated,
-            "total_processed": len(carteirinhas_data)
+            "total_processed": len(carteirinhas_data),
+            "warnings": warnings
         }
 
     except HTTPException:
         raise
     except Exception as e:
         import traceback
-        traceback.print_exc()
+        import os
+        tb_str = traceback.format_exc()
+        trace_path = os.path.join(os.path.dirname(__file__), '..', 'upload_trace.log')
+        with open(trace_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n--- NEW UPLOAD ERROR ---\n{tb_str}\n")
+            
+        print("Upload Error traced to:", trace_path)
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @router.get("", response_model=None)
@@ -273,7 +302,7 @@ def list_carteirinhas(
     limit: int = 100, 
     search: Optional[str] = None, 
     status: Optional[str] = None,
-    id_pagamento: Optional[str] = None,
+    codigo_beneficiario: Optional[str] = None,
     id_convenio: Optional[int] = None,
     paciente: Optional[str] = None,
     db: Session = Depends(get_db),
@@ -300,7 +329,7 @@ def list_carteirinhas(
                 Carteirinha.paciente.ilike(search_filter), 
                 Carteirinha.carteirinha.ilike(search_filter),
                 Carteirinha.id_paciente.cast(String).ilike(search_filter),
-                Carteirinha.id_pagamento.cast(String).ilike(search_filter)
+                Carteirinha.codigo_beneficiario.ilike(search_filter)
             )
         )
         
@@ -308,8 +337,8 @@ def list_carteirinhas(
     if status:
         query = query.filter(Carteirinha.status == status)
         
-    if id_pagamento:
-        query = query.filter(Carteirinha.id_pagamento.cast(String).ilike(f"%{id_pagamento}%"))
+    if codigo_beneficiario:
+        query = query.filter(Carteirinha.codigo_beneficiario.ilike(f"%{codigo_beneficiario}%"))
         
     if paciente:
         query = query.filter(Carteirinha.paciente.ilike(f"%{paciente}%"))
@@ -350,7 +379,7 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
         carteirinha=item['carteirinha'],
         paciente=item.get('paciente', ''),
         id_paciente=item.get('id_paciente'),
-        id_pagamento=item.get('id_pagamento'),
+        codigo_beneficiario=item.get('codigo_beneficiario'),
         status=item.get('status', 'ativo'),
         id_convenio=target_convenio
     )
@@ -374,8 +403,10 @@ def update_carteirinha(carteirinha_id: int, item: dict = Body(...), db: Session 
         cart.paciente = item['paciente']
     if 'id_paciente' in item:
         cart.id_paciente = item['id_paciente']
-    if 'id_pagamento' in item:
-        cart.id_pagamento = item['id_pagamento']
+    if 'codigo_beneficiario' in item:
+        cart.codigo_beneficiario = item['codigo_beneficiario']
+    if 'id_convenio' in item and item['id_convenio']:
+        cart.id_convenio = item['id_convenio']
     if 'status' in item:
         cart.status = item['status']
         

@@ -1,0 +1,1 @@
+['id_agendamento', 'id_unidade', 'carteirinha', 'id_paciente', 'Nome_Paciente', 'nome_convenio', 'data', 'hora_inicio', 'sala', 'Id_profissional', 'Nome_profissional', 'Tipo_atendimento', 'Qtd Sess', 'Status', 'Elegibilidade', 'Substituicao', 'Tipo de Falta', 'Id_Pai', 'cod_procedimento_aut']

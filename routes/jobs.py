@@ -47,10 +47,37 @@ def create_jobs(
         created_count = job_service.create_all_jobs(db, id_convenio=target_convenio, rotina=request.rotina, params=request.params)
             
     elif request.type in ['single', 'multiple']:
-        if not request.carteirinha_ids:
-             raise HTTPException(status_code=400, detail="carteirinha_ids required for single/multiple")
+        is_ipasgo_op3 = target_convenio == 6 and request.rotina in ['3', 'op3_import_guias']
         
-        created_count = job_service.create_jobs_bulk(db, request.carteirinha_ids, id_convenio=target_convenio, rotina=request.rotina, params=request.params)
+        if not request.carteirinha_ids:
+            if is_ipasgo_op3 and request.type == 'single':
+                # Create a standalone job for IPASGO op3 without a specific patient
+                new_job = Job(carteirinha_id=None, status="pending", id_convenio=target_convenio, rotina=request.rotina, params=request.params)
+                db.add(new_job)
+                created_count = 1
+            else:
+                raise HTTPException(status_code=400, detail="carteirinha_ids required for single/multiple")
+        else:
+            # Special validation for IPASGO printing jobs (routine 5)
+            if target_convenio == 6 and request.rotina == '5':
+                import json
+                try:
+                    p = json.loads(request.params or '{}')
+                    guia_num = p.get("numero_guia")
+                    if guia_num:
+                        from models import BaseGuia
+                        # Check if this guide belongs to one of the carteirinhas and is authorized
+                        valid_guia = db.query(BaseGuia).filter(
+                            BaseGuia.guia == guia_num,
+                            BaseGuia.carteirinha_id.in_(request.carteirinha_ids),
+                            BaseGuia.status_guia.ilike('%autorizad%')
+                        ).first()
+                        if not valid_guia:
+                            raise HTTPException(status_code=400, detail="Apenas guias autorizadas podem ser enviadas para impressão.")
+                except json.JSONDecodeError:
+                    pass
+            
+            created_count = job_service.create_jobs_bulk(db, request.carteirinha_ids, id_convenio=target_convenio, rotina=request.rotina, params=request.params)
     
     elif request.type == 'temp':
         if not request.temp_patient:

@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 from models import (
     Agendamento,
@@ -242,34 +242,121 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db)):
         for ag in agendamentos_to_update:
             if ag.id_convenio:
                 conv = db.query(Convenio).filter(Convenio.id_convenio == ag.id_convenio).first()
-                if conv and (conv.biometria or conv.pei_automatico):
+                # Confirmar lote: Para Anápolis (2), cria par Captura + Execução dependente.
+                # Para outros (como Goiânia 3), mantém apenas Captura isolada.
+                should_create_capture = False
+                if ag.id_convenio in (2, 3):
+                    should_create_capture = True
+                elif conv and (conv.biometria or conv.pei_automatico):
+                    should_create_capture = True
+                    
+                # IPASGO does not need capture, just direct execution
+                if ag.id_convenio == 6:
+                    should_create_capture = False
+                
+                if should_create_capture:
                     cart = db.query(Carteirinha).filter(
                         Carteirinha.carteirinha == ag.carteirinha, 
                         Carteirinha.id_convenio == ag.id_convenio
                     ).first()
                     if cart:
-                        # 1. Cria Captura
-                        new_job = Job(
-                            carteirinha_id=cart.id,
-                            id_convenio=ag.id_convenio,
-                            rotina="Captura",
-                            status="pending",
-                            params=json.dumps({"agendamento_id": ag.id_agendamento, "numero_guia": ag.numero_guia or ""})
-                        )
-                        db.add(new_job)
-                        db.commit()
-                        db.refresh(new_job)
-                        jobs_created += 1
+                        # 1. Busca ou Cria Captura
+                        cap_job = None
+                        if ag.numero_guia:
+                            from sqlalchemy import cast, String
+                            cap_job = db.query(Job).filter(
+                                Job.id_convenio == ag.id_convenio,
+                                Job.rotina == "Captura",
+                                Job.status.in_(["pending", "processing", "success"]),
+                                cast(Job.params, String).contains(ag.numero_guia)
+                            ).first()
                         
-                        # 2. Se pei automático for ligado, Encadeia a Execução!
-                        if conv.pei_automatico:
-                            exec_job = Job(
+                        if not cap_job:
+                            cap_job = Job(
                                 carteirinha_id=cart.id,
                                 id_convenio=ag.id_convenio,
+                                rotina="Captura",
+                                status="pending",
+                                params=json.dumps({"agendamento_id": ag.id_agendamento, "numero_guia": ag.numero_guia or ""})
+                            )
+                            db.add(cap_job)
+                            db.flush()
+                            jobs_created += 1
+
+                        # 2. Para Anápolis (2), cria também a Execução dependente se não existir
+                        if ag.id_convenio == 2:
+                            from sqlalchemy import cast, String
+                            existing_exec = db.query(Job).filter(
+                                Job.rotina == "Execução",
+                                Job.status.in_(["pending", "processing"]),
+                                cast(Job.params, String).contains(f'"agendamento_id": {ag.id_agendamento}')
+                            ).first()
+
+                            if not existing_exec:
+                                from models import CorpoClinico
+                                from datetime import datetime
+                                prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == ag.Id_profissional).first()
+                                data_hora = ""
+                                try:
+                                    if ag.data and ag.hora_inicio:
+                                        hora = ag.hora_inicio
+                                        if isinstance(hora, str):
+                                            try: hora = datetime.strptime(hora[:5], "%H:%M").time()
+                                            except: pass
+                                        data_hora = f"{ag.data.strftime('%d/%m/%Y')} {hora.strftime('%H:%M')}"
+                                except: pass
+
+                                exec_params = {
+                                    "agendamento_id": ag.id_agendamento,
+                                    "numero_guia": ag.numero_guia or "",
+                                    "nome_profissional": prof.nome if prof else (ag.Nome_profissional or ""),
+                                    "conselho": prof.conselho if prof else "",
+                                    "data_hora": data_hora,
+                                    "cod_procedimento_fat": ag.cod_procedimento_fat or ""
+                                }
+                                exec_job = Job(
+                                    carteirinha_id=cart.id,
+                                    id_convenio=cart.id_convenio,
+                                    rotina="Execução",
+                                    status="pending",
+                                    depending_id=cap_job.id,
+                                    params=json.dumps(exec_params)
+                                )
+                                db.add(exec_job)
+                                ag.execucao_status = "pendente"
+                                jobs_created += 1
+                                
+                # Se for IPASGO (6), criamos APENAS a rotina de Execucao Direta independente
+                if ag.id_convenio == 6:
+                    from sqlalchemy import cast, String
+                    existing_exec = db.query(Job).filter(
+                        Job.rotina == "Execução",
+                        Job.status.in_(["pending", "processing"]),
+                        cast(Job.params, String).contains(f'"agendamento_id": {ag.id_agendamento}')
+                    ).first()
+
+                    if not existing_exec:
+                        cart = db.query(Carteirinha).filter(
+                            Carteirinha.carteirinha == ag.carteirinha, 
+                            Carteirinha.id_convenio == ag.id_convenio
+                        ).first()
+                        
+                        if cart:
+                            # Parametros Mínimos OP4 Ipasgo (numero_guia, sessoes_realizadas)
+                            sessoes = getattr(req, "sessoes_realizadas", 1) # fallback seguro para 1 sessão
+                            exec_params = {
+                                "agendamento_id": ag.id_agendamento,
+                                "numero_guia": ag.numero_guia or "",
+                                "cod_procedimento_fat": ag.cod_procedimento_fat or "",
+                                "sessoes_realizadas": sessoes
+                            }
+                            exec_job = Job(
+                                carteirinha_id=cart.id,
+                                id_convenio=cart.id_convenio,
                                 rotina="Execução",
                                 status="pending",
-                                depending_id=new_job.id,
-                                params=json.dumps({"agendamento_id": ag.id_agendamento, "numero_guia": ag.numero_guia or ""})
+                                depending_id=None,
+                                params=json.dumps(exec_params)
                             )
                             db.add(exec_job)
                             ag.execucao_status = "pendente"
@@ -306,28 +393,95 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db)):
     if not agendamentos:
         raise HTTPException(status_code=404, detail="Nenhum agendamento encontrado")
         
-    from models import Job
+    from models import Job, Convenio
     from datetime import datetime
+    import json
     
     jobs_created = []
     for agenda in agendamentos:
-        # Pega a carteirinha
         cart = db.query(Carteirinha).filter(Carteirinha.carteirinha == agenda.carteirinha, Carteirinha.id_convenio == agenda.id_convenio).first()
         
-        # O Faturamento (OP 3) eh criado para a base de carteirinha
         if cart:
-            new_job = Job(
-                carteirinha_id=cart.id,
-                id_convenio=cart.id_convenio,
-                rotina="Faturamento",
-                status="Pendente",
-                params='{"origem": "batch_agendamentos", "agendamento_id": ' + str(agenda.id_agendamento) + '}'
-            )
-            db.add(new_job)
-            db.flush()
-            jobs_created.append(new_job.id)
+            # Anápolis (id_convenio=2): cria par Captura + Execução dependente
+            if agenda.id_convenio == 2:
+                # Anti-duplicidade para Captura
+                cap_job = None
+                if agenda.numero_guia:
+                    cap_job = db.query(Job).filter(
+                        Job.id_convenio == 2,
+                        Job.rotina == "Captura",
+                        Job.status.in_(["pending", "processing", "success"]),
+                        Job.params.contains(agenda.numero_guia)
+                    ).first()
+                
+                if not cap_job:
+                    cap_job = Job(
+                        carteirinha_id=cart.id,
+                        id_convenio=cart.id_convenio,
+                        rotina="Captura",
+                        status="pending",
+                        params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""})
+                    )
+                    db.add(cap_job)
+                    db.flush()
+                
+                jobs_created.append(cap_job.id)
+
+                # Verifica se já existe Execução para este agendamento
+                existing_exec = db.query(Job).filter(
+                    Job.rotina == "Execução",
+                    Job.status.in_(["pending", "processing"]),
+                    Job.params.contains(f'"agendamento_id": {agenda.id_agendamento}')
+                ).first()
+
+                if not existing_exec:
+                    # Enriquece params de Execução para Anápolis
+                    prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == agenda.Id_profissional).first()
+                    data_hora = ""
+                    try:
+                        if agenda.data and agenda.hora_inicio:
+                            hora = agenda.hora_inicio
+                            if isinstance(hora, str):
+                                try: hora = datetime.strptime(hora[:5], "%H:%M").time()
+                                except: pass
+                            data_hora = f"{agenda.data.strftime('%d/%m/%Y')} {hora.strftime('%H:%M')}"
+                    except: pass
+
+                    exec_params = {
+                        "agendamento_id": agenda.id_agendamento,
+                        "numero_guia": agenda.numero_guia or "",
+                        "nome_profissional": prof.nome if prof else (agenda.Nome_profissional or ""),
+                        "conselho": prof.conselho if prof else "",
+                        "data_hora": data_hora,
+                        "cod_procedimento_fat": agenda.cod_procedimento_fat or ""
+                    }
+                    exec_job = Job(
+                        carteirinha_id=cart.id,
+                        id_convenio=cart.id_convenio,
+                        rotina="Execução",
+                        status="pending",
+                        depending_id=cap_job.id,
+                        params=json.dumps(exec_params)
+                    )
+                    db.add(exec_job)
+                    db.flush()
+                    jobs_created.append(exec_job.id)
+                    agenda.execucao_status = "pendente"
+                else:
+                    jobs_created.append(existing_exec.id)
+            else:
+                # Demais convênios: Faturamento direto
+                new_job = Job(
+                    carteirinha_id=cart.id,
+                    id_convenio=cart.id_convenio,
+                    rotina="Faturamento",
+                    status="pending",
+                    params=json.dumps({"origem": "batch_agendamentos", "agendamento_id": agenda.id_agendamento})
+                )
+                db.add(new_job)
+                db.flush()
+                jobs_created.append(new_job.id)
             
-            # Atualiza status do Agendamento
             agenda.Status = "Faturamento Solicitado"
             
     try:
@@ -336,7 +490,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
         
-    return {"status": "success", "message": f"{len(jobs_created)} Jobs de Faturamento criados", "jobs": jobs_created}
+    return {"status": "success", "message": f"{len(jobs_created)} Jobs criados", "jobs": jobs_created}
 
 class AgendamentoJobRequest(BaseModel):
     agendamento_id: int
@@ -359,6 +513,20 @@ def create_job_captura(req: AgendamentoJobRequest, db: Session = Depends(get_db)
     from models import Job
     import json
     
+    # Anti-duplicidade: verifica se já existe Captura pendente/processing/success para esta guia
+    if agenda.numero_guia:
+        existing = db.query(Job).filter(
+            Job.id_convenio == agenda.id_convenio,
+            Job.rotina == "Captura",
+            Job.status.in_(["pending", "processing", "success"]),
+            Job.params.contains(agenda.numero_guia)
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Já existe job de Captura ativo para guia {agenda.numero_guia} (Job #{existing.id}, status={existing.status})"
+            )
+    
     new_job = Job(
         carteirinha_id=cart.id,
         id_convenio=agenda.id_convenio,
@@ -373,6 +541,7 @@ def create_job_captura(req: AgendamentoJobRequest, db: Session = Depends(get_db)
 
 @router.post("/executar")
 def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db)):
+    """Cria Job Execução. Para Goiânia/Anápolis, auto-cria Captura antes se necessário."""
     agenda = db.query(Agendamento).filter(Agendamento.id_agendamento == req.agendamento_id).first()
     if not agenda:
         raise HTTPException(status_code=404, detail="Agendamento não encontrado")
@@ -387,20 +556,90 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
         
     from models import Job
     import json
+
+    # Params base
+    params_base = {"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}
+
+    # Para Anápolis (id_convenio=2): enriquece params com dados de execução SP/SADT
+    if agenda.id_convenio == 2:
+        prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == agenda.Id_profissional).first()
+        data_hora = ""
+        try:
+            if agenda.data and agenda.hora_inicio:
+                # hora_inicio pode ser datetime.time ou string "HH:MM:SS"
+                hora = agenda.hora_inicio
+                if isinstance(hora, str):
+                    hora = datetime.strptime(hora[:5], "%H:%M").time()
+                data_hora = f"{agenda.data.strftime('%d/%m/%Y')} {hora.strftime('%H:%M')}"
+        except Exception:
+            data_hora = ""
+        params_base.update({
+            "nome_profissional": prof.nome if prof else (agenda.Nome_profissional or ""),
+            "conselho":          prof.conselho if prof else "",
+            "data_hora":         data_hora,
+            "cod_procedimento_fat": agenda.cod_procedimento_fat or ""
+        })
+
+    params_json = json.dumps(params_base)
+    cap_job_id = req.depending_id  # fallback se já fornecido
     
+    # Para Goiânia (3) e Anápolis (2): auto-cria Captura se não existe ainda
+    if agenda.id_convenio in (2, 3) and not req.depending_id:
+        # Verifica se já existe Captura com sucesso → usa como dependência
+        existing_cap = None
+        if agenda.numero_guia:
+            from sqlalchemy import cast, String
+            existing_cap = db.query(Job).filter(
+                Job.id_convenio == agenda.id_convenio,
+                Job.rotina == "Captura",
+                Job.status.in_(["pending", "processing", "success"]),
+                cast(Job.params, String).contains(agenda.numero_guia)
+            ).first()
+        
+        if existing_cap:
+            cap_job_id = existing_cap.id
+        else:
+            # Cria Captura standalone primeiro
+            cap_job = Job(
+                carteirinha_id=cart.id,
+                id_convenio=agenda.id_convenio,
+                rotina="Captura",
+                status="pending",
+                params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""})
+            )
+            db.add(cap_job)
+            db.flush()
+            cap_job_id = cap_job.id
+    
+    
+    # Anti-duplicidade Execução
+    from sqlalchemy import cast, String
+    existing_exec = db.query(Job).filter(
+        Job.rotina == "Execução",
+        Job.status.in_(["pending", "processing"]),
+        cast(Job.params, String).contains(f'"agendamento_id": {agenda.id_agendamento}')
+    ).first()
+
+    if existing_exec:
+        return {"status": "success", "message": "Job de execução já existente", "job_id": existing_exec.id}
+
+    # Para IPASGO (6), set depending_id para None explicitamente se nao tiver id injetado   
+    if agenda.id_convenio == 6:
+        cap_job_id = None
+
     new_job = Job(
         carteirinha_id=cart.id,
         id_convenio=agenda.id_convenio,
         rotina="Execução",
         status="pending",
-        depending_id=req.depending_id,
-        params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""})
+        depending_id=cap_job_id,
+        params=params_json
     )
     db.add(new_job)
     
-    # Mark the agenda as pending execution
     agenda.execucao_status = "pendente"
     
     db.commit()
     db.refresh(new_job)
-    return {"status": "success", "job_id": new_job.id}
+    return {"status": "success", "job_id": new_job.id, "captura_job_id": cap_job_id}
+

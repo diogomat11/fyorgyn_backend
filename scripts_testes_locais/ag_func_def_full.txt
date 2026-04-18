@@ -1,0 +1,32 @@
+CREATE OR REPLACE FUNCTION public.func_agendamento_define_cod_faturamento()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_cod_fat VARCHAR;
+    v_valor NUMERIC;
+    v_id_proc INTEGER;
+    v_nome_proc VARCHAR;
+BEGIN
+    -- Se cod_procedimento_fat for NULL ou cod_procedimento_aut for alterado
+    IF (NEW.cod_procedimento_fat IS NULL) OR (TG_OP = 'UPDATE' AND NEW.cod_procedimento_aut IS DISTINCT FROM OLD.cod_procedimento_aut) THEN
+        IF NEW.id_convenio IS NOT NULL AND NEW.cod_procedimento_aut IS NOT NULL THEN
+            -- Busca na tabela procedimentos espelhando pelp CODIGO PROCEDIMENTO (antigo codigo TUSS real do convênio)
+            SELECT pf.faturamento, pf.id_procedimento, pfat.valor, pf.nome 
+            INTO v_cod_fat, v_id_proc, v_valor, v_nome_proc
+            FROM procedimentos pf
+            LEFT JOIN procedimento_faturamento pfat ON pfat.id_procedimento = pf.id_procedimento AND pfat.id_convenio = NEW.id_convenio
+            WHERE pf.id_convenio = NEW.id_convenio AND pf.codigo_procedimento = NEW.cod_procedimento_aut
+            LIMIT 1;
+
+            IF FOUND THEN
+                NEW.cod_procedimento_fat := v_cod_fat;
+                NEW.id_procedimento := v_id_proc;
+                NEW.valor_procedimento := v_valor;
+                NEW.nome_procedimento := v_nome_proc;
+            END IF;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$function$

@@ -239,13 +239,15 @@ def export_pei(
                 
                 # ID Paciente
                 id_paciente_real = row.carteirinha_rel.id_paciente if row.carteirinha_rel else ""
-                id_pagamento_val = row.carteirinha_rel.id_pagamento if row.carteirinha_rel and row.carteirinha_rel.id_pagamento else ""
+                codigo_beneficiario_val = row.carteirinha_rel.codigo_beneficiario if row.carteirinha_rel and row.carteirinha_rel.codigo_beneficiario else ""
+                id_convenio_val = row.carteirinha_rel.id_convenio if row.carteirinha_rel and row.carteirinha_rel.id_convenio else ""
 
                 ws.append([
                     id_paciente_real,
                     row.carteirinha_rel.paciente if row.carteirinha_rel else "",
                     row.carteirinha_rel.carteirinha if row.carteirinha_rel else "",
-                    id_pagamento_val,
+                    codigo_beneficiario_val,
+                    id_convenio_val,
                     row.codigo_terapia,
                     guia_num,
                     data_auth.strftime("%d/%m/%Y") if data_auth else "",
@@ -299,7 +301,7 @@ def export_pei(
         
         # Header
         ws.append([
-            "ID Paciente", "Paciente", "Carteirinha", "ID Pagamento", "Código Terapia", 
+            "ID Paciente", "Paciente", "Carteirinha", "Cód Convênio", "ID Convênio", "Código Terapia", 
             "Guia Vinculada", "Data Autorização", "Senha", "Qtd Autorizada",
             "PEI Semanal", "Validade", "Status", "Atualizado Em"
         ])
@@ -309,16 +311,17 @@ def export_pei(
             Carteirinha.id_paciente,          # 0
             Carteirinha.paciente,             # 1
             Carteirinha.carteirinha,          # 2
-            Carteirinha.id_pagamento,         # 3
-            PatientPei.codigo_terapia,        # 4
-            BaseGuia.guia,                    # 5
-            BaseGuia.data_autorizacao,        # 6
-            BaseGuia.senha,                   # 7
-            BaseGuia.sessoes_autorizadas,     # 8
-            PatientPei.pei_semanal,           # 9
-            PatientPei.validade,              # 10
-            PatientPei.status,                # 11
-            PatientPei.updated_at             # 12
+            Carteirinha.codigo_beneficiario,         # 3
+            Carteirinha.id_convenio,          # 4
+            PatientPei.codigo_terapia,        # 5
+            BaseGuia.guia,                    # 6
+            BaseGuia.data_autorizacao,        # 7
+            BaseGuia.senha,                   # 8
+            BaseGuia.sessoes_autorizadas,     # 9
+            PatientPei.pei_semanal,           # 10
+            PatientPei.validade,              # 11
+            PatientPei.status,                # 12
+            PatientPei.updated_at             # 13
         ).select_from(PatientPei)\
          .join(Carteirinha, PatientPei.carteirinha_id == Carteirinha.id)\
          .outerjoin(BaseGuia, PatientPei.base_guia_id == BaseGuia.id)
@@ -356,7 +359,8 @@ def export_pei(
                 row.id_paciente or "",                  # ID Paciente
                 row.paciente or "",                     # Paciente
                 row.carteirinha or "",                  # Carteirinha
-                row.id_pagamento or "",                 # ID Pagamento (Direct from select)
+                row.codigo_beneficiario or "",                 # Cód Convênio
+                row.id_convenio or "",                  # ID Convênio
                 row.codigo_terapia,                     # Codigo Terapia
                 row.guia or "-",                        # Guia
                 fmt(row.data_autorizacao),              # Data Auth

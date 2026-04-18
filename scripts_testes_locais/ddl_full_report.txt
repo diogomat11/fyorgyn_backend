@@ -1,0 +1,36 @@
+
+--- DDL for procedimentos ---
+COLUMNS:
+('id_procedimento', 'integer', 'NO')
+('nome', 'text', 'YES')
+('codigo_procedimento', 'text', 'YES')
+('faturamento', 'text', 'YES')
+('status', 'text', 'YES')
+('id_area', 'integer', 'YES')
+('id_convenio', 'integer', 'YES')
+
+CONSTRAINTS:
+('procedimentos_id_area_fkey', 'FOREIGN KEY (id_area) REFERENCES areas_atuacao(id_area)')
+('procedimentos_id_convenio_fkey', 'FOREIGN KEY (id_convenio) REFERENCES convenios(id_convenio)')
+('procedimentos_pkey', 'PRIMARY KEY (id_procedimento)')
+
+INDEXES:
+('procedimentos_pkey', 'CREATE UNIQUE INDEX procedimentos_pkey ON public.procedimentos USING btree (id_procedimento)')
+
+--- DDL for procedimento_faturamento ---
+COLUMNS:
+('id_proc_fat', 'integer', 'NO')
+('id_procedimento', 'integer', 'YES')
+('id_convenio', 'integer', 'YES')
+('valor', 'double precision', 'YES')
+('data_inicio', 'date', 'YES')
+('data_fim', 'date', 'YES')
+('status', 'text', 'YES')
+
+CONSTRAINTS:
+('procedimento_faturamento_id_convenio_fkey', 'FOREIGN KEY (id_convenio) REFERENCES convenios(id_convenio) ON DELETE CASCADE')
+('procedimento_faturamento_id_procedimento_fkey', 'FOREIGN KEY (id_procedimento) REFERENCES procedimentos(id_procedimento) ON DELETE CASCADE')
+('procedimento_faturamento_pkey', 'PRIMARY KEY (id_proc_fat)')
+
+INDEXES:
+('procedimento_faturamento_pkey', 'CREATE UNIQUE INDEX procedimento_faturamento_pkey ON public.procedimento_faturamento USING btree (id_proc_fat)')

@@ -30,7 +30,7 @@ class Carteirinha(Base):
     carteirinha = Column(Text, unique=True, nullable=False)
     paciente = Column(Text)
     id_paciente = Column(Integer, index=True)
-    id_pagamento = Column(Integer, index=True)
+    codigo_beneficiario = Column(Text, nullable=True) # ID of user in external system (e.g., IPASGO)
     status = Column(Text, default="ativo")
     id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -71,14 +71,17 @@ class BaseGuia(Base):
     id = Column(Integer, primary_key=True, index=True)
     carteirinha_id = Column(Integer, ForeignKey("carteirinhas.id", ondelete="CASCADE"))
     id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True)
+    codigo_beneficiario = Column(Text, nullable=True) # Used for link resolution in IPASGO trigger
     guia = Column(Text)
     data_autorizacao = Column(Date)
     senha = Column(Text)
     status_guia = Column(Text, default="Autorizado")
     validade = Column(Date)
     codigo_terapia = Column(Text)
+    nome_terapia = Column(Text, nullable=True) # Auto-resolved from procedimentos by Trigger
     qtde_solicitada = Column(Integer)
     sessoes_autorizadas = Column(Integer)
+    sessoes_realizadas = Column(Integer)
     saldo = Column(Integer, default=0, nullable=False)
     timestamp_captura = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -164,6 +167,8 @@ class Convenio(Base):
 
     id_convenio = Column(Integer, primary_key=True, index=True)
     nome = Column(Text, nullable=False)
+    digitos_carteirinha = Column(Integer, nullable=True)
+    codigo_referenciado = Column(Text, nullable=True)
     usuario = Column(Text)
     senha_criptografada = Column(Text)
     biometria = Column(Boolean, default=False)
@@ -365,3 +370,18 @@ class Agendamento(Base):
     data_update = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     Status = Column(Text, nullable=False, default="A Confirmar")
     execucao_status = Column(Text, default="pendente")
+
+class FaturamentoLote(Base):
+    __tablename__ = "faturamento_lotes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    loteId = Column(Integer, index=True)
+    detalheId = Column(Integer, unique=True, index=True, nullable=False)
+    CodigoBeneficiario = Column(Text)
+    StatusConciliacao = Column(Text, default="pendente")
+    dataRealizacao = Column(Date)
+    Guia = Column(Text)
+    StatusConferencia = Column(Integer)
+    ValorProcedimento = Column(Float)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

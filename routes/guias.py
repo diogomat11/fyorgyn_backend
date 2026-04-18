@@ -22,12 +22,26 @@ def list_guias(
     created_at_end: Optional[date] = None,
     carteirinha_id: Optional[int] = None,
     id_convenio: Optional[int] = None,
+    aba: Optional[str] = None,
     limit: int = 25,
     skip: int = 0,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    query = db.query(BaseGuia)
+    from sqlalchemy import func, case
+    from models import Agendamento
+    
+    subq = db.query(
+        Agendamento.numero_guia,
+        func.sum(case((Agendamento.Status == 'Confirmado', 1), else_=0)).label('q_realizadas'),
+        func.sum(case((Agendamento.Status == 'A Confirmar', 1), else_=0)).label('q_a_confirmar')
+    ).group_by(Agendamento.numero_guia).subquery()
+
+    query = db.query(
+        BaseGuia,
+        func.coalesce(subq.c.q_realizadas, 0).label('computed_realizadas'),
+        func.coalesce(subq.c.q_a_confirmar, 0).label('computed_a_confirmar')
+    ).outerjoin(subq, BaseGuia.guia == subq.c.numero_guia)
     
     # Isolation: if user has a convenio, only show guias from that convenio
     from dependencies import get_allowed_convenio_ids
@@ -48,11 +62,31 @@ def list_guias(
         query = query.filter(BaseGuia.updated_at < end_dt)
     if carteirinha_id:
         query = query.filter(BaseGuia.carteirinha_id == carteirinha_id)
+        
+    if aba == "autorizadas":
+        query = query.filter(BaseGuia.status_guia.ilike('%autorizad%'))
+    elif aba == "solicitacoes":
+        query = query.filter(~BaseGuia.status_guia.ilike('%autorizad%'))
 
     total = query.count()
-    guias = query.order_by(BaseGuia.created_at.desc()).limit(limit).offset(skip).all()
+    results = query.order_by(BaseGuia.created_at.desc()).limit(limit).offset(skip).all()
     
-    return {"data": guias, "total": total, "skip": skip, "limit": limit}
+    guias_data = []
+    for row in results:
+        guia_obj = row[0]
+        q_realizadas = int(row[1] or 0)
+        q_a_confirmar = int(row[2] or 0)
+        
+        g_dict = {c.name: getattr(guia_obj, c.name) for c in guia_obj.__table__.columns}
+        g_dict['sessoes_realizadas'] = q_realizadas
+        
+        # Saldo dinâmico (Autorizado - realizadas - a confirmar)
+        auth = g_dict.get('sessoes_autorizadas') or 0
+        g_dict['saldo'] = auth - (q_realizadas + q_a_confirmar)
+        
+        guias_data.append(g_dict)
+    
+    return {"data": guias_data, "total": total, "skip": skip, "limit": limit}
 
 @router.get("/export")
 def export_guias(
@@ -60,6 +94,7 @@ def export_guias(
     created_at_end: Optional[str] = Query(None, description="End Date (YYYY-MM-DD)"),
     carteirinha_id: Optional[int] = Query(None, description="Filter by Carteirinha ID"),
     id_convenio: Optional[int] = Query(None, description="Filter by Convenio ID"),
+    aba: Optional[str] = Query(None, description="Filter by ABA (autorizadas/solicitacoes)"),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
@@ -111,6 +146,11 @@ def export_guias(
             query = query.filter(BaseGuia.updated_at <= str(end_dt))
         if carteirinha_id:
             query = query.filter(BaseGuia.carteirinha_id == carteirinha_id)
+            
+        if aba == "autorizadas":
+            query = query.filter(BaseGuia.status_guia.ilike('%autorizad%'))
+        elif aba == "solicitacoes":
+            query = query.filter(~BaseGuia.status_guia.ilike('%autorizad%'))
         
         results = query.yield_per(1000)
         

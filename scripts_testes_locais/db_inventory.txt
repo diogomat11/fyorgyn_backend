@@ -1,0 +1,28 @@
+TABLES found: ['users', 'jobs', 'base_guias', 'pei_temp', 'carteirinhas', 'patient_pei', 'priority_rules', 'workers', 'areas', 'convenios', 'tipo_faturamento', 'job_executions', 'tipo_documentos', 'modelo_documentos', 'procedimento_faturamento', 'procedimentos', 'fichas', 'migrations_log', 'logs', 'user_convenios', 'convenio_operacoes', 'agendamentos', 'areas_atuacao', 'conselhos', 'corpo_clinico', 'server_configs']
+
+users: 1 rows
+jobs: 15 rows
+base_guias: 104 rows
+pei_temp: 0 rows
+carteirinhas: 611 rows
+patient_pei: 48 rows
+priority_rules: 11 rows
+workers: 5 rows
+areas: 0 rows
+convenios: 5 rows
+tipo_faturamento: 0 rows
+job_executions: 37 rows
+tipo_documentos: 0 rows
+modelo_documentos: 0 rows
+procedimento_faturamento: 29 rows
+procedimentos: 16 rows
+fichas: 0 rows
+migrations_log: 26 rows
+logs: 1853 rows
+user_convenios: 5 rows
+convenio_operacoes: 20 rows
+agendamentos: 501 rows
+areas_atuacao: 7 rows
+conselhos: 6 rows
+corpo_clinico: 99 rows
+server_configs: 5 rows

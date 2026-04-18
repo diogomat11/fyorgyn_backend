@@ -8,36 +8,32 @@ import random
 def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None) -> int:
     """
     Creates multiple jobs for existing carteirinhas in a single bulk operation.
+    Captura jobs are always standalone — Execução is created via /executar.
     """
     if not carteirinha_ids:
         return 0
         
-    # Optimize: Fetch valid IDs in one query to avoid N+1
     valid_ids = db.query(Carteirinha.id).filter(Carteirinha.id.in_(carteirinha_ids)).all()
-    # valid_ids is list of tuples [(1,), (2,)]
     valid_ids = [vid[0] for vid in valid_ids]
     
-    if valid_ids:
-        new_jobs = [Job(carteirinha_id=cid, status="pending", id_convenio=id_convenio, rotina=rotina, params=params) for cid in valid_ids]
-        db.bulk_save_objects(new_jobs)
-        return len(new_jobs)
-    
-    return 0
+    if not valid_ids:
+        return 0
+
+    new_jobs = [Job(carteirinha_id=cid, status="pending", id_convenio=id_convenio, rotina=rotina, params=params) for cid in valid_ids]
+    db.bulk_save_objects(new_jobs)
+    return len(new_jobs)
 
 def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None) -> int:
     """
     Creates jobs for ALL non-temporary carteirinhas.
-    If id_convenio is provided, only creates jobs for carteirinhas linked to that convenio.
+    Captura jobs are always standalone — Execução is created via /executar.
     """
     query = db.query(Carteirinha).filter(Carteirinha.is_temporary == False)
     if id_convenio is not None:
-        # Filter to only carteirinhas from the specified convenio
         query = query.filter(Carteirinha.id_convenio == id_convenio)
     
     all_carteirinhas = query.all()
-    new_jobs = []
-    for cart in all_carteirinhas:
-         new_jobs.append(Job(carteirinha_id=cart.id, status="pending", id_convenio=id_convenio, rotina=rotina, params=params))
+    new_jobs = [Job(carteirinha_id=cart.id, status="pending", id_convenio=id_convenio, rotina=rotina, params=params) for cart in all_carteirinhas]
     
     if new_jobs:
         db.bulk_save_objects(new_jobs)
