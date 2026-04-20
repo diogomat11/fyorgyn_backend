@@ -47,11 +47,11 @@ def create_jobs(
         created_count = job_service.create_all_jobs(db, id_convenio=target_convenio, rotina=request.rotina, params=request.params)
             
     elif request.type in ['single', 'multiple']:
-        is_ipasgo_op3 = target_convenio == 6 and request.rotina in ['3', 'op3_import_guias']
+        is_ipasgo_standalone = target_convenio == 6 and request.rotina in ['3', 'op3_import_guias', '6', 'op6_check_baixados', '7', 'op7_fat_facplan', '11', 'op11_import_guias_api']
         
         if not request.carteirinha_ids:
-            if is_ipasgo_op3 and request.type == 'single':
-                # Create a standalone job for IPASGO op3 without a specific patient
+            if is_ipasgo_standalone and request.type == 'single':
+                # Create a standalone job for IPASGO without a specific patient
                 new_job = Job(carteirinha_id=None, status="pending", id_convenio=target_convenio, rotina=request.rotina, params=request.params)
                 db.add(new_job)
                 created_count = 1

@@ -33,6 +33,7 @@ class ConvenioOperacaoResponse(BaseModel):
 
 class ConvenioResponse(ConvenioBase):
     id_convenio: int
+    codigo_referenciado: Optional[str] = None
     operacoes: List[ConvenioOperacaoResponse] = Field(default=[], validation_alias="operacoes_rel")
     
     class Config:
@@ -75,3 +76,23 @@ def update_convenio(id_convenio: int, conv: ConvenioUpdate, db: Session = Depend
     db.commit()
     db.refresh(db_conv)
     return db_conv
+
+
+@router.get("/{id_convenio}/procedimentos")
+def list_procedimentos_by_convenio(id_convenio: int, db: Session = Depends(get_db)):
+    """Retorna procedimentos de autorização do convênio para selects pesquisáveis."""
+    from models import Procedimento
+    procs = db.query(Procedimento).filter(
+        Procedimento.id_convenio == id_convenio,
+        Procedimento.status == "ativo"
+    ).order_by(Procedimento.nome).all()
+    return [
+        {
+            "id": p.id_procedimento,
+            "codigo": p.codigo_procedimento,
+            "nome": p.nome,
+            "faturamento": p.faturamento
+        }
+        for p in procs
+    ]
+
