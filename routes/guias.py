@@ -23,6 +23,9 @@ def list_guias(
     carteirinha_id: Optional[int] = None,
     id_convenio: Optional[int] = None,
     aba: Optional[str] = None,
+    status: Optional[str] = None,
+    senha: Optional[str] = None,
+    codigo_terapia: Optional[str] = None,
     limit: int = 25,
     skip: int = 0,
     db: Session = Depends(get_db),
@@ -62,6 +65,12 @@ def list_guias(
         query = query.filter(BaseGuia.updated_at < end_dt)
     if carteirinha_id:
         query = query.filter(BaseGuia.carteirinha_id == carteirinha_id)
+    if status:
+        query = query.filter(BaseGuia.status_guia.ilike(f'%{status}%'))
+    if senha:
+        query = query.filter(BaseGuia.senha.ilike(f'%{senha}%'))
+    if codigo_terapia:
+        query = query.filter(BaseGuia.codigo_terapia.ilike(f'%{codigo_terapia}%'))
         
     if aba == "autorizadas":
         query = query.filter(BaseGuia.status_guia.ilike('%autorizad%'))
@@ -95,6 +104,9 @@ def export_guias(
     carteirinha_id: Optional[int] = Query(None, description="Filter by Carteirinha ID"),
     id_convenio: Optional[int] = Query(None, description="Filter by Convenio ID"),
     aba: Optional[str] = Query(None, description="Filter by ABA (autorizadas/solicitacoes)"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    senha: Optional[str] = Query(None, description="Filter by senha"),
+    codigo_terapia: Optional[str] = Query(None, description="Filter by codigo terapia"),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
@@ -146,6 +158,12 @@ def export_guias(
             query = query.filter(BaseGuia.updated_at <= str(end_dt))
         if carteirinha_id:
             query = query.filter(BaseGuia.carteirinha_id == carteirinha_id)
+        if status:
+            query = query.filter(BaseGuia.status_guia.ilike(f'%{status}%'))
+        if senha:
+            query = query.filter(BaseGuia.senha.ilike(f'%{senha}%'))
+        if codigo_terapia:
+            query = query.filter(BaseGuia.codigo_terapia.ilike(f'%{codigo_terapia}%'))
             
         if aba == "autorizadas":
             query = query.filter(BaseGuia.status_guia.ilike('%autorizad%'))
