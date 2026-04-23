@@ -1,4 +1,0 @@
-TRIGGER STATUS (agendamentos): ('trg_agendamento_define_cod_faturamento', 'O')
-TRIGGERS (procedimentos): []
-PROC COUNTS: [(3, 9), (6, 6), (2, 1)]
-FAT COUNTS: [(3, 14), (6, 15)]

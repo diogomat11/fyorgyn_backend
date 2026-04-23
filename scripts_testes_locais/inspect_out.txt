@@ -1,4 +1,0 @@
-procedimentos: ['id_procedimento', 'id_area', 'id_convenio', 'status', 'faturamento', 'nome', 'codigo_procedimento']
-corpo_clinico: ['id_profissional', 'nome', 'cpf', 'area', 'conselho', 'registro', 'UF', 'CBO', 'codigo_ipasgo', 'status']
-corpo_clinico data: [(4443599, 'FERNANDA BARROS ATAIDE HELRIGER', '998.464.701-34', 'Psicologia', 'CRP', '17591', 'GO', '251510', '48116-0', 'Ativo'), (4444178, 'AMANDA NARY MOREIRA DE SOUSA', None, 'Psicologia', 'CRP', None, None, '251510', None, 'Ativo')]
-procedimentos data: [(142, 'CONSULTA', '10101012', '10101012', 'ativo', None, 2), (143, 'PSICOLOGIA ', '2250005103', '2250005103', 'ativo', 6, 2)]

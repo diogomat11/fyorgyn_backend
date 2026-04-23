@@ -1,1 +1,0 @@
-[{'id': 2, 'nome': 'UNIMED ANAPOLIS'}, {'id': 6, 'nome': 'IPASGO'}, {'id': 3, 'nome': 'UNIMED GOIANIA'}, {'id': 9, 'nome': 'AMIL'}, {'id': 8, 'nome': 'SULAMERICA'}]
