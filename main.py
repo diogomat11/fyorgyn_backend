@@ -65,3 +65,5 @@ app.include_router(prio_rules.router, prefix="/api/priority-rules", tags=["prior
 app.include_router(server_configs.router, prefix="/api/server-configs", tags=["server-configs"])
 app.include_router(agendamentos.router, prefix="/api")
 app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])
+
+

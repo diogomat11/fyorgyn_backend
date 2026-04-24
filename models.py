@@ -73,6 +73,7 @@ class BaseGuia(Base):
     id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True)
     codigo_beneficiario = Column(Text, nullable=True) # Used for link resolution in IPASGO trigger
     guia = Column(Text)
+    guia_prestador = Column(Text, nullable=True)
     data_autorizacao = Column(Date)
     senha = Column(Text)
     status_guia = Column(Text, default="Autorizado")

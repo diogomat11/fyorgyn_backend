@@ -47,7 +47,7 @@ def create_jobs(
         created_count = job_service.create_all_jobs(db, id_convenio=target_convenio, rotina=request.rotina, params=request.params)
             
     elif request.type in ['single', 'multiple']:
-        is_ipasgo_standalone = target_convenio == 6 and request.rotina in ['3', 'op3_import_guias', '6', 'op6_check_baixados', '7', 'op7_fat_facplan', '11', 'op11_import_guias_api']
+        is_ipasgo_standalone = target_convenio == 6 and request.rotina in ['3', 'op3_import_guias', '6', 'op6_check_baixados', '7', 'op7_fat_facplan', '11', 'op11_import_guias_api', '12', 'op12_impressao_api']
         
         if not request.carteirinha_ids:
             if is_ipasgo_standalone and request.type == 'single':
@@ -58,8 +58,8 @@ def create_jobs(
             else:
                 raise HTTPException(status_code=400, detail="carteirinha_ids required for single/multiple")
         else:
-            # Special validation for IPASGO printing jobs (routine 5)
-            if target_convenio == 6 and request.rotina == '5':
+            # Special validation for IPASGO printing jobs (routine 5 or 12)
+            if target_convenio == 6 and request.rotina in ['5', '12']:
                 import json
                 try:
                     p = json.loads(request.params or '{}')
