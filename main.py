@@ -56,7 +56,7 @@ app.include_router(guias.router, prefix="/api")
 app.include_router(logs.router, prefix="/api/logs")
 app.include_router(dashboard.router, prefix="/api")
 
-from routes import workers, pei, convenios, prio_rules, metrics, agendamentos, server_configs
+from routes import workers, pei, convenios, prio_rules, metrics, agendamentos, server_configs, lotes, conciliacao
 app.include_router(workers.router, prefix="/api")
 app.include_router(pei.router, prefix="/api")
 app.include_router(debug_optimization.router, prefix="/api")
@@ -65,5 +65,7 @@ app.include_router(prio_rules.router, prefix="/api/priority-rules", tags=["prior
 app.include_router(server_configs.router, prefix="/api/server-configs", tags=["server-configs"])
 app.include_router(agendamentos.router, prefix="/api")
 app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])
+app.include_router(lotes.router, prefix="/api", tags=["lotes"])
+app.include_router(conciliacao.router, prefix="/api", tags=["conciliacao"])
 
 

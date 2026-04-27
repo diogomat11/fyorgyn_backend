@@ -376,7 +376,7 @@ class FaturamentoLote(Base):
     __tablename__ = "faturamento_lotes"
 
     id = Column(Integer, primary_key=True, index=True)
-    loteId = Column(Integer, index=True)
+    id_lote = Column(Integer, ForeignKey("lotes_convenio.id_lote", ondelete="SET NULL"), index=True)
     detalheId = Column(Integer, unique=True, index=True, nullable=False)
     CodigoBeneficiario = Column(Text)
     StatusConciliacao = Column(Text, default="pendente")
@@ -384,5 +384,46 @@ class FaturamentoLote(Base):
     Guia = Column(Text)
     StatusConferencia = Column(Integer)
     ValorProcedimento = Column(Float)
+    agendamento_id = Column(Integer, ForeignKey("agendamentos.id_agendamento", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class LoteConvenio(Base):
+    __tablename__ = "lotes_convenio"
+
+    id_lote = Column(Integer, primary_key=True, index=True)
+    id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="CASCADE"))
+    numero_lote = Column(Integer, index=True)
+    cod_prestador = Column(Text)
+    status = Column(Text, default="Aberto") # Aberto, Enviado, Cancelado
+    data_inicio = Column(Date, nullable=True)
+    data_fim = Column(Date, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    convenio_rel = relationship("Convenio")
+
+class LoteAgendamento(Base):
+    __tablename__ = "lotes_agendamento"
+
+    id_lote_ag = Column(Integer, primary_key=True, index=True)
+    id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="CASCADE"))
+    id_lote_convenio = Column(Integer, ForeignKey("lotes_convenio.id_lote", ondelete="SET NULL"), nullable=True, index=True)
+    data_inicio = Column(Date)
+    data_fim = Column(Date)
+    status = Column(Text, default="Aberto")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    convenio_rel = relationship("Convenio")
+
+class LoteAgendamentoItem(Base):
+    __tablename__ = "lote_agendamento_itens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_lote_ag = Column(Integer, ForeignKey("lotes_agendamento.id_lote_ag", ondelete="CASCADE"), index=True)
+    id_agendamento = Column(Integer, ForeignKey("agendamentos.id_agendamento", ondelete="CASCADE"), index=True)
+    status_conciliacao = Column(Text, default="Não Conciliado")
+    id_faturamento_lote = Column(Integer, ForeignKey("faturamento_lotes.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
