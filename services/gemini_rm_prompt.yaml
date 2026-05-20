@@ -1,0 +1,106 @@
+version: 1.1
+task: extracao_terapias_relatorio_medico
+language: pt-BR
+
+objetivo: >
+  Extrair do arquivo de relatório médico anexo (PDF, JPG, PNG) as áreas terapêuticas prescritas
+  e suas respectivas cargas horárias, lidando com erros, abreviações ou variações.
+  Retornar os dados em formato JSON, mapeando o id_paciente requisitado e separando
+  as áreas médicas não listadas no padrão.
+
+entrada_esperada:
+  - arquivo_medico: Arquivo (PDF, JPG, PNG) contendo o relatório.
+  - id_paciente: Identificador numérico ou string passado junto à requisição.
+
+areas_padrao:
+  - PSICOLOGIA
+  - FISIOTERAPIA
+  - TERAPIA OCUPACIONAL
+  - PSICOPEDAGOGIA
+  - FONOAUDIOLOGIA
+  - PSICOMOTRICIDADE
+  - MUSICOTERAPIA
+  - AVALIACAO NEUROPSICOLOGICA
+  - NUTRICAO
+
+normalizacao:
+  regras_gerais:
+    - remover acentos
+    - ignorar caixa (maiúsculo/minúsculo)
+    - ignorar espaços extras
+    - corrigir erros comuns por similaridade textual (fuzzy match), mas respeitar estritamente o mapeamento explícito abaixo.
+
+mapeamento_areas:
+  PSICOLOGIA:
+    - psicologia
+    - psi
+    - psicologia aba
+    - psicologo
+    - psicoterapia
+    - psicoterapeuta
+    - pisoterapeuta
+  FISIOTERAPIA:
+    - fisioterapia
+    - fisio
+    - fisioterapeuta
+  TERAPIA OCUPACIONAL:
+    - terapia ocupacional
+    - terapia ocupaciona
+    - t.o
+    - to
+  PSICOPEDAGOGIA:
+    - psicopedagogia
+    - psicopedagogo
+  FONOAUDIOLOGIA:
+    - fonoaudiologia
+    - fono
+    - fonoaudiologa
+    - fonoterapia
+  PSICOMOTRICIDADE:
+    - psicomotricidade
+    - psicomotor
+  MUSICOTERAPIA:
+    - musicoterapia
+    - musicoterapeuta
+  AVALIACAO NEUROPSICOLOGICA:
+    - avaliacao neuropsicologica
+    - neuropsicologia
+    - avaliacao neuropsico
+    - neuropsicologico
+  NUTRICAO:
+    - nutricao
+    - nutrição
+    - nutricção
+    - nutricionista
+    - nutri
+
+regras_extracao:
+  - localizar seção de prescrição (ex: "Solicito", "Prescrevo", "Encaminho", etc).
+  - identificar linhas com terapias.
+  - mapear texto encontrado para uma das areas_padrao usando o mapeamento_areas.
+  - classificar as áreas médicas solicitadas que NÃO constam em 'areas_padrao' (ex: Psiquiatria, Neurologia) como itens ignorados.
+  - extrair carga horaria com regex.
+
+regex_carga_horaria:
+  padroes:
+    - "(\\d+)\\s*h\\s*(semanais|semana|mensais|mensal)"
+    - "(\\d+)\\s*horas\\s*(semanais|mensais)"
+    - "(\\d+)h"
+
+regras_saida:
+  - Retornar APENAS o JSON válido.
+  - se encontrar área mas sem carga → area_carga_horaria = 0 e tipo_carga_horaria = null.
+  - padronizar tipo_carga_horaria em: semanal, mensal, ou null.
+
+formato_saida:
+  tipo: json
+  estrutura_exemplo:
+    id_paciente: 12345
+    areas_extraidas:
+      - Area: "PSICOLOGIA"
+        area_carga_horaria: 2
+        tipo_carga_horaria: "semanal"
+    itens_ignorados:
+      - Area: "Psiquiatria"
+        area_carga_horaria: 1
+        tipo_carga_horaria: "mensal"
