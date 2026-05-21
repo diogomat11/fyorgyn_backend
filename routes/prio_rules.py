@@ -9,7 +9,7 @@ router = APIRouter()
 
 class PriorityRuleBase(BaseModel):
     id_convenio: int
-    rotina: str
+    rotina: Optional[str] = None
     base_priority: int = 2          # 0 = highest priority (top of queue)
     escalation_minutes: int = 10    # minutes between each step towards priority 0
     weight_per_day: Optional[float] = None

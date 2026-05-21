@@ -45,3 +45,12 @@ def get_allowed_convenio_ids(user: User):
     if user.id_convenio: # Fallback legado
         return [user.id_convenio]
     return [] # Se vazio, assumimos Admin para rotas que verificam 'if allowed_ids'
+
+async def get_protocolo_user(authorization: str = Header(None), db: Session = Depends(get_db)):
+    user = await get_current_user(authorization, db)
+    if not user.permitir_protocolo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acesso não autorizado ao módulo de protocolo."
+        )
+    return user

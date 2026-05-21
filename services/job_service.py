@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from fastapi import HTTPException
 import random
 
-def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None) -> int:
+def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None, user_id: Optional[int] = None) -> int:
     """
     Creates multiple jobs for existing carteirinhas in a single bulk operation.
     Captura jobs are always standalone — Execução is created via /executar.
@@ -18,12 +18,12 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
     
     if not valid_ids:
         return 0
-
-    new_jobs = [Job(carteirinha_id=cid, status="pending", id_convenio=id_convenio, rotina=rotina, params=params) for cid in valid_ids]
+ 
+    new_jobs = [Job(carteirinha_id=cid, status="pending", id_convenio=id_convenio, rotina=rotina, params=params, user_id=user_id) for cid in valid_ids]
     db.bulk_save_objects(new_jobs)
     return len(new_jobs)
 
-def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None) -> int:
+def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None, user_id: Optional[int] = None) -> int:
     """
     Creates jobs for ALL non-temporary carteirinhas.
     Captura jobs are always standalone — Execução is created via /executar.
@@ -33,7 +33,7 @@ def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Opti
         query = query.filter(Carteirinha.id_convenio == id_convenio)
     
     all_carteirinhas = query.all()
-    new_jobs = [Job(carteirinha_id=cart.id, status="pending", id_convenio=id_convenio, rotina=rotina, params=params) for cart in all_carteirinhas]
+    new_jobs = [Job(carteirinha_id=cart.id, status="pending", id_convenio=id_convenio, rotina=rotina, params=params, user_id=user_id) for cart in all_carteirinhas]
     
     if new_jobs:
         db.bulk_save_objects(new_jobs)
@@ -41,7 +41,7 @@ def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Opti
     return len(new_jobs)
 
 
-def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None) -> int:
+def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None, user_id: Optional[int] = None) -> int:
     """
     Creates a temporary patient and job.
     """
@@ -74,7 +74,8 @@ def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: O
     if not rotina:
         rotina = "consulta_guias" if id_convenio == 3 or id_convenio == 2 else None
         
-    job = Job(carteirinha_id=cart_id, status="pending", id_convenio=id_convenio, rotina=rotina, params=params)
+    job = Job(carteirinha_id=cart_id, status="pending", id_convenio=id_convenio, rotina=rotina, params=params, user_id=user_id)
     db.add(job)
     
     return 1
+

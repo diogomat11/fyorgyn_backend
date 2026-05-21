@@ -11,15 +11,12 @@ router = APIRouter()
 
 class ConvenioBase(BaseModel):
     nome: str
-    usuario: Optional[str] = None
 
 class ConvenioCreate(ConvenioBase):
-    senha: Optional[str] = None
+    pass
 
 class ConvenioUpdate(BaseModel):
     nome: Optional[str] = None
-    usuario: Optional[str] = None
-    senha: Optional[str] = None
 
 from pydantic import Field
 
@@ -33,7 +30,6 @@ class ConvenioOperacaoResponse(BaseModel):
 
 class ConvenioResponse(ConvenioBase):
     id_convenio: int
-    codigo_referenciado: Optional[str] = None
     operacoes: List[ConvenioOperacaoResponse] = Field(default=[], validation_alias="operacoes_rel")
     
     class Config:
@@ -55,9 +51,7 @@ def list_convenios(db: Session = Depends(get_db), current_user = Depends(get_cur
 
 @router.post("/", response_model=ConvenioResponse)
 def create_convenio(conv: ConvenioCreate, db: Session = Depends(get_db)):
-    new_conv = Convenio(nome=conv.nome, usuario=conv.usuario)
-    if conv.senha:
-        new_conv.senha_criptografada = encrypt_password(conv.senha)
+    new_conv = Convenio(nome=conv.nome)
     db.add(new_conv)
     db.commit()
     db.refresh(new_conv)
@@ -70,8 +64,6 @@ def update_convenio(id_convenio: int, conv: ConvenioUpdate, db: Session = Depend
         raise HTTPException(status_code=404, detail="Convenio not found")
     
     if conv.nome: db_conv.nome = conv.nome
-    if conv.usuario: db_conv.usuario = conv.usuario
-    if conv.senha: db_conv.senha_criptografada = encrypt_password(conv.senha)
     
     db.commit()
     db.refresh(db_conv)
