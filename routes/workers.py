@@ -39,8 +39,6 @@ def list_workers(db: Session = Depends(get_db), current_user = Depends(get_curre
     """
     List all registered workers.
     """
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     return worker_service.get_all_workers(db)
 
 @router.post("/{worker_id}/restart")
