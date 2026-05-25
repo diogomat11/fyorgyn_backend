@@ -70,6 +70,8 @@ def get_dashboard_stats(
     
     # Isolation
     query_base = db.query(func.count(PatientPei.id)).join(Carteirinha)
+    if not current_user.is_admin:
+        query_base = query_base.filter(PatientPei.user_id == current_user.id)
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)
     
@@ -142,6 +144,8 @@ def list_pei(
      .outerjoin(BaseGuia, PatientPei.base_guia_id == BaseGuia.id)
     
     # Isolation
+    if not current_user.is_admin:
+        query = query.filter(PatientPei.user_id == current_user.id)
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)
     
@@ -327,6 +331,8 @@ def export_pei(
          .outerjoin(BaseGuia, PatientPei.base_guia_id == BaseGuia.id)
         
         # Isolation
+        if not current_user.is_admin:
+            query = query.filter(PatientPei.user_id == current_user.id)
         from dependencies import get_allowed_convenio_ids
         allowed_ids = get_allowed_convenio_ids(current_user)
         
@@ -395,6 +401,8 @@ def override_pei(
 ):
     # Validation: check if the guia belongs to the user's convenio
     guia = db.query(BaseGuia).join(Carteirinha).filter(BaseGuia.id == req.guia_id)
+    if not current_user.is_admin:
+        guia = guia.filter(BaseGuia.user_id == current_user.id)
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids:

@@ -238,8 +238,17 @@ async def upload_carteirinhas(
             ).first()
             
             if existing:
-                # Update existing record
+                # Se não for admin, verificar posse
                 changed = False
+                if not user.is_admin:
+                    if existing.user_id is None:
+                        existing.user_id = user.id
+                        changed = True
+                    elif existing.user_id != user.id:
+                        warnings.append(f"Linha {index+2}: Carteirinha {item['carteirinha']} pertence a outro usuário. Atualização ignorada.")
+                        continue
+                
+                # Update existing record
                 if existing.paciente != item['paciente']:
                     existing.paciente = item['paciente']
                     changed = True
@@ -267,7 +276,8 @@ async def upload_carteirinhas(
                      id_paciente=item.get('id_paciente'),
                      codigo_beneficiario=item.get('codigo_beneficiario'),
                      status=item.get('status', 'ativo'),
-                     id_convenio=derived_convenio
+                     id_convenio=derived_convenio,
+                     user_id=user.id
                  )
                  db.add(new_cart)
                  count_added += 1
@@ -309,6 +319,8 @@ def list_carteirinhas(
     user: User = Depends(get_current_user)
 ):
     query = db.query(Carteirinha)
+    if not user.is_admin:
+        query = query.filter(Carteirinha.user_id == user.id)
     
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(user)
@@ -369,6 +381,20 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
     # Check if already exists
     existing = db.query(Carteirinha).filter(Carteirinha.carteirinha == item['carteirinha']).first()
     if existing:
+        if not user.is_admin:
+            if existing.user_id is None:
+                # Claim ownership and update fields
+                existing.user_id = user.id
+                if 'paciente' in item: existing.paciente = item['paciente']
+                if 'id_paciente' in item: existing.id_paciente = item['id_paciente']
+                if 'codigo_beneficiario' in item: existing.codigo_beneficiario = item['codigo_beneficiario']
+                if 'status' in item: existing.status = item['status']
+                if item.get('id_convenio'): existing.id_convenio = item['id_convenio']
+                db.commit()
+                db.refresh(existing)
+                return existing
+            elif existing.user_id != user.id:
+                raise HTTPException(status_code=403, detail="Esta carteirinha pertence a outro usuario.")
         raise HTTPException(status_code=400, detail=f"Carteirinha {item['carteirinha']} already exists")
     
     from dependencies import get_allowed_convenio_ids
@@ -381,7 +407,8 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
         id_paciente=item.get('id_paciente'),
         codigo_beneficiario=item.get('codigo_beneficiario'),
         status=item.get('status', 'ativo'),
-        id_convenio=target_convenio
+        id_convenio=target_convenio,
+        user_id=user.id
     )
     
     db.add(new_cart)
@@ -395,6 +422,12 @@ def update_carteirinha(carteirinha_id: int, item: dict = Body(...), db: Session 
     cart = db.query(Carteirinha).filter(Carteirinha.id == carteirinha_id).first()
     if not cart:
         raise HTTPException(status_code=404, detail="Carteirinha not found")
+    
+    if not user.is_admin:
+        if cart.user_id is None:
+            cart.user_id = user.id
+        elif cart.user_id != user.id:
+            raise HTTPException(status_code=403, detail="Esta carteirinha pertence a outro usuario.")
     
     if 'carteirinha' in item:
         validate_carteirinha_format(item['carteirinha'])
@@ -420,6 +453,9 @@ def delete_carteirinha(carteirinha_id: int, db: Session = Depends(get_db), user:
     if not cart:
         raise HTTPException(status_code=404, detail="Carteirinha not found")
     
+    if not user.is_admin and cart.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Esta carteirinha pertence a outro usuario.")
+        
     db.delete(cart)
     db.commit()
     return {"message": "Deleted successfully"}

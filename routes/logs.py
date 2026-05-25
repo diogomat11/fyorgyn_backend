@@ -20,6 +20,8 @@ def list_logs(
     current_user = Depends(get_current_user)
 ):
     query = db.query(Log).join(Job, isouter=True).join(Carteirinha, isouter=True)
+    if not current_user.is_admin:
+        query = query.filter(Log.user_id == current_user.id)
     
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)

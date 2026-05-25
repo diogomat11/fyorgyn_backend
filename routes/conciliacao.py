@@ -101,6 +101,8 @@ def list_lotes_agendamento(
 ):
     allowed_ids = get_allowed_convenio_ids(current_user)
     query = db.query(LoteAgendamento)
+    if not current_user.is_admin:
+        query = query.filter(LoteAgendamento.user_id == current_user.id)
     
     if id_convenio:
         if allowed_ids and id_convenio not in allowed_ids:
@@ -148,12 +150,15 @@ def gerar_lote_agendamento(
         raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
     
     # Buscar agendamentos confirmados no intervalo
-    agendamentos = db.query(Agendamento).filter(
+    query_ags = db.query(Agendamento).filter(
         Agendamento.id_convenio == request.id_convenio,
         Agendamento.Status == "Confirmado",
         Agendamento.data >= request.data_inicio,
         Agendamento.data <= request.data_fim
-    ).all()
+    )
+    if not current_user.is_admin:
+        query_ags = query_ags.filter(Agendamento.user_id == current_user.id)
+    agendamentos = query_ags.all()
     
     if not agendamentos:
         raise HTTPException(status_code=404, detail="Nenhum agendamento confirmado encontrado no período.")
@@ -163,7 +168,8 @@ def gerar_lote_agendamento(
         id_convenio=request.id_convenio,
         data_inicio=request.data_inicio,
         data_fim=request.data_fim,
-        status="Aberto"
+        status="Aberto",
+        user_id=current_user.id
     )
     db.add(novo_lote)
     db.flush()
@@ -197,15 +203,20 @@ def list_itens_lote_agendamento(
     lote = db.query(LoteAgendamento).filter(LoteAgendamento.id_lote_ag == id_lote_ag).first()
     if not lote:
         raise HTTPException(status_code=404, detail="Lote de agendamento não encontrado.")
+        
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote de agendamento.")
     
     # Query otimizada: buscar tudo de uma vez com JOINs
-    rows = (
+    query_rows = (
         db.query(LoteAgendamentoItem, Agendamento)
         .join(Agendamento, LoteAgendamentoItem.id_agendamento == Agendamento.id_agendamento)
         .filter(LoteAgendamentoItem.id_lote_ag == id_lote_ag)
-        .offset(skip).limit(limit)
-        .all()
     )
+    if not current_user.is_admin:
+        query_rows = query_rows.filter(Agendamento.user_id == current_user.id)
+        
+    rows = query_rows.offset(skip).limit(limit).all()
     total = len(rows) if len(rows) < limit else (
         db.query(func.count(LoteAgendamentoItem.id))
         .filter(LoteAgendamentoItem.id_lote_ag == id_lote_ag).scalar()
@@ -263,30 +274,39 @@ def conciliar_lote(
     lote_conv = db.query(LoteConvenio).filter(LoteConvenio.id_lote == request.id_lote_convenio).first()
     if not lote_conv:
         raise HTTPException(status_code=404, detail="Lote de convênio não encontrado.")
+    if not current_user.is_admin and lote_conv.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote de convênio.")
     
     lote_ag = db.query(LoteAgendamento).filter(LoteAgendamento.id_lote_ag == request.id_lote_ag).first()
     if not lote_ag:
         raise HTTPException(status_code=404, detail="Lote de agendamento não encontrado.")
+    if not current_user.is_admin and lote_ag.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote de agendamento.")
     
     # Persistir vínculo entre lote_agendamento e lote_convenio
     lote_ag.id_lote_convenio = lote_conv.id_lote
     
     # Carregar itens do lote de faturamento (não conciliados)
-    fat_items = db.query(FaturamentoLote).filter(
+    fat_query = db.query(FaturamentoLote).filter(
         FaturamentoLote.id_lote == lote_conv.id_lote,
         FaturamentoLote.agendamento_id.is_(None)
-    ).all()
+    )
+    if not current_user.is_admin:
+        fat_query = fat_query.filter(FaturamentoLote.user_id == current_user.id)
+    fat_items = fat_query.all()
     
     # Carregar itens do lote de agendamento (não conciliados)
-    ag_items = (
+    ag_query = (
         db.query(LoteAgendamentoItem, Agendamento)
         .join(Agendamento, LoteAgendamentoItem.id_agendamento == Agendamento.id_agendamento)
         .filter(
             LoteAgendamentoItem.id_lote_ag == request.id_lote_ag,
             LoteAgendamentoItem.status_conciliacao == "Não Conciliado"
         )
-        .all()
     )
+    if not current_user.is_admin:
+        ag_query = ag_query.filter(Agendamento.user_id == current_user.id)
+    ag_items = ag_query.all()
     
     # Pre-fetch all carteirinhas necessárias em batch (com TRIM)
     cart_texts_raw = list(set(ag.carteirinha.strip() for _, ag in ag_items if ag.carteirinha))
@@ -324,7 +344,6 @@ def conciliar_lote(
             ag_map[key].append((lai, ag))
     
     count_conciliados = 0
-    count_pendentes = 0
     
     for fat in fat_items:
         if not fat.Guia:
@@ -374,15 +393,21 @@ def conciliar_manual(
     fat = db.query(FaturamentoLote).filter(FaturamentoLote.id == request.id_faturamento_lote).first()
     if not fat:
         raise HTTPException(status_code=404, detail="Item de faturamento não encontrado.")
+    if not current_user.is_admin and fat.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este item de faturamento.")
     
     ag = db.query(Agendamento).filter(Agendamento.id_agendamento == request.id_agendamento).first()
     if not ag:
         raise HTTPException(status_code=404, detail="Agendamento não encontrado.")
+    if not current_user.is_admin and ag.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
     
     # Verificar se é apto a faturar
     if ag.numero_guia:
         guia_obj = db.query(BaseGuia).filter(BaseGuia.guia == ag.numero_guia).first()
         if guia_obj:
+            if not current_user.is_admin and guia_obj.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="A guia vinculada pertence a outro usuário.")
             status_ver = compute_status_verificacao(ag.data, guia_obj)
             if not status_ver["apto"]:
                 raise HTTPException(status_code=400, detail=f"Agendamento não apto: {status_ver['texto']}")
@@ -416,6 +441,8 @@ def editar_item(
     fat = db.query(FaturamentoLote).filter(FaturamentoLote.id == id_faturamento_lote).first()
     if not fat:
         raise HTTPException(status_code=404, detail="Item de faturamento não encontrado.")
+    if not current_user.is_admin and fat.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este item de faturamento.")
     
     # Aplicar edições
     if request.dataRealizacao is not None:
@@ -427,10 +454,13 @@ def editar_item(
     conciliado = False
     if fat.Guia and fat.CodigoBeneficiario and not fat.agendamento_id:
         # Buscar agendamentos com a mesma guia
-        ags = db.query(Agendamento).filter(
+        query_ags = db.query(Agendamento).filter(
             Agendamento.numero_guia == fat.Guia,
             Agendamento.Status == "Confirmado"
-        ).all()
+        )
+        if not current_user.is_admin:
+            query_ags = query_ags.filter(Agendamento.user_id == current_user.id)
+        ags = query_ags.all()
         
         ag = None
         for a in ags:
@@ -483,15 +513,20 @@ def listar_candidatos(
     fat = db.query(FaturamentoLote).filter(FaturamentoLote.id == id_faturamento_lote).first()
     if not fat:
         raise HTTPException(status_code=404, detail="Item de faturamento não encontrado.")
+    if not current_user.is_admin and fat.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este item de faturamento.")
     
     if not fat.Guia:
         return {"data": [], "message": "Item sem guia vinculada."}
     
     # Buscar agendamentos que tenham a mesma guia
-    agendamentos = db.query(Agendamento).filter(
+    query_ag = db.query(Agendamento).filter(
         Agendamento.numero_guia == fat.Guia,
         Agendamento.Status == "Confirmado"
-    ).all()
+    )
+    if not current_user.is_admin:
+        query_ag = query_ag.filter(Agendamento.user_id == current_user.id)
+    agendamentos = query_ag.all()
     
     data = []
     for ag in agendamentos:
@@ -525,6 +560,8 @@ def listar_candidatos_fat_por_guia(
         FaturamentoLote.Guia == numero_guia,
         FaturamentoLote.agendamento_id.is_(None)
     )
+    if not current_user.is_admin:
+        query = query.filter(FaturamentoLote.user_id == current_user.id)
     if id_lote_convenio:
         query = query.filter(FaturamentoLote.id_lote == id_lote_convenio)
     
@@ -556,10 +593,14 @@ def conciliar_manual_por_agendamento(
     ag = db.query(Agendamento).filter(Agendamento.id_agendamento == request.id_agendamento).first()
     if not ag:
         raise HTTPException(status_code=404, detail="Agendamento não encontrado.")
+    if not current_user.is_admin and ag.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
     
     fat = db.query(FaturamentoLote).filter(FaturamentoLote.id == request.id_faturamento_lote).first()
     if not fat:
         raise HTTPException(status_code=404, detail="Item de faturamento não encontrado.")
+    if not current_user.is_admin and fat.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este item de faturamento.")
     
     if fat.agendamento_id:
         raise HTTPException(status_code=400, detail="Este item de faturamento já está conciliado.")

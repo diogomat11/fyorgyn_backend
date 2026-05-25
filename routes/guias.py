@@ -50,6 +50,9 @@ def list_guias(
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)
     
+    if not current_user.is_admin:
+        query = query.filter(BaseGuia.user_id == current_user.id)
+    
     if id_convenio:
         if allowed_ids and id_convenio not in allowed_ids:
              raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
@@ -142,6 +145,9 @@ def export_guias(
         # Isolation: if user has a convenio, only show guias from that convenio
         from dependencies import get_allowed_convenio_ids
         allowed_ids = get_allowed_convenio_ids(current_user)
+        
+        if not current_user.is_admin:
+            query = query.filter(BaseGuia.user_id == current_user.id)
         
         if id_convenio:
             if allowed_ids and id_convenio not in allowed_ids:

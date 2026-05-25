@@ -71,6 +71,15 @@ def create_jobs(
             else:
                 raise HTTPException(status_code=400, detail="carteirinha_ids required for single/multiple")
         else:
+            # Se não for admin, verificar posse das carteirinhas
+            if not current_user.is_admin:
+                count_carteirinhas = db.query(Carteirinha).filter(
+                    Carteirinha.id.in_(request.carteirinha_ids),
+                    Carteirinha.user_id == current_user.id
+                ).count()
+                if count_carteirinhas != len(request.carteirinha_ids):
+                    raise HTTPException(status_code=403, detail="Uma ou mais carteirinhas não pertencem ao seu usuário.")
+
             # Special validation for IPASGO printing jobs (routine 5 or 12)
             if target_convenio == 6 and request.rotina in ['5', '12']:
                 import json
@@ -213,7 +222,10 @@ def export_fature_jobs(
     if allowed_ids and id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão.")
 
-    jobs = db.query(Job).filter(Job.id_convenio == id_convenio).order_by(Job.created_at.desc()).all()
+    query = db.query(Job).filter(Job.id_convenio == id_convenio)
+    if not current_user.is_admin:
+        query = query.filter(Job.user_id == current_user.id)
+    jobs = query.order_by(Job.created_at.desc()).all()
     
     data = []
     from models import Log
@@ -304,6 +316,8 @@ def list_jobs(
     current_user = Depends(get_current_user)
 ):
     query = db.query(Job)
+    if not current_user.is_admin:
+        query = query.filter(Job.user_id == current_user.id)
     
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)
@@ -359,30 +373,34 @@ def list_jobs(
     return {"data": results, "total": total, "skip": skip, "limit": limit}
 
 @router.delete("/{id}")
-def delete_job(id: int, db: Session = Depends(get_db)):
+def delete_job(id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     job = db.query(Job).filter(Job.id == id).first()
     if not job:
         raise HTTPException(404, "Job not found")
+    if not current_user.is_admin and job.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissao para este job.")
         
     # Validation: Only delete if error and attempts > 3
-    # User said: "probido exclusão de jobs em andamento ou com status sucess"
-    # "um Job só poderá ser excluido se status seja error e tentativas maior que 3"
+    # User said: "probido exclusao de jobs em andamento ou com status sucess"
+    # "um Job so podera ser excluido se status seja error e tentativas maior que 3"
     
     allowed = (job.status == 'error' and job.attempts > 3)
     # Or maybe allow pending if it's stuck? User didn't specify. Sticking to strict rule.
     
     if not allowed:
-         raise HTTPException(status_code=400, detail="Exclusão permitida apenas para Jobs com erro e mais de 3 tentativas.")
+         raise HTTPException(status_code=400, detail="Exclusao permitida apenas para Jobs com erro e mais de 3 tentativas.")
          
     db.delete(job)
     db.commit()
     return {"message": "Job deleted"}
 
 @router.post("/{id}/retry")
-def retry_job(id: int, db: Session = Depends(get_db)):
+def retry_job(id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     job = db.query(Job).filter(Job.id == id).first()
     if not job:
         raise HTTPException(404, "Job not found")
+    if not current_user.is_admin and job.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissao para este job.")
 
     # Validation: Same as delete?
     # "ao clicar em reenviar exibir mensagem de confirmação, o status será alterado para pending"

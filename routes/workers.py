@@ -32,18 +32,24 @@ def heartbeat(data: HeartbeatSchema, db: Session = Depends(get_db)):
     )
     return result
 
+from dependencies import get_current_user
+
 @router.get("/")
-def list_workers(db: Session = Depends(get_db)):
+def list_workers(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     """
     List all registered workers.
     """
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     return worker_service.get_all_workers(db)
 
 @router.post("/{worker_id}/restart")
-def restart_worker(worker_id: int, db: Session = Depends(get_db)):
+def restart_worker(worker_id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     """
     Queue a restart command for a worker.
     """
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     worker = worker_service.queue_restart_command(db, worker_id)
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")

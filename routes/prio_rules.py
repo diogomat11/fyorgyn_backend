@@ -26,12 +26,18 @@ class PriorityRuleResponse(PriorityRuleBase):
     class Config:
         from_attributes = True
 
+from dependencies import get_current_user
+
 @router.get("/", response_model=List[PriorityRuleResponse])
-def list_rules(db: Session = Depends(get_db)):
+def list_rules(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     return db.query(PriorityRule).order_by(PriorityRule.id_convenio, PriorityRule.rotina).all()
 
 @router.post("/", response_model=PriorityRuleResponse)
-def create_rule(rule: PriorityRuleBase, db: Session = Depends(get_db)):
+def create_rule(rule: PriorityRuleBase, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     new_rule = PriorityRule(**rule.model_dump())
     db.add(new_rule)
     db.commit()
@@ -39,7 +45,9 @@ def create_rule(rule: PriorityRuleBase, db: Session = Depends(get_db)):
     return new_rule
 
 @router.patch("/{rule_id}", response_model=PriorityRuleResponse)
-def update_rule(rule_id: int, rule_update: PriorityRuleUpdate, db: Session = Depends(get_db)):
+def update_rule(rule_id: int, rule_update: PriorityRuleUpdate, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     db_rule = db.query(PriorityRule).filter(PriorityRule.id == rule_id).first()
     if not db_rule:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -50,7 +58,9 @@ def update_rule(rule_id: int, rule_update: PriorityRuleUpdate, db: Session = Dep
     return db_rule
 
 @router.delete("/{rule_id}")
-def delete_rule(rule_id: int, db: Session = Depends(get_db)):
+def delete_rule(rule_id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     db_rule = db.query(PriorityRule).filter(PriorityRule.id == rule_id).first()
     if not db_rule:
         raise HTTPException(status_code=404, detail="Rule not found")

@@ -113,14 +113,18 @@ def get_lote_status(
     from services.protocolo_service import recalculate_lote_totals
     from models import ProtocoloLote
     
+    lote_basic = db.query(ProtocoloLote).filter(ProtocoloLote.id == lote_id).first()
+    if not lote_basic:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+        
+    if not current_user.is_admin and lote_basic.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
+    
     # Recalculate only if still active (processing or pending)
-    lote_basic = db.query(ProtocoloLote.id, ProtocoloLote.status).filter(ProtocoloLote.id == lote_id).first()
-    if lote_basic and lote_basic.status in ["pending", "processing"]:
+    if lote_basic.status in ["pending", "processing"]:
         recalculate_lote_totals(db, lote_id)
     
     result = svc_status(db, lote_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Lote não encontrado")
     return result
 
 
@@ -136,6 +140,14 @@ def cancel_lote(
 ):
     """Cancel an ongoing batch processing."""
     from services.protocolo_service import cancel_lote as svc_cancel
+    from models import ProtocoloLote
+
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+        
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
 
     success = svc_cancel(db, lote_id)
     if not success:
@@ -156,6 +168,14 @@ def reprocess_errors(
 ):
     """Reprocess only the files that failed or need review."""
     from services.protocolo_service import reprocess_errors as svc_reprocess
+    from models import ProtocoloLote
+
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+        
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
 
     count = svc_reprocess(db, lote_id)
     if count == 0:
@@ -176,6 +196,16 @@ def download_arquivo(
 ):
     """Download a single processed file."""
     from services.protocolo_service import get_arquivo_file_path
+    from models import ProtocoloArquivo, ProtocoloLote
+
+    arq = db.query(ProtocoloArquivo).filter(ProtocoloArquivo.id == arquivo_id).first()
+    if not arq:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == arq.lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote associado não encontrado")
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este arquivo.")
 
     result = get_arquivo_file_path(db, arquivo_id)
     if not result:
@@ -202,6 +232,16 @@ def update_arquivo(
 ):
     """Update the final filename of a file (manual override)."""
     from services.protocolo_service import update_arquivo_nome
+    from models import ProtocoloArquivo, ProtocoloLote
+
+    arq = db.query(ProtocoloArquivo).filter(ProtocoloArquivo.id == arquivo_id).first()
+    if not arq:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == arq.lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote associado não encontrado")
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este arquivo.")
 
     result = update_arquivo_nome(db, arquivo_id, body.nome_final)
     if not result:
@@ -223,6 +263,16 @@ def update_atendimentos(
 ):
     """Update the atendimentos (dates/signatures) of a file."""
     from services.protocolo_service import update_arquivo_atendimentos
+    from models import ProtocoloArquivo, ProtocoloLote
+
+    arq = db.query(ProtocoloArquivo).filter(ProtocoloArquivo.id == arquivo_id).first()
+    if not arq:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == arq.lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote associado não encontrado")
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este arquivo.")
 
     atend_dicts = [{"data": a.data, "assinatura": a.assinatura} for a in body.atendimentos]
     result = update_arquivo_atendimentos(db, arquivo_id, atend_dicts)
@@ -244,6 +294,16 @@ def delete_arquivo(
 ):
     """Delete a single file from the session."""
     from services.protocolo_service import delete_arquivo as svc_delete
+    from models import ProtocoloArquivo, ProtocoloLote
+
+    arq = db.query(ProtocoloArquivo).filter(ProtocoloArquivo.id == arquivo_id).first()
+    if not arq:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == arq.lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote associado não encontrado")
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este arquivo.")
 
     result = svc_delete(db, arquivo_id)
     if not result:
@@ -268,6 +328,13 @@ def download_zip(
     ZIPs are split into 10MB parts. Use ?part=N to download specific parts.
     """
     from services.protocolo_service import generate_download_zip
+    from models import ProtocoloLote
+
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
 
     zip_parts = generate_download_zip(db, lote_id)
 

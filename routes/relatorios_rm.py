@@ -123,11 +123,15 @@ def get_relatorio(
     current_user=Depends(get_current_user),
 ):
     """Get details of a single therapy extraction."""
-    from services.relatorio_rm_service import get_extraction
-
-    result = get_extraction(db, extraction_id)
+    from models import RelatorioMedicoExtracao
+    
+    result = db.query(RelatorioMedicoExtracao).filter(RelatorioMedicoExtracao.id == extraction_id).first()
     if not result:
         raise HTTPException(status_code=404, detail="Extração não encontrada")
+        
+    if not current_user.is_admin and result.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para esta extração.")
+        
     return result
 
 
@@ -144,14 +148,20 @@ def atualizar_relatorio(
 ):
     """Update therapy extraction values (manual user adjustment after AI extraction)."""
     from services.relatorio_rm_service import update_extraction
+    from models import RelatorioMedicoExtracao
+
+    result = db.query(RelatorioMedicoExtracao).filter(RelatorioMedicoExtracao.id == extraction_id).first()
+    if not result:
+        raise HTTPException(status_code=404, detail="Extração não encontrada")
+        
+    if not current_user.is_admin and result.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para esta extração.")
 
     updates = body.dict(exclude_none=True)
     if not updates:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
     result = update_extraction(db, extraction_id, updates)
-    if not result:
-        raise HTTPException(status_code=404, detail="Extração não encontrada")
     return result
 
 
@@ -167,8 +177,14 @@ def deletar_relatorio(
 ):
     """Delete a therapy extraction record."""
     from services.relatorio_rm_service import delete_extraction
+    from models import RelatorioMedicoExtracao
+
+    result = db.query(RelatorioMedicoExtracao).filter(RelatorioMedicoExtracao.id == extraction_id).first()
+    if not result:
+        raise HTTPException(status_code=404, detail="Extração não encontrada")
+        
+    if not current_user.is_admin and result.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para esta extração.")
 
     success = delete_extraction(db, extraction_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Extração não encontrada")
     return {"message": "Extração removida com sucesso"}

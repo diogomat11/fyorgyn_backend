@@ -25,12 +25,18 @@ class ServerConfigResponse(ServerConfigBase):
     class Config:
         from_attributes = True
 
+from dependencies import get_current_user
+
 @router.get("/", response_model=List[ServerConfigResponse])
-def list_configs(db: Session = Depends(get_db)):
+def list_configs(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     return db.query(ServerConfig).order_by(ServerConfig.server_url).all()
 
 @router.post("/", response_model=ServerConfigResponse)
-def create_config(cfg: ServerConfigBase, db: Session = Depends(get_db)):
+def create_config(cfg: ServerConfigBase, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     existing = db.query(ServerConfig).filter(ServerConfig.server_url == cfg.server_url).first()
     if existing:
         raise HTTPException(status_code=409, detail="Config for this server_url already exists. Use PATCH to update.")
@@ -41,7 +47,9 @@ def create_config(cfg: ServerConfigBase, db: Session = Depends(get_db)):
     return new
 
 @router.patch("/{cfg_id}", response_model=ServerConfigResponse)
-def update_config(cfg_id: int, update: ServerConfigUpdate, db: Session = Depends(get_db)):
+def update_config(cfg_id: int, update: ServerConfigUpdate, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     row = db.query(ServerConfig).filter(ServerConfig.id == cfg_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Config not found")
@@ -52,7 +60,9 @@ def update_config(cfg_id: int, update: ServerConfigUpdate, db: Session = Depends
     return row
 
 @router.delete("/{cfg_id}")
-def delete_config(cfg_id: int, db: Session = Depends(get_db)):
+def delete_config(cfg_id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso restrito a administradores.")
     row = db.query(ServerConfig).filter(ServerConfig.id == cfg_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="Config not found")

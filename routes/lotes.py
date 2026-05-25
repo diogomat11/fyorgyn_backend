@@ -32,6 +32,8 @@ def list_lotes(
     allowed_ids = get_allowed_convenio_ids(current_user)
     
     query = db.query(LoteConvenio)
+    if not current_user.is_admin:
+        query = query.filter(LoteConvenio.user_id == current_user.id)
     
     if id_convenio:
         if allowed_ids and id_convenio not in allowed_ids:
@@ -71,7 +73,8 @@ def create_lote(
         cod_prestador=request.cod_prestador,
         data_fim=request.data_fim,
         status="Processando",
-        numero_lote=None # Will be updated by Worker
+        numero_lote=None, # Will be updated by Worker
+        user_id=current_user.id
     )
     db.add(novo_lote)
     db.flush() # get id_lote
@@ -84,7 +87,8 @@ def create_lote(
             "cod_prestador": request.cod_prestador,
             "data_fim": request.data_fim.strftime("%d/%m/%Y"),
             "id_lote_interno": novo_lote.id_lote # Worker can update this row
-        })
+        }),
+        user_id=current_user.id
     )
     db.add(new_job)
     db.commit()
@@ -101,6 +105,9 @@ def cancelar_lote(
     lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == id_lote).first()
     if not lote:
         raise HTTPException(status_code=404, detail="Lote não encontrado")
+        
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
         
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids and lote.id_convenio not in allowed_ids:
@@ -135,7 +142,8 @@ def cancelar_lote(
             "cod_prestador": request.cod_prestador,
             "numero_lote": lote.numero_lote,
             "id_lote_interno": lote.id_lote
-        })
+        }),
+        user_id=current_user.id
     )
     db.add(new_job)
     db.commit()
@@ -154,6 +162,9 @@ def list_faturamentos_por_lote(
     if not lote:
         raise HTTPException(status_code=404, detail="Lote não encontrado")
         
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
+        
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids and lote.id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão.")
@@ -169,6 +180,9 @@ def list_faturamentos_por_lote(
         .outerjoin(cart, FaturamentoLote.CodigoBeneficiario == cart.codigo_beneficiario)
         .filter(FaturamentoLote.id_lote == lote.id_lote)
     )
+    if not current_user.is_admin:
+        query = query.filter(FaturamentoLote.user_id == current_user.id)
+        
     total = query.count()
     rows = query.order_by(FaturamentoLote.created_at.desc()).offset(skip).limit(limit).all()
     

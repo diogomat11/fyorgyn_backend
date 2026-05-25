@@ -28,6 +28,10 @@ def get_dashboard_stats(
         func.sum(case((Job.status == 'error', 1), else_=0)).label("error"),
         func.sum(case((Job.status.in_(['pending', 'processing']), 1), else_=0)).label("pending")
     )
+    if not current_user.is_admin:
+        cart_query = cart_query.filter(Carteirinha.user_id == current_user.id)
+        guia_query = guia_query.filter(BaseGuia.user_id == current_user.id)
+        job_query = job_query.filter(Job.user_id == current_user.id)
     
     from dependencies import get_allowed_convenio_ids
     from fastapi import HTTPException
