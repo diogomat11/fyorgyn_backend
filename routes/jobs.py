@@ -88,12 +88,18 @@ def create_jobs(
                     guia_num = p.get("numero_guia")
                     if guia_num:
                         from models import BaseGuia
-                        # Check if this guide belongs to one of the carteirinhas and is authorized
-                        valid_guia = db.query(BaseGuia).filter(
+                        # Check if this guide belongs to the user and is authorized
+                        query_guia = db.query(BaseGuia).filter(
                             BaseGuia.guia == guia_num,
-                            BaseGuia.carteirinha_id.in_(request.carteirinha_ids),
                             BaseGuia.status_guia.ilike('%autorizad%')
-                        ).first()
+                        )
+                        if not current_user.is_admin:
+                            query_guia = query_guia.filter(BaseGuia.user_id == current_user.id)
+                        
+                        if request.carteirinha_ids:
+                            query_guia = query_guia.filter(BaseGuia.carteirinha_id.in_(request.carteirinha_ids))
+                            
+                        valid_guia = query_guia.first()
                         if not valid_guia:
                             raise HTTPException(status_code=400, detail="Apenas guias autorizadas podem ser enviadas para impressão.")
                 except json.JSONDecodeError:
