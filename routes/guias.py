@@ -139,8 +139,9 @@ def export_guias(
             BaseGuia.codigo_terapia,         # 6
             BaseGuia.qtde_solicitada,        # 7
             BaseGuia.sessoes_autorizadas,    # 8
-            BaseGuia.created_at              # 9
-        ).select_from(BaseGuia).join(Carteirinha, BaseGuia.carteirinha_id == Carteirinha.id)
+            BaseGuia.created_at,             # 9
+            BaseGuia.codigo_beneficiario     # 10
+        ).select_from(BaseGuia).outerjoin(Carteirinha, BaseGuia.carteirinha_id == Carteirinha.id)
 
         # Isolation: if user has a convenio, only show guias from that convenio
         from dependencies import get_allowed_convenio_ids
@@ -182,7 +183,7 @@ def export_guias(
         for row in results:
             count += 1
             ws.append([
-                row.carteirinha or "",
+                row.carteirinha or row.codigo_beneficiario or "",
                 row.paciente or "",
                 row.guia,
                 fmt_date(row.data_autorizacao),
