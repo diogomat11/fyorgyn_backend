@@ -34,6 +34,34 @@ def create_jobs(
     current_user = Depends(get_current_user)
 ):
     import json
+    
+    # Validação para OP11 do IPASGO (requer ao menos 1 parâmetro: datas, guia ou carteirinha)
+    if request.rotina in ['11', 'op11_import_guias_api']:
+        has_params = False
+        if request.carteirinha_ids and len(request.carteirinha_ids) > 0:
+            has_params = True
+        if request.params:
+            try:
+                p_dict = json.loads(request.params)
+                if (
+                    p_dict.get("data_ini") or 
+                    p_dict.get("data_fim") or 
+                    p_dict.get("start_date") or 
+                    p_dict.get("end_date") or 
+                    p_dict.get("guia") or 
+                    p_dict.get("numero_guia") or 
+                    p_dict.get("carteira") or 
+                    p_dict.get("codigoBeneficiario")
+                ):
+                    has_params = True
+            except Exception:
+                pass
+        if not has_params:
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP11, informe ao menos um parâmetro: intervalo de datas, guia ou carteirinha."
+            )
+
     if request.rotina and "fature" in request.rotina:
         request.rotina = request.rotina.replace("_fature", "").replace("fature_", "")
         try:
