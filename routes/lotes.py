@@ -175,9 +175,15 @@ def list_faturamentos_por_lote(
     from sqlalchemy.orm import aliased
     cart = aliased(Carteirinha)
     
+    from sqlalchemy import and_
+    
     query = (
         db.query(FaturamentoLote, cart.paciente.label("nome_beneficiario"))
-        .outerjoin(cart, FaturamentoLote.CodigoBeneficiario == cart.codigo_beneficiario)
+        .outerjoin(cart, and_(
+            FaturamentoLote.CodigoBeneficiario == cart.codigo_beneficiario,
+            FaturamentoLote.user_id == cart.user_id,
+            cart.id_convenio == lote.id_convenio
+        ))
         .filter(FaturamentoLote.id_lote == lote.id_lote)
     )
     if not current_user.is_admin:
@@ -193,3 +199,55 @@ def list_faturamentos_por_lote(
         data.append(dic)
     
     return {"data": data, "total": total}
+
+class UpdateLoteItemRequest(BaseModel):
+    status_conferencia: Optional[int] = None
+    auto_envio: Optional[bool] = False
+    data_realizacao: Optional[str] = None
+
+@router.put("/itens/{id}")
+def update_lote_item(
+    id: int,
+    request: UpdateLoteItemRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    item = db.query(FaturamentoLote).filter(FaturamentoLote.id == id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item de faturamento não encontrado.")
+    if not current_user.is_admin and item.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este item.")
+        
+    lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == item.id_lote).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote associado não encontrado.")
+        
+    if request.data_realizacao is not None:
+        try:
+            item.dataRealizacao = date.fromisoformat(request.data_realizacao)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Formato de data inválido. Use AAAA-MM-DD.")
+            
+    if request.status_conferencia is not None:
+        item.StatusConferencia = request.status_conferencia
+        
+    # Se status_conferencia for alterado e auto_envio for True e for IPASGO
+    if request.status_conferencia is not None and request.auto_envio and lote.id_convenio == 6:
+        import json
+        new_job = Job(
+            carteirinha_id=None,
+            id_convenio=6,
+            rotina="7",
+            params=json.dumps({
+                "detalheId": item.detalheId,
+                "status": request.status_conferencia,
+                "dataRealizacao": item.dataRealizacao.strftime("%d/%m/%Y") if item.dataRealizacao else None,
+                "valorProcedimento": item.ValorProcedimento or ""
+            }),
+            status="pending",
+            user_id=current_user.id
+        )
+        db.add(new_job)
+        
+    db.commit()
+    return {"message": "Item atualizado com sucesso."}

@@ -38,15 +38,20 @@ from dependencies import get_current_user
 def create_agendamento(req: CreateAgendamentoRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     # 1. Load dependencies based on input
     
-    # Check Carteirinha
-    cart = db.query(Carteirinha).filter(
+    query = db.query(Carteirinha).filter(
         Carteirinha.carteirinha == req.carteirinha,
         Carteirinha.id_convenio == req.id_convenio
-    ).first()
+    )
+    if not current_user.is_admin:
+        query = query.filter(Carteirinha.user_id == current_user.id)
+    cart = query.first()
     
     if not cart:
         # Tenta buscar ignorando o convenio, caso seja cart universal ou errada
-        cart = db.query(Carteirinha).filter(Carteirinha.carteirinha == req.carteirinha).first()
+        query2 = db.query(Carteirinha).filter(Carteirinha.carteirinha == req.carteirinha)
+        if not current_user.is_admin:
+            query2 = query2.filter(Carteirinha.user_id == current_user.id)
+        cart = query2.first()
         if not cart:
             raise HTTPException(status_code=404, detail="Carteirinha não encontrada.")
 
@@ -288,7 +293,8 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                 if should_create_capture:
                     cart = db.query(Carteirinha).filter(
                         Carteirinha.carteirinha == ag.carteirinha, 
-                        Carteirinha.id_convenio == ag.id_convenio
+                        Carteirinha.id_convenio == ag.id_convenio,
+                        Carteirinha.user_id == ag.user_id
                     ).first()
                     if cart:
                         # 1. Busca ou Cria Captura
@@ -297,7 +303,7 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                             from sqlalchemy import cast, String
                             cap_job = db.query(Job).filter(
                                 Job.id_convenio == ag.id_convenio,
-                                Job.rotina == "Captura",
+                                Job.rotina.in_(["Captura", "op2_captura"]),
                                 Job.status.in_(["pending", "processing", "success"]),
                                 cast(Job.params, String).contains(ag.numero_guia)
                             ).first()
@@ -306,7 +312,7 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                             cap_job = Job(
                                 carteirinha_id=cart.id,
                                 id_convenio=ag.id_convenio,
-                                rotina="Captura",
+                                rotina="op2_captura",
                                 status="pending",
                                 params=json.dumps({"agendamento_id": ag.id_agendamento, "numero_guia": ag.numero_guia or ""}),
                                 user_id=current_user.id
@@ -319,9 +325,9 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                         if ag.id_convenio == 2:
                             from sqlalchemy import cast, String
                             existing_exec = db.query(Job).filter(
-                                Job.rotina == "Execução",
+                                Job.rotina.in_(["Execução", "op3_execucao"]),
                                 Job.status.in_(["pending", "processing"]),
-                                cast(Job.params, String).contains(f'"agendamento_id": {ag.id_agendamento}')
+                                cast(Job.params, String).contains(str(ag.id_agendamento))
                             ).first()
  
                             if not existing_exec:
@@ -349,7 +355,7 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                                 exec_job = Job(
                                     carteirinha_id=cart.id,
                                     id_convenio=cart.id_convenio,
-                                    rotina="Execução",
+                                    rotina="op3_execucao",
                                     status="pending",
                                     depending_id=cap_job.id,
                                     params=json.dumps(exec_params),
@@ -363,30 +369,32 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                 if ag.id_convenio == 6:
                     from sqlalchemy import cast, String
                     existing_exec = db.query(Job).filter(
-                        Job.rotina == "Execução",
+                        Job.rotina.in_(["Execução", "op4_confirma_guia"]),
                         Job.status.in_(["pending", "processing"]),
-                        cast(Job.params, String).contains(f'"agendamento_id": {ag.id_agendamento}')
+                        cast(Job.params, String).contains(str(ag.id_agendamento))
                     ).first()
  
                     if not existing_exec:
                         cart = db.query(Carteirinha).filter(
                             Carteirinha.carteirinha == ag.carteirinha, 
-                            Carteirinha.id_convenio == ag.id_convenio
+                            Carteirinha.id_convenio == ag.id_convenio,
+                            Carteirinha.user_id == ag.user_id
                         ).first()
                         
                         if cart:
-                            # Parametros Mínimos OP4 Ipasgo (numero_guia, sessoes_realizadas)
+                            # Parametros Mínimos OP4 Ipasgo (numero_guia, sessoes_realizadas, carteira)
                             sessoes = getattr(req, "sessoes_realizadas", 1) # fallback seguro para 1 sessão
                             exec_params = {
                                 "agendamento_id": ag.id_agendamento,
                                 "numero_guia": ag.numero_guia or "",
                                 "cod_procedimento_fat": ag.cod_procedimento_fat or "",
-                                "sessoes_realizadas": sessoes
+                                "sessoes_realizadas": sessoes,
+                                "carteira": cart.carteirinha
                             }
                             exec_job = Job(
                                 carteirinha_id=cart.id,
                                 id_convenio=cart.id_convenio,
-                                rotina="Execução",
+                                rotina="op4_confirma_guia",
                                 status="pending",
                                 depending_id=None,
                                 params=json.dumps(exec_params),
@@ -451,7 +459,11 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
     
     jobs_created = []
     for agenda in agendamentos:
-        cart = db.query(Carteirinha).filter(Carteirinha.carteirinha == agenda.carteirinha, Carteirinha.id_convenio == agenda.id_convenio).first()
+        cart = db.query(Carteirinha).filter(
+            Carteirinha.carteirinha == agenda.carteirinha, 
+            Carteirinha.id_convenio == agenda.id_convenio,
+            Carteirinha.user_id == agenda.user_id
+        ).first()
         
         if cart:
             # Anápolis (id_convenio=2): cria par Captura + Execução dependente
@@ -461,7 +473,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
                 if agenda.numero_guia:
                     cap_job = db.query(Job).filter(
                         Job.id_convenio == 2,
-                        Job.rotina == "Captura",
+                        Job.rotina.in_(["Captura", "op2_captura"]),
                         Job.status.in_(["pending", "processing", "success"]),
                         Job.params.contains(agenda.numero_guia)
                     ).first()
@@ -470,7 +482,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
                     cap_job = Job(
                         carteirinha_id=cart.id,
                         id_convenio=cart.id_convenio,
-                        rotina="Captura",
+                        rotina="op2_captura",
                         status="pending",
                         params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
                         user_id=current_user.id
@@ -482,9 +494,9 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
 
                 # Verifica se já existe Execução para este agendamento
                 existing_exec = db.query(Job).filter(
-                    Job.rotina == "Execução",
+                    Job.rotina.in_(["Execução", "op3_execucao"]),
                     Job.status.in_(["pending", "processing"]),
-                    Job.params.contains(f'"agendamento_id": {agenda.id_agendamento}')
+                    cast(Job.params, String).contains(str(agenda.id_agendamento))
                 ).first()
 
                 if not existing_exec:
@@ -511,7 +523,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
                     exec_job = Job(
                         carteirinha_id=cart.id,
                         id_convenio=cart.id_convenio,
-                        rotina="Execução",
+                        rotina="op3_execucao",
                         status="pending",
                         depending_id=cap_job.id,
                         params=json.dumps(exec_params),
@@ -550,6 +562,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
 class AgendamentoJobRequest(BaseModel):
     agendamento_id: int
     depending_id: Optional[int] = None
+    sessoes_realizadas: Optional[int] = 1
 
 @router.post("/capturar")
 def create_job_captura(req: AgendamentoJobRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
@@ -562,7 +575,8 @@ def create_job_captura(req: AgendamentoJobRequest, db: Session = Depends(get_db)
 
     cart = db.query(Carteirinha).filter(
         Carteirinha.carteirinha == agenda.carteirinha, 
-        Carteirinha.id_convenio == agenda.id_convenio
+        Carteirinha.id_convenio == agenda.id_convenio,
+        Carteirinha.user_id == agenda.user_id
     ).first()
     
     if not cart:
@@ -575,7 +589,7 @@ def create_job_captura(req: AgendamentoJobRequest, db: Session = Depends(get_db)
     if agenda.numero_guia:
         existing = db.query(Job).filter(
             Job.id_convenio == agenda.id_convenio,
-            Job.rotina == "Captura",
+            Job.rotina.in_(["Captura", "op2_captura"]),
             Job.status.in_(["pending", "processing", "success"]),
             Job.params.contains(agenda.numero_guia)
         ).first()
@@ -588,7 +602,7 @@ def create_job_captura(req: AgendamentoJobRequest, db: Session = Depends(get_db)
     new_job = Job(
         carteirinha_id=cart.id,
         id_convenio=agenda.id_convenio,
-        rotina="Captura",
+        rotina="op2_captura",
         status="pending",
         params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
         user_id=current_user.id
@@ -610,7 +624,8 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
 
     cart = db.query(Carteirinha).filter(
         Carteirinha.carteirinha == agenda.carteirinha, 
-        Carteirinha.id_convenio == agenda.id_convenio
+        Carteirinha.id_convenio == agenda.id_convenio,
+        Carteirinha.user_id == agenda.user_id
     ).first()
     
     if not cart:
@@ -642,6 +657,15 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
             "cod_procedimento_fat": agenda.cod_procedimento_fat or ""
         })
 
+    # Para IPASGO (id_convenio=6): enriquece params com carteira, procedimento, sessoes_realizadas
+    if agenda.id_convenio == 6:
+        sessoes_req = req.sessoes_realizadas if getattr(req, "sessoes_realizadas", None) is not None else 1
+        params_base.update({
+            "carteira": cart.carteirinha,
+            "cod_procedimento_fat": agenda.cod_procedimento_fat or "",
+            "sessoes_realizadas": sessoes_req
+        })
+
     params_json = json.dumps(params_base)
     cap_job_id = req.depending_id  # fallback se já fornecido
     
@@ -653,7 +677,7 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
             from sqlalchemy import cast, String
             existing_cap = db.query(Job).filter(
                 Job.id_convenio == agenda.id_convenio,
-                Job.rotina == "Captura",
+                Job.rotina.in_(["Captura", "op2_captura"]),
                 Job.status.in_(["pending", "processing", "success"]),
                 cast(Job.params, String).contains(agenda.numero_guia)
             ).first()
@@ -665,7 +689,7 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
             cap_job = Job(
                 carteirinha_id=cart.id,
                 id_convenio=agenda.id_convenio,
-                rotina="Captura",
+                rotina="op2_captura",
                 status="pending",
                 params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
                 user_id=current_user.id
@@ -677,10 +701,12 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
     
     # Anti-duplicidade Execução
     from sqlalchemy import cast, String
+    exec_rotina = "op3_execucao" if agenda.id_convenio == 2 else "op4_confirma_guia" if agenda.id_convenio == 6 else "op3_execucao"
+    
     existing_exec = db.query(Job).filter(
-        Job.rotina == "Execução",
+        Job.rotina.in_(["Execução", "op3_execucao", "op4_confirma_guia"]),
         Job.status.in_(["pending", "processing"]),
-        cast(Job.params, String).contains(f'"agendamento_id": {agenda.id_agendamento}')
+        cast(Job.params, String).contains(str(agenda.id_agendamento))
     ).first()
 
     if existing_exec:
@@ -693,7 +719,7 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
     new_job = Job(
         carteirinha_id=cart.id,
         id_convenio=agenda.id_convenio,
-        rotina="Execução",
+        rotina=exec_rotina,
         status="pending",
         depending_id=cap_job_id,
         params=params_json,
@@ -706,4 +732,35 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
     db.commit()
     db.refresh(new_job)
     return {"status": "success", "job_id": new_job.id, "captura_job_id": cap_job_id}
+
+
+@router.get("/profissionais")
+def list_profissionais(
+    tipo: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Retorna a lista de profissionais ativos do corpo clínico, opcionalmente filtrados por tipo (profissional/medico)."""
+    query = db.query(CorpoClinico).filter(CorpoClinico.status == "ativo")
+    if not current_user.is_admin:
+        query = query.filter((CorpoClinico.user_id == current_user.id) | (CorpoClinico.user_id.is_(None)))
+    
+    if tipo:
+        query = query.filter(CorpoClinico.tipo_profissional == tipo)
+        
+    profissionais = query.order_by(CorpoClinico.nome).all()
+    return [
+        {
+            "id_profissional": p.id_profissional,
+            "nome": p.nome,
+            "conselho": p.conselho or "",
+            "registro": p.registro or "",
+            "UF": p.UF or "",
+            "CBO": p.CBO or "",
+            "codigo_ipasgo": p.codigo_ipasgo or "",
+            "tipo_profissional": p.tipo_profissional or "profissional"
+        }
+        for p in profissionais
+    ]
+
 

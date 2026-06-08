@@ -35,6 +35,76 @@ def create_jobs(
 ):
     import json
     
+    # Enrich and normalize job parameters for authorization/job execution
+    if request.params:
+        try:
+            p_dict = json.loads(request.params)
+            
+            # 1. Fetch patient and convenio details
+            if request.carteirinha_ids and len(request.carteirinha_ids) > 0:
+                from models import Carteirinha, Convenio
+                cart = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
+                if cart:
+                    p_dict["Paciente"] = cart.paciente or ""
+                    p_dict["Carteira"] = cart.carteirinha or ""
+                    p_dict["TarjaMagnetica"] = getattr(cart, "tarja_magnetica", "") or ""
+                    
+                    conv = db.query(Convenio).filter(Convenio.id_convenio == cart.id_convenio).first()
+                    if conv:
+                        p_dict["convenio"] = conv.nome or ""
+            
+            # 2. Extract Cod_procedimento_Aut and Qtde
+            procs = p_dict.get("procedimentos", [])
+            if procs and len(procs) > 0:
+                p_dict["Cod_procedimento_Aut"] = procs[0].get("codigo_procedimento") or ""
+                p_dict["Qtde"] = procs[0].get("qtde_solicitada") or 1
+            elif p_dict.get("codigo_procedimento"):
+                p_dict["Cod_procedimento_Aut"] = p_dict.get("codigo_procedimento")
+                p_dict["Qtde"] = p_dict.get("qtde_solicitada") or 1
+                
+            # 3. Retrieve professional details from database if id_profissional is provided
+            id_prof = p_dict.get("id_profissional")
+            from models import CorpoClinico
+            if id_prof:
+                prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
+                if prof:
+                    p_dict["Profissional_nome"] = prof.nome or ""
+                    p_dict["Profissional_cod_convenio"] = prof.codigo_ipasgo or ""
+                    p_dict["Profissional_nomeConselho"] = prof.conselho or ""
+                    p_dict["Profisisonal_NumerConselho"] = prof.registro or ""
+                    p_dict["Profissional_UFConselho"] = prof.UF or ""
+                    p_dict["Profissional_CBO"] = prof.CBO or ""
+                    
+            # 4. Retrieve doctor (medico) details from database if id_medico is provided
+            id_med = p_dict.get("id_medico")
+            if id_med:
+                med = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_med).first()
+                if med:
+                    p_dict["Medico_Nome"] = med.nome or ""
+                    p_dict["Medico_NomeConselho"] = med.conselho or ""
+                    p_dict["Medico_NumeroConselho"] = med.registro or ""
+                    p_dict["Medico_UFConselho"] = med.UF or ""
+                    p_dict["Medico_CBO"] = med.CBO or ""
+            elif p_dict.get("medico_mesmo_profissional") and id_prof:
+                prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
+                if prof:
+                    p_dict["Medico_Nome"] = prof.nome or ""
+                    p_dict["Medico_NomeConselho"] = prof.conselho or ""
+                    p_dict["Medico_NumeroConselho"] = prof.registro or ""
+                    p_dict["Medico_UFConselho"] = prof.UF or ""
+                    p_dict["Medico_CBO"] = prof.CBO or ""
+
+            # 5. Flatten attachments (Anexo1, TipoAnexo1, Anexo2, TipoAnexo2 ...)
+            anex_list = p_dict.get("anexos", [])
+            if anex_list:
+                for idx, a in enumerate(anex_list):
+                    p_dict[f"Anexo{idx+1}"] = a.get("nome") or ""
+                    p_dict[f"TipoAnexo{idx+1}"] = a.get("tipo") or ""
+            
+            request.params = json.dumps(p_dict)
+        except Exception as e:
+            print(f"Error parsing/augmenting job params: {e}")
+    
     # Validação para OP11 do IPASGO (requer ao menos 1 parâmetro: datas, guia ou carteirinha)
     if request.rotina in ['11', 'op11_import_guias_api']:
         has_params = False
@@ -88,7 +158,15 @@ def create_jobs(
         created_count = job_service.create_all_jobs(db, id_convenio=target_convenio, rotina=request.rotina, params=request.params, user_id=current_user.id)
             
     elif request.type in ['single', 'multiple']:
-        is_ipasgo_standalone = target_convenio == 6 and request.rotina in ['3', 'op3_import_guias', '6', 'op6_check_baixados', '7', 'op7_fat_facplan', '11', 'op11_import_guias_api', '12', 'op12_impressao_api']
+        is_ipasgo_standalone = target_convenio == 6 and request.rotina in [
+            '3', 'op3_import_guias', 
+            '6', 'op6_check_baixados', 
+            '7', 'op7_fat_facplan', 
+            '11', 'op11_import_guias_api', 
+            '12', 'op12_impressao_api',
+            '13', 'op13_criar_lote',
+            '14', 'op14_cancelar_lote'
+        ]
         
         if not request.carteirinha_ids:
             if is_ipasgo_standalone and request.type == 'single':
@@ -109,7 +187,7 @@ def create_jobs(
                     raise HTTPException(status_code=403, detail="Uma ou mais carteirinhas não pertencem ao seu usuário.")
 
             # Special validation for IPASGO printing jobs (routine 5 or 12)
-            if target_convenio == 6 and request.rotina in ['5', '12']:
+            if target_convenio == 6 and request.rotina in ['5', 'op5_impress_guia', '12', 'op12_impressao_api']:
                 import json
                 try:
                     p = json.loads(request.params or '{}')

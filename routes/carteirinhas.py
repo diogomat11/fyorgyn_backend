@@ -234,7 +234,8 @@ async def upload_carteirinhas(
                 derived_convenio = target_convenio # Fallback to form/default
 
             existing = db.query(Carteirinha).filter(
-                Carteirinha.carteirinha == item['carteirinha']
+                Carteirinha.carteirinha == item['carteirinha'],
+                Carteirinha.user_id == user.id
             ).first()
             
             if existing:
@@ -378,8 +379,12 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
     # Validate format
     validate_carteirinha_format(item['carteirinha'])
     
-    # Check if already exists
-    existing = db.query(Carteirinha).filter(Carteirinha.carteirinha == item['carteirinha']).first()
+    # Check if already exists for this user or is unowned (legacy)
+    existing = db.query(Carteirinha).filter(
+        Carteirinha.carteirinha == item['carteirinha']
+    ).filter(
+        or_(Carteirinha.user_id == user.id, Carteirinha.user_id.is_(None))
+    ).first()
     if existing:
         if not user.is_admin:
             if existing.user_id is None:
@@ -393,8 +398,6 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
                 db.commit()
                 db.refresh(existing)
                 return existing
-            elif existing.user_id != user.id:
-                raise HTTPException(status_code=403, detail="Esta carteirinha pertence a outro usuario.")
         raise HTTPException(status_code=400, detail=f"Carteirinha {item['carteirinha']} already exists")
     
     from dependencies import get_allowed_convenio_ids

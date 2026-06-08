@@ -3,13 +3,13 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import (
     Agendamento, FaturamentoLote, LoteConvenio, LoteAgendamento,
-    LoteAgendamentoItem, Carteirinha, BaseGuia
+    LoteAgendamentoItem, Carteirinha, BaseGuia, Job
 )
 from dependencies import get_current_user, get_allowed_convenio_ids
 from typing import Optional, List
 from pydantic import BaseModel
 from datetime import date
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 router = APIRouter(
     prefix="/conciliacao",
@@ -26,15 +26,22 @@ class GerarLoteAgendamentoRequest(BaseModel):
 class ConciliarRequest(BaseModel):
     id_lote_convenio: int  # id_lote da tabela lotes_convenio
     id_lote_ag: int        # id_lote_ag da tabela lotes_agendamento
+    auto_envio: Optional[bool] = False
 
 class ConciliarManualRequest(BaseModel):
     id_faturamento_lote: int
     id_agendamento: int
+    auto_envio: Optional[bool] = False
+
+class ReverterRequest(BaseModel):
+    id_lote_ag: int
+    auto_envio: Optional[bool] = False
 
 class EditarItemRequest(BaseModel):
     dataRealizacao: Optional[date] = None
     Guia: Optional[str] = None
     cod_procedimento_fat: Optional[str] = None
+    auto_envio: Optional[bool] = False
 
 # ── Helpers ──
 
@@ -84,7 +91,12 @@ def resolve_codigo_beneficiario(db: Session, ag: Agendamento) -> Optional[str]:
             return cart.codigo_beneficiario
     if ag.carteirinha:
         cart_val = ag.carteirinha.strip()
-        cart = db.query(Carteirinha).filter(Carteirinha.carteirinha == cart_val).first()
+        cart = db.query(Carteirinha).filter(
+            Carteirinha.carteirinha == cart_val,
+            Carteirinha.user_id == ag.user_id
+        ).first()
+        if not cart:
+            cart = db.query(Carteirinha).filter(Carteirinha.carteirinha == cart_val).first()
         if cart and cart.codigo_beneficiario:
             return cart.codigo_beneficiario
     return None
@@ -149,15 +161,19 @@ def gerar_lote_agendamento(
     if allowed_ids and request.id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
     
-    # Buscar agendamentos confirmados no intervalo
+    # Buscar agendamentos confirmados no intervalo do próprio usuário logado
     query_ags = db.query(Agendamento).filter(
         Agendamento.id_convenio == request.id_convenio,
         Agendamento.Status == "Confirmado",
         Agendamento.data >= request.data_inicio,
-        Agendamento.data <= request.data_fim
+        Agendamento.data <= request.data_fim,
+        Agendamento.user_id == current_user.id
     )
-    if not current_user.is_admin:
-        query_ags = query_ags.filter(Agendamento.user_id == current_user.id)
+    
+    # Excluir agendamentos que já possuem lote de agendamento associado
+    subquery_exists = db.query(LoteAgendamentoItem.id_agendamento)
+    query_ags = query_ags.filter(~Agendamento.id_agendamento.in_(subquery_exists))
+    
     agendamentos = query_ags.all()
     
     if not agendamentos:
@@ -260,6 +276,97 @@ def list_itens_lote_agendamento(
 
 # ── Endpoints: Conciliação ──
 
+@router.post("/reverter")
+def reverter_conciliacao(
+    request: ReverterRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Desvincula o lote de agendamento do lote de faturamento.
+    Coloca todos os itens correspondentes de volta para Não Conciliado (agendamento)
+    e pendente/Não Conferido (faturamento).
+    Se auto_envio for True e for IPASGO, gera um Job OP7 para atualizar o status dos itens para 78 (Não Conferido) no portal.
+    """
+    lote_ag = db.query(LoteAgendamento).filter(LoteAgendamento.id_lote_ag == request.id_lote_ag).first()
+    if not lote_ag:
+        raise HTTPException(status_code=404, detail="Lote de agendamento não encontrado.")
+    if not current_user.is_admin and lote_ag.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote de agendamento.")
+        
+    id_lote_convenio = lote_ag.id_lote_convenio
+    if not id_lote_convenio:
+        raise HTTPException(status_code=400, detail="Este lote de agendamento não possui conciliação vinculada para reverter.")
+        
+    lote_conv = db.query(LoteConvenio).filter(LoteConvenio.id_lote == id_lote_convenio).first()
+    
+    # 1. Obter todos os IDs de agendamento vinculados a este lote de agendamento
+    ag_ids_q = db.query(LoteAgendamentoItem.id_agendamento).filter(
+        LoteAgendamentoItem.id_lote_ag == request.id_lote_ag
+    ).all()
+    ag_ids = [r[0] for r in ag_ids_q]
+    
+    itens_faturamento_revertidos = []
+    
+    if ag_ids:
+        # 2. Resetar qualquer item de faturamento correspondente sob o lote de convênio vinculado
+        fat_query = db.query(FaturamentoLote).filter(
+            FaturamentoLote.id_lote == id_lote_convenio,
+            FaturamentoLote.agendamento_id.in_(ag_ids)
+        )
+        if not current_user.is_admin:
+            fat_query = fat_query.filter(FaturamentoLote.user_id == current_user.id)
+            
+        fat_items = fat_query.all()
+        
+        for fat in fat_items:
+            # Resetar dados do faturamento
+            fat.agendamento_id = None
+            fat.dataRealizacao = None
+            fat.StatusConferencia = 78  # Não Conferido
+            fat.StatusConciliacao = "pendente"
+            itens_faturamento_revertidos.append(fat)
+            
+    # 3. Resetar status dos itens no lote de agendamento
+    db.query(LoteAgendamentoItem).filter(
+        LoteAgendamentoItem.id_lote_ag == request.id_lote_ag
+    ).update({
+        LoteAgendamentoItem.status_conciliacao: "Não Conciliado",
+        LoteAgendamentoItem.id_faturamento_lote: None
+    }, synchronize_session=False)
+    
+    # Limpar vínculo no lote de agendamento
+    lote_ag.id_lote_convenio = None
+    
+    # Criar Job OP7 de reversão se auto_envio for True e for IPASGO
+    if request.auto_envio and lote_conv and lote_conv.id_convenio == 6 and itens_faturamento_revertidos:
+        import json
+        new_job = Job(
+            carteirinha_id=None,
+            id_convenio=6,
+            rotina="7",
+            params=json.dumps({
+                "itens": [
+                    {
+                        "detalheId": fat.detalheId,
+                        "status": 78,  # Retorna para Não Conferido no portal
+                        "dataRealizacao": None,
+                        "valorProcedimento": fat.ValorProcedimento or ""
+                    } for fat in itens_faturamento_revertidos
+                ]
+            }),
+            status="pending",
+            user_id=current_user.id
+        )
+        db.add(new_job)
+        
+    db.commit()
+    
+    return {
+        "message": f"Reversão concluída: {len(itens_faturamento_revertidos)} itens desvinculados.",
+        "revertidos": len(itens_faturamento_revertidos)
+    }
+
 @router.post("/conciliar")
 def conciliar_lote(
     request: ConciliarRequest,
@@ -314,7 +421,11 @@ def conciliar_lote(
     
     carts_by_text = {}
     if cart_texts_raw:
-        for c in db.query(Carteirinha).filter(Carteirinha.carteirinha.in_(cart_texts_raw)).all():
+        query_cart = db.query(Carteirinha).filter(
+            Carteirinha.carteirinha.in_(cart_texts_raw),
+            or_(Carteirinha.user_id == lote_ag.user_id, Carteirinha.user_id.is_(None))
+        )
+        for c in query_cart.all():
             carts_by_text[c.carteirinha] = c
     
     carts_by_id = {}
@@ -344,6 +455,7 @@ def conciliar_lote(
             ag_map[key].append((lai, ag))
     
     count_conciliados = 0
+    itens_conciliados = []
     
     for fat in fat_items:
         if not fat.Guia:
@@ -368,12 +480,35 @@ def conciliar_lote(
             lai.id_faturamento_lote = fat.id
             
             count_conciliados += 1
+            itens_conciliados.append(fat)
             
     # Contar pendentes do lote de agendamento para bater com o dashboard
     total_ag_pendentes = db.query(LoteAgendamentoItem).filter(
         LoteAgendamentoItem.id_lote_ag == request.id_lote_ag,
         LoteAgendamentoItem.status_conciliacao != "Conciliado"
     ).count()
+    
+    # Criar Job OP7 se auto_envio for True e for IPASGO
+    if request.auto_envio and lote_conv.id_convenio == 6 and itens_conciliados:
+        import json
+        new_job = Job(
+            carteirinha_id=None,
+            id_convenio=6,
+            rotina="7",
+            params=json.dumps({
+                "itens": [
+                    {
+                        "detalheId": fat.detalheId,
+                        "status": 67,
+                        "dataRealizacao": fat.dataRealizacao.strftime("%d/%m/%Y") if fat.dataRealizacao else None,
+                        "valorProcedimento": fat.ValorProcedimento or ""
+                    } for fat in itens_conciliados
+                ]
+            }),
+            status="pending",
+            user_id=current_user.id
+        )
+        db.add(new_job)
     
     db.commit()
     
@@ -425,6 +560,26 @@ def conciliar_manual(
     if lai:
         lai.status_conciliacao = "Conciliado"
         lai.id_faturamento_lote = fat.id
+    
+    # Criar Job OP7 se auto_envio for True e for IPASGO
+    if request.auto_envio:
+        lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == fat.id_lote).first()
+        if lote and lote.id_convenio == 6:
+            import json
+            new_job = Job(
+                carteirinha_id=None,
+                id_convenio=6,
+                rotina="7",
+                params=json.dumps({
+                    "detalheId": fat.detalheId,
+                    "status": 67,
+                    "dataRealizacao": fat.dataRealizacao.strftime("%d/%m/%Y") if fat.dataRealizacao else None,
+                    "valorProcedimento": fat.ValorProcedimento or ""
+                }),
+                status="pending",
+                user_id=current_user.id
+            )
+            db.add(new_job)
     
     db.commit()
     
@@ -495,6 +650,26 @@ def editar_item(
             if guia_obj:
                 status_ver = compute_status_verificacao(ag.data, guia_obj)
     
+    # Criar Job OP7 se auto_envio for True e for IPASGO
+    if conciliado and request.auto_envio:
+        lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == fat.id_lote).first()
+        if lote and lote.id_convenio == 6:
+            import json
+            new_job = Job(
+                carteirinha_id=None,
+                id_convenio=6,
+                rotina="7",
+                params=json.dumps({
+                    "detalheId": fat.detalheId,
+                    "status": 67,
+                    "dataRealizacao": fat.dataRealizacao.strftime("%d/%m/%Y") if fat.dataRealizacao else None,
+                    "valorProcedimento": fat.ValorProcedimento or ""
+                }),
+                status="pending",
+                user_id=current_user.id
+            )
+            db.add(new_job)
+            
     db.commit()
     
     return {
@@ -582,6 +757,7 @@ def listar_candidatos_fat_por_guia(
 class ConciliarManualPorAgendamentoRequest(BaseModel):
     id_agendamento: int
     id_faturamento_lote: int  # id (PK) da tabela faturamento_lotes
+    auto_envio: Optional[bool] = False
 
 @router.post("/conciliar-manual-ag")
 def conciliar_manual_por_agendamento(
@@ -617,5 +793,109 @@ def conciliar_manual_por_agendamento(
         lai.status_conciliacao = "Conciliado"
         lai.id_faturamento_lote = fat.id
     
+    # Criar Job OP7 se auto_envio for True e for IPASGO
+    if request.auto_envio:
+        lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == fat.id_lote).first()
+        if lote and lote.id_convenio == 6:
+            import json
+            new_job = Job(
+                carteirinha_id=None,
+                id_convenio=6,
+                rotina="7",
+                params=json.dumps({
+                    "detalheId": fat.detalheId,
+                    "status": 67,
+                    "dataRealizacao": fat.dataRealizacao.strftime("%d/%m/%Y") if fat.dataRealizacao else None,
+                    "valorProcedimento": fat.ValorProcedimento or ""
+                }),
+                status="pending",
+                user_id=current_user.id
+            )
+            db.add(new_job)
+            
     db.commit()
     return {"message": "Conciliação manual realizada com sucesso."}
+
+@router.delete("/lote-agendamento/{id_lote_ag}")
+def delete_lote_agendamento(
+    id_lote_ag: int,
+    auto_envio: Optional[bool] = False,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Exclui um lote de agendamento.
+    Se o lote estiver conciliado (id_lote_convenio preenchido), reverte a conciliação primeiro:
+      - Reseta os itens de faturamento vinculados para "Não Conferido (78)" e "pendente".
+      - Se auto_envio for True e for IPASGO, gera o Job OP7 de reversão.
+    Depois, exclui o lote de agendamento, liberando os agendamentos.
+    """
+    lote_ag = db.query(LoteAgendamento).filter(LoteAgendamento.id_lote_ag == id_lote_ag).first()
+    if not lote_ag:
+        raise HTTPException(status_code=404, detail="Lote de agendamento não encontrado.")
+    if not current_user.is_admin and lote_ag.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote de agendamento.")
+
+    id_lote_convenio = lote_ag.id_lote_convenio
+    itens_faturamento_revertidos = []
+
+    # 1. Se estiver conciliado, reverte a conciliação dos itens de faturamento correspondentes
+    if id_lote_convenio:
+        lote_conv = db.query(LoteConvenio).filter(LoteConvenio.id_lote == id_lote_convenio).first()
+        
+        # Obter todos os IDs de agendamento neste lote
+        ag_ids_q = db.query(LoteAgendamentoItem.id_agendamento).filter(
+            LoteAgendamentoItem.id_lote_ag == id_lote_ag
+        ).all()
+        ag_ids = [r[0] for r in ag_ids_q]
+        
+        if ag_ids:
+            fat_query = db.query(FaturamentoLote).filter(
+                FaturamentoLote.id_lote == id_lote_convenio,
+                FaturamentoLote.agendamento_id.in_(ag_ids)
+            )
+            if not current_user.is_admin:
+                fat_query = fat_query.filter(FaturamentoLote.user_id == current_user.id)
+                
+            fat_items = fat_query.all()
+            for fat in fat_items:
+                fat.agendamento_id = None
+                fat.dataRealizacao = None
+                fat.StatusConferencia = 78  # Não Conferido
+                fat.StatusConciliacao = "pendente"
+                itens_faturamento_revertidos.append(fat)
+
+        # Enfileirar Job OP7 de reversão se auto_envio for True e for IPASGO
+        if auto_envio and lote_conv and lote_conv.id_convenio == 6 and itens_faturamento_revertidos:
+            import json
+            new_job = Job(
+                carteirinha_id=None,
+                id_convenio=6,
+                rotina="7",
+                params=json.dumps({
+                    "itens": [
+                        {
+                            "detalheId": fat.detalheId,
+                            "status": 78,
+                            "dataRealizacao": None,
+                            "valorProcedimento": fat.ValorProcedimento or ""
+                        } for fat in itens_faturamento_revertidos
+                    ]
+                }),
+                status="pending",
+                user_id=current_user.id
+            )
+            db.add(new_job)
+
+    # 2. Excluir itens associados
+    db.query(LoteAgendamentoItem).filter(LoteAgendamentoItem.id_lote_ag == id_lote_ag).delete()
+
+    # 3. Excluir o lote principal
+    db.delete(lote_ag)
+    db.commit()
+
+    return {
+        "message": f"Lote de agendamento #{id_lote_ag} excluído com sucesso. {len(itens_faturamento_revertidos)} itens de faturamento revertidos.",
+        "revertidos": len(itens_faturamento_revertidos)
+    }
+

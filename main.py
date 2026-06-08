@@ -7,7 +7,7 @@ from routes import auth, carteirinhas, jobs, guias, logs, dashboard, debug_optim
 # Create tables
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Base Guias Unimed API", version="1.0.0")
+app = FastAPI(title="FyorGyn API", version="1.0.0")
 
 # Configure CORS
 origins = [
@@ -27,7 +27,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"message": "Base Guias Unimed API is running"}
+    return {"message": "FyorGyn API is running"}
 
 import asyncio
 from database import SessionLocal

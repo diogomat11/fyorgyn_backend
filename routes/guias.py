@@ -31,7 +31,7 @@ def list_guias(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    from sqlalchemy import func, case
+    from sqlalchemy import func, case, and_, or_
     from models import Agendamento
     
     subq = db.query(
@@ -43,8 +43,19 @@ def list_guias(
     query = db.query(
         BaseGuia,
         func.coalesce(subq.c.q_realizadas, 0).label('computed_realizadas'),
-        func.coalesce(subq.c.q_a_confirmar, 0).label('computed_a_confirmar')
-    ).outerjoin(subq, BaseGuia.guia == subq.c.numero_guia)
+        func.coalesce(subq.c.q_a_confirmar, 0).label('computed_a_confirmar'),
+        Carteirinha.paciente.label('nome_paciente'),
+        Carteirinha.carteirinha.label('carteirinha_numero')
+    ).select_from(BaseGuia)\
+     .outerjoin(subq, BaseGuia.guia == subq.c.numero_guia)\
+     .outerjoin(Carteirinha, and_(
+         BaseGuia.carteirinha_id == Carteirinha.id,
+         or_(
+             BaseGuia.user_id == Carteirinha.user_id,
+             Carteirinha.user_id.is_(None),
+             BaseGuia.user_id.is_(None)
+         )
+     ))
     
     # Isolation: if user has a convenio, only show guias from that convenio
     from dependencies import get_allowed_convenio_ids
@@ -88,9 +99,13 @@ def list_guias(
         guia_obj = row[0]
         q_realizadas = int(row[1] or 0)
         q_a_confirmar = int(row[2] or 0)
+        nome_paciente = row[3]
+        carteirinha_numero = row[4]
         
         g_dict = {c.name: getattr(guia_obj, c.name) for c in guia_obj.__table__.columns}
         g_dict['sessoes_realizadas'] = q_realizadas
+        g_dict['nome_paciente'] = nome_paciente
+        g_dict['carteirinha_numero'] = carteirinha_numero
         
         # Saldo dinâmico (Autorizado - realizadas - a confirmar)
         auth = g_dict.get('sessoes_autorizadas') or 0
@@ -118,8 +133,13 @@ def export_guias(
         wb = Workbook(write_only=True)
         ws = wb.create_sheet("Guias")
         
-        headers = ["Carteirinha", "Paciente", "Guia", "Data_Autorização", "Senha", 
-                   "Validade", "Código_Terapia", "Qtde_Solicitada", "Sessões Autorizadas", "Importado_Em"]
+        is_ipasgo = (id_convenio == 6)
+        if is_ipasgo:
+            headers = ["Carteirinha", "Paciente", "Guia", "Senha", "Status", "Data Solicitacao", 
+                       "Data Autorizacao", "Codigo", "Qtde Solicit", "Qtde Aut", "Validade", "Data Importacao"]
+        else:
+            headers = ["Carteirinha", "Paciente", "Guia", "Data_Autorização", "Senha", 
+                       "Validade", "Código_Terapia", "Qtde_Solicitada", "Sessões Autorizadas", "Importado_Em"]
         ws.append(headers)
         
         # Helper to format date
@@ -140,7 +160,9 @@ def export_guias(
             BaseGuia.qtde_solicitada,        # 7
             BaseGuia.sessoes_autorizadas,    # 8
             BaseGuia.created_at,             # 9
-            BaseGuia.codigo_beneficiario     # 10
+            BaseGuia.codigo_beneficiario,    # 10
+            BaseGuia.status_guia,            # 11
+            BaseGuia.data_solicitacao        # 12
         ).select_from(BaseGuia).outerjoin(Carteirinha, BaseGuia.carteirinha_id == Carteirinha.id)
 
         # Isolation: if user has a convenio, only show guias from that convenio
@@ -182,18 +204,34 @@ def export_guias(
         count = 0
         for row in results:
             count += 1
-            ws.append([
-                row.carteirinha or row.codigo_beneficiario or "",
-                row.paciente or "",
-                row.guia,
-                fmt_date(row.data_autorizacao),
-                row.senha,
-                fmt_date(row.validade),
-                row.codigo_terapia,
-                row.qtde_solicitada,
-                row.sessoes_autorizadas,
-                row.created_at.strftime("%d/%m/%Y %H:%M:%S") if row.created_at else ""
-            ])
+            if is_ipasgo:
+                ws.append([
+                    row.carteirinha or row.codigo_beneficiario or "",
+                    row.paciente or "",
+                    row.guia,
+                    row.senha,
+                    row.status_guia,
+                    fmt_date(row.data_solicitacao),
+                    fmt_date(row.data_autorizacao),
+                    row.codigo_terapia,
+                    row.qtde_solicitada,
+                    row.sessoes_autorizadas,
+                    fmt_date(row.validade),
+                    row.created_at.strftime("%d/%m/%Y %H:%M:%S") if row.created_at else ""
+                ])
+            else:
+                ws.append([
+                    row.carteirinha or row.codigo_beneficiario or "",
+                    row.paciente or "",
+                    row.guia,
+                    fmt_date(row.data_autorizacao),
+                    row.senha,
+                    fmt_date(row.validade),
+                    row.codigo_terapia,
+                    row.qtde_solicitada,
+                    row.sessoes_autorizadas,
+                    row.created_at.strftime("%d/%m/%Y %H:%M:%S") if row.created_at else ""
+                ])
 
         print(f"DEBUG: Processed {count} rows. Saving Workbook...")
         output = io.BytesIO()

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, DateTime, Time, ForeignKey, Text, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Date, DateTime, Time, ForeignKey, Text, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -40,17 +40,19 @@ class User(Base):
 
 class Carteirinha(Base):
     __tablename__ = "carteirinhas"
-    __table_args__ = {'extend_existing': True}
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    __table_args__ = (
+        UniqueConstraint('carteirinha', 'user_id', name='uq_carteirinha_user_id'),
+        {'extend_existing': True}
+    )
 
     id = Column(Integer, primary_key=True, index=True)
-    carteirinha = Column(Text, unique=True, nullable=False)
+    carteirinha = Column(Text, nullable=False)
     paciente = Column(Text)
     id_paciente = Column(Text, index=True)
     codigo_beneficiario = Column(Text, nullable=True) # ID of user in external system (e.g., IPASGO)
     status = Column(Text, default="ativo")
     id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
@@ -386,6 +388,7 @@ class CorpoClinico(Base):
     CBO = Column(Text)
     codigo_ipasgo = Column(Text)
     status = Column(Text, default="ativo")
+    tipo_profissional = Column(Text, default="profissional")
 
 class Agendamento(Base):
     __tablename__ = "agendamentos"

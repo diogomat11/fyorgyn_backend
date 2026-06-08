@@ -45,8 +45,11 @@ def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: O
     """
     Creates a temporary patient and job.
     """
-    # Check if carteirinha already exists (even temp)
-    existing = db.query(Carteirinha).filter(Carteirinha.carteirinha == carteirinha).first()
+    # Check if carteirinha already exists (even temp) for this user
+    query = db.query(Carteirinha).filter(Carteirinha.carteirinha == carteirinha)
+    if user_id is not None:
+        query = query.filter(Carteirinha.user_id == user_id)
+    existing = query.first()
     cart_id = None
     
     if existing:
@@ -64,7 +67,8 @@ def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: O
             paciente=paciente,
             id_paciente=fake_id_paciente,
             is_temporary=True,
-            expires_at=datetime.utcnow() + timedelta(hours=1)
+            expires_at=datetime.utcnow() + timedelta(hours=1),
+            user_id=user_id
         )
         db.add(new_cart)
         db.flush() # Get ID
