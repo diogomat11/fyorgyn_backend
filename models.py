@@ -66,18 +66,18 @@ class Carteirinha(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
-    __table_args__ = {'extend_existing': True}
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
-    carteirinha_id = Column(Integer, ForeignKey("carteirinhas.id", ondelete="CASCADE"), nullable=True)
-    id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    carteirinha_id = Column(Integer, ForeignKey("public.carteirinhas.id", ondelete="CASCADE"), nullable=True)
+    id_convenio = Column(Integer, ForeignKey("public.convenios.id_convenio", ondelete="SET NULL"), nullable=True)
+    user_id = Column(Integer, ForeignKey("public.users.id", ondelete="SET NULL"), nullable=True, index=True)
     rotina = Column(Text) # consulta_guias, autorizacao, etc.
     params = Column(JSONB, nullable=True) # Arbitrary JSON parameters
     status = Column(Text, nullable=False, default="pending", index=True) # success, pending, processing, error
     attempts = Column(Integer, default=0)
     priority = Column(Integer, default=0)
-    depending_id = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    depending_id = Column(Integer, ForeignKey("worker.jobs.id", ondelete="SET NULL"), nullable=True)
     locked_by = Column(Text) # Server URL
     timeout = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -150,12 +150,12 @@ class PatientPei(Base):
 
 class Log(Base):
     __tablename__ = "logs"
-    __table_args__ = {'extend_existing': True}
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
-    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
-    carteirinha_id = Column(Integer, ForeignKey("carteirinhas.id", ondelete="Set NULL"), nullable=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    job_id = Column(Integer, ForeignKey("worker.jobs.id", ondelete="SET NULL"), nullable=True)
+    carteirinha_id = Column(Integer, ForeignKey("public.carteirinhas.id", ondelete="SET NULL"), nullable=True)
+    user_id = Column(Integer, ForeignKey("public.users.id", ondelete="SET NULL"), nullable=True, index=True)
     level = Column(Text, default="INFO") # INFO, WARN, ERROR
     message = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -166,13 +166,13 @@ class Log(Base):
 
 class Worker(Base):
     __tablename__ = "workers"
-    __table_args__ = {'extend_existing': True}
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
     hostname = Column(Text, unique=True, nullable=False)
     status = Column(Text, default="offline") # idle, processing, offline, error
     last_heartbeat = Column(DateTime(timezone=True), server_default=func.now())
-    current_job_id = Column(Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    current_job_id = Column(Integer, ForeignKey("worker.jobs.id", ondelete="SET NULL"), nullable=True)
     command = Column(Text, nullable=True) # restart, stop, etc.
     meta = Column(Text, nullable=True) # JSON string for CPU, RAM, Version
     first_error_at = Column(DateTime(timezone=True), nullable=True)

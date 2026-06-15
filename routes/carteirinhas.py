@@ -225,6 +225,12 @@ async def upload_carteirinhas(
         if not carteirinhas_data and warnings:
              raise HTTPException(status_code=400, detail="Nenhuma carteirinha válida na importação.\n" + "\n".join(warnings[:15]))
              
+        # Otimização: Carrega carteirinhas existentes em memória para evitar queries N+1
+        existing_carts = db.query(Carteirinha).filter(
+            or_(Carteirinha.user_id == user.id, Carteirinha.user_id.is_(None))
+        ).all()
+        existing_map = {c.carteirinha: c for c in existing_carts}
+
         count_added = 0
         count_updated = 0
         
@@ -233,10 +239,7 @@ async def upload_carteirinhas(
             if derived_convenio not in valid_convenios:
                 derived_convenio = target_convenio # Fallback to form/default
 
-            existing = db.query(Carteirinha).filter(
-                Carteirinha.carteirinha == item['carteirinha'],
-                Carteirinha.user_id == user.id
-            ).first()
+            existing = existing_map.get(item['carteirinha'])
             
             if existing:
                 # Se não for admin, verificar posse
@@ -285,6 +288,13 @@ async def upload_carteirinhas(
         
         db.commit()
         
+        # Invalidação do cache
+        try:
+            from cache import cache
+            cache.invalidate_tenant(user.id)
+        except Exception as e:
+            print(f"Error invalidating cache: {e}")
+        
         return {
             "message": "Upload processed successfully",
             "added": count_added,
@@ -319,6 +329,22 @@ def list_carteirinhas(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
+    # Montar parâmetros da consulta para gerar chave de cache única
+    cache_params = {
+        "skip": skip,
+        "limit": limit,
+        "search": search,
+        "status": status,
+        "codigo_beneficiario": codigo_beneficiario,
+        "id_convenio": id_convenio,
+        "paciente": paciente
+    }
+    
+    from cache import cache
+    cached_res = cache.get(user.id, "carteirinhas", cache_params)
+    if cached_res:
+        return cached_res
+
     query = db.query(Carteirinha)
     if not user.is_admin:
         query = query.filter(Carteirinha.user_id == user.id)
@@ -362,12 +388,18 @@ def list_carteirinhas(
     total = query.count()
     carteirinhas = query.offset(skip).limit(limit).all()
     
-    return {
-        "data": carteirinhas,
+    res_payload = {
+        "data": [
+            {c.name: getattr(cart, c.name) for c in cart.__table__.columns}
+            for cart in carteirinhas
+        ],
         "total": total,
         "skip": skip,
         "limit": limit
     }
+    
+    cache.set(user.id, "carteirinhas", cache_params, res_payload, ttl=300)
+    return res_payload
 
 @router.post("", response_model=None)
 @router.post("/", include_in_schema=False)
@@ -396,6 +428,11 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
                 if 'status' in item: existing.status = item['status']
                 if item.get('id_convenio'): existing.id_convenio = item['id_convenio']
                 db.commit()
+                try:
+                    from cache import cache
+                    cache.invalidate_tenant(user.id)
+                except Exception as e:
+                    print(f"Error invalidating cache: {e}")
                 db.refresh(existing)
                 return existing
         raise HTTPException(status_code=400, detail=f"Carteirinha {item['carteirinha']} already exists")
@@ -416,6 +453,11 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
     
     db.add(new_cart)
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(user.id)
+    except Exception as e:
+        print(f"Error invalidating cache: {e}")
     db.refresh(new_cart)
     
     return new_cart
@@ -447,6 +489,11 @@ def update_carteirinha(carteirinha_id: int, item: dict = Body(...), db: Session 
         cart.status = item['status']
         
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(user.id)
+    except Exception as e:
+        print(f"Error invalidating cache: {e}")
     db.refresh(cart)
     return cart
 
@@ -461,4 +508,9 @@ def delete_carteirinha(carteirinha_id: int, db: Session = Depends(get_db), user:
         
     db.delete(cart)
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(user.id)
+    except Exception as e:
+        print(f"Error invalidating cache: {e}")
     return {"message": "Deleted successfully"}

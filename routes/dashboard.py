@@ -19,6 +19,22 @@ def get_dashboard_stats(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    cache_params = {
+        "id_convenio": id_convenio
+    }
+    
+    # Auto-sincronizar antes do dashboard para garantir dados novos
+    try:
+        from services.guias_sync_service import sync_completed_worker_jobs
+        sync_completed_worker_jobs(db)
+    except Exception as e:
+        print(f"Error syncing completed jobs during dashboard load: {e}")
+        
+    from cache import cache
+    cached_res = cache.get(current_user.id, "dashboard", cache_params)
+    if cached_res:
+        return cached_res
+
     # Isolation
     cart_query = db.query(Carteirinha)
     guia_query = db.query(BaseGuia)
@@ -58,7 +74,7 @@ def get_dashboard_stats(
     jobs_error = job_stats.error or 0
     jobs_pending = job_stats.pending or 0
     
-    return {
+    res_payload = {
         "overview": {
             "total_carteirinhas": total_carteirinhas,
             "total_guias": total_guias,
@@ -70,3 +86,6 @@ def get_dashboard_stats(
             "pending": jobs_pending
         }
     }
+    
+    cache.set(current_user.id, "dashboard", cache_params, res_payload, ttl=10)
+    return res_payload

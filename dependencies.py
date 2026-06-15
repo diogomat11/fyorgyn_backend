@@ -1,8 +1,13 @@
+import os
+import jwt
 from fastapi import Depends, HTTPException, status, Header
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User
-from datetime import datetime
+from datetime import datetime, timedelta
+
+JWT_SECRET = os.getenv("JWT_SECRET", "fyorgyn_jwt_secret_2025_secure_key")
+JWT_ALGORITHM = "HS256"
 
 async def get_current_user(authorization: str = Header(None), db: Session = Depends(get_db)):
     if not authorization:
@@ -19,17 +24,40 @@ async def get_current_user(authorization: str = Header(None), db: Session = Depe
     
     token = authorization.split(" ")[1]
     
-    # In this simple implementation, the token IS the api_key.
-    # In a JWT implementation, we would decode the token here.
+    # Tentar JWT primeiro
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = int(payload.get("sub"))
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            if user.status != "Ativo":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Usuário inativo."
+                )
+            if user.validade and user.validade < datetime.now().date():
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Chave de acesso vencida."
+                )
+            return user
+    except (jwt.PyJWTError, ValueError, TypeError):
+        pass
+        
+    # Fallback: API Key
     user = db.query(User).filter(User.api_key == token).first()
-    
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token inválido ou usuário não encontrado."
         )
         
-    # Validade check
+    if user.status != "Ativo":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Usuário inativo."
+        )
+        
     if user.validade and user.validade < datetime.now().date():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

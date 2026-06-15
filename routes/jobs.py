@@ -101,6 +101,36 @@ def create_jobs(
                     p_dict[f"Anexo{idx+1}"] = a.get("nome") or ""
                     p_dict[f"TipoAnexo{idx+1}"] = a.get("tipo") or ""
             
+            # 6. Fetch user credentials for the convenio and inject into params (makes job self-contained)
+            target_conv_id = request.id_convenio
+            if not target_conv_id and request.carteirinha_ids and len(request.carteirinha_ids) > 0:
+                from models import Carteirinha
+                cart = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
+                if cart:
+                    target_conv_id = cart.id_convenio
+            
+            if target_conv_id:
+                from models import UserConvenio
+                uconv = db.query(UserConvenio).filter(
+                    UserConvenio.user_id == current_user.id,
+                    UserConvenio.id_convenio == target_conv_id
+                ).first()
+                if uconv:
+                    p_dict["login"] = uconv.login
+                    p_dict["senha_criptografada"] = uconv.senha_criptografada
+                    p_dict["cod_prestador"] = uconv.cod_prestador
+                    p_dict["login_fat"] = uconv.login_fat
+                    p_dict["senha_fat_criptografada"] = uconv.senha_fat_criptografada
+
+            # 7. Set strict_session_affinity (default True for Bradesco OP1 to avoid login conflicts)
+            is_bradesco_op1 = False
+            if target_conv_id == 1:
+                # Rotina 1 (consulta/faturamento) ou rotinas de consulta
+                if request.rotina in ['1', 'op1_consulta', 'op1_fature', 'op0_login']:
+                    is_bradesco_op1 = True
+            
+            p_dict["strict_session_affinity"] = p_dict.get("strict_session_affinity", is_bradesco_op1)
+            
             request.params = json.dumps(p_dict)
         except Exception as e:
             print(f"Error parsing/augmenting job params: {e}")
@@ -427,6 +457,13 @@ def list_jobs(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    # Auto-sincronizar guias extraídas pelo worker
+    try:
+        from services.guias_sync_service import sync_completed_worker_jobs
+        sync_completed_worker_jobs(db)
+    except Exception as e:
+        print(f"Error syncing completed jobs during list_jobs: {e}")
+
     query = db.query(Job)
     if not current_user.is_admin:
         query = query.filter(Job.user_id == current_user.id)
@@ -532,3 +569,24 @@ def retry_job(id: int, db: Session = Depends(get_db), current_user = Depends(get
     
     db.commit()
     return {"message": "Job queued for retry", "status": job.status}
+
+
+@router.post("/sync-results")
+def sync_results(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """
+    Sincroniza manualmente guias extraídas do worker.
+    """
+    try:
+        from services.guias_sync_service import sync_completed_worker_jobs
+        counts = sync_completed_worker_jobs(db)
+        return {
+            "status": "success",
+            "message": "Sincronização concluída com sucesso.",
+            "details": counts
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR if 'status' in globals() else 500,
+            detail=f"Erro ao sincronizar resultados do worker: {str(e)}"
+        )
+

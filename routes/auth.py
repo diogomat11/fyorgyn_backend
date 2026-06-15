@@ -30,8 +30,21 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             detail="Chave está vencida. Contratar nova."
         )
 
+    import jwt
+    from datetime import datetime, timedelta, timezone
+    from dependencies import JWT_SECRET, JWT_ALGORITHM
+    
+    payload = {
+        "sub": str(user.id),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=24),
+        "iat": datetime.now(timezone.utc),
+        "username": user.username,
+        "is_admin": user.is_admin
+    }
+    jwt_token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
     return {
-        "token": user.api_key, # Simple token for now, or could use JWT
+        "token": jwt_token,
         "username": user.username,
         "validade": user.validade,
         "is_admin": user.is_admin

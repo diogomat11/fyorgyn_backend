@@ -34,6 +34,34 @@ def list_guias(
     from sqlalchemy import func, case, and_, or_
     from models import Agendamento
     
+    # Montar parâmetros da consulta para gerar chave de cache única
+    cache_params = {
+        "start_date": str(start_date) if start_date else None,
+        "end_date": str(end_date) if end_date else None,
+        "created_at_start": str(created_at_start) if created_at_start else None,
+        "created_at_end": str(created_at_end) if created_at_end else None,
+        "carteirinha_id": carteirinha_id,
+        "id_convenio": id_convenio,
+        "aba": aba,
+        "status": status,
+        "senha": senha,
+        "codigo_terapia": codigo_terapia,
+        "limit": limit,
+        "skip": skip
+    }
+    
+    from cache import cache
+    cached_res = cache.get(current_user.id, "guias", cache_params)
+    if cached_res:
+        return cached_res
+
+    # Auto-sincronizar guias extraídas pelo worker
+    try:
+        from services.guias_sync_service import sync_completed_worker_jobs
+        sync_completed_worker_jobs(db)
+    except Exception as e:
+        print(f"Error syncing completed jobs during list_guias: {e}")
+    
     subq = db.query(
         Agendamento.numero_guia,
         func.sum(case((Agendamento.Status == 'Confirmado', 1), else_=0)).label('q_realizadas'),
@@ -113,7 +141,9 @@ def list_guias(
         
         guias_data.append(g_dict)
     
-    return {"data": guias_data, "total": total, "skip": skip, "limit": limit}
+    res_payload = {"data": guias_data, "total": total, "skip": skip, "limit": limit}
+    cache.set(current_user.id, "guias", cache_params, res_payload, ttl=30)
+    return res_payload
 
 @router.get("/export")
 def export_guias(
