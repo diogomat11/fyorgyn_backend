@@ -253,6 +253,11 @@ def create_jobs(
         raise HTTPException(status_code=400, detail="Invalid job type")
 
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(current_user.id)
+    except Exception as e:
+        print(f"Error invalidating cache in create_jobs: {e}")
     return {"message": f"Created/Queued jobs", "count": created_count}
 
 @router.post("/import/fature-batch")
@@ -349,6 +354,11 @@ async def import_fature_batch(
         created_count += 1
         
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(current_user.id)
+    except Exception as e:
+        print(f"Error invalidating cache in import_fature_batch: {e}")
     return {"message": "Lote importado com sucesso", "count": created_count}
 
 @router.get("/export/fature")
@@ -457,6 +467,20 @@ def list_jobs(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    cache_params = {
+        "status": status,
+        "created_at_start": str(created_at_start) if created_at_start else None,
+        "created_at_end": str(created_at_end) if created_at_end else None,
+        "id_convenio": id_convenio,
+        "limit": limit,
+        "skip": skip
+    }
+    
+    from cache import cache
+    cached_res = cache.get(current_user.id, "jobs", cache_params)
+    if cached_res:
+        return cached_res
+
     # Auto-sincronizar guias extraídas pelo worker
     try:
         from services.guias_sync_service import sync_completed_worker_jobs
@@ -493,6 +517,15 @@ def list_jobs(
     
     from models import Log
     results = []
+    
+    # Batch query error logs to avoid N+1 queries
+    error_job_ids = [j.id for j in jobs if j.status == 'error']
+    error_logs_map = {}
+    if error_job_ids:
+        errs = db.query(Log).filter(Log.job_id.in_(error_job_ids), Log.level == "ERROR").all()
+        for log in sorted(errs, key=lambda x: x.created_at):
+            error_logs_map[log.job_id] = log.message
+
     for j in jobs:
         j_dict = {
             "id": j.id,
@@ -510,16 +543,18 @@ def list_jobs(
             "error_message": None
         }
         if j.status == 'error':
-            last_err = db.query(Log).filter(Log.job_id == j.id, Log.level == "ERROR").order_by(Log.created_at.desc()).first()
-            if last_err:
-                msg_lower = last_err.message.lower()
+            last_err_msg = error_logs_map.get(j.id)
+            if last_err_msg:
+                msg_lower = last_err_msg.lower()
                 if "carteira inv" in msg_lower or "dígito" in msg_lower or "invalida" in msg_lower:
                     j_dict["error_message"] = "Carteira inválida"
                 else:
-                    j_dict["error_message"] = last_err.message
+                    j_dict["error_message"] = last_err_msg
         results.append(j_dict)
     
-    return {"data": results, "total": total, "skip": skip, "limit": limit}
+    res_payload = {"data": results, "total": total, "skip": skip, "limit": limit}
+    cache.set(current_user.id, "jobs", cache_params, res_payload, ttl=15)
+    return res_payload
 
 @router.delete("/{id}")
 def delete_job(id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
@@ -541,6 +576,11 @@ def delete_job(id: int, db: Session = Depends(get_db), current_user = Depends(ge
          
     db.delete(job)
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(current_user.id)
+    except Exception as e:
+        print(f"Error invalidating cache in delete_job: {e}")
     return {"message": "Job deleted"}
 
 @router.post("/{id}/retry")
@@ -568,6 +608,11 @@ def retry_job(id: int, db: Session = Depends(get_db), current_user = Depends(get
     job.updated_at = datetime.utcnow()
     
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(current_user.id)
+    except Exception as e:
+        print(f"Error invalidating cache in retry_job: {e}")
     return {"message": "Job queued for retry", "status": job.status}
 
 

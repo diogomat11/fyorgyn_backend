@@ -149,43 +149,52 @@ def bulk_upsert_guias_from_json(
     if not records:
         return {"total": 0, "affected_rows": 0, "skipped": skipped}
     
-    # Batch INSERT ON CONFLICT usando o índice funcional uq_guia_conv_ter_cart
-    # Como o índice usa COALESCE, precisamos usar raw SQL para o ON CONFLICT
-    # Alternativa: fazer batch em chunks para evitar problemas com NULLs
+    # Batch INSERT ON CONFLICT using in-memory mapping to avoid N+1 queries.
+    guia_list = list({r["guia"] for r in records})
+    convenio_list = list({r["id_convenio"] for r in records})
     
-    # Usar batch insert via SQLAlchemy para compatibilidade
+    existing_guias = db.query(BaseGuia).filter(
+        BaseGuia.user_id == user_id,
+        BaseGuia.guia.in_(guia_list),
+        BaseGuia.id_convenio.in_(convenio_list)
+    ).all()
+    
+    existing_map = {}
+    for eg in existing_guias:
+        norm_guia = str(eg.guia).strip()
+        norm_conv = eg.id_convenio
+        norm_ter = str(eg.codigo_terapia).strip() if eg.codigo_terapia else ""
+        norm_cid = eg.carteirinha_id
+        key = (norm_guia, norm_conv, norm_ter, norm_cid)
+        existing_map[key] = eg
+
     count_inserted = 0
     count_updated = 0
     
     for record in records:
-        # Buscar existente usando mesma lógica do índice funcional
-        existing = db.query(BaseGuia).filter(
-            BaseGuia.guia == record["guia"],
-            BaseGuia.id_convenio == record["id_convenio"],
-        ).filter(
-            # Match codigo_terapia (com COALESCE logic)
-            BaseGuia.codigo_terapia == record["codigo_terapia"]
-            if record["codigo_terapia"]
-            else BaseGuia.codigo_terapia.is_(None) | (BaseGuia.codigo_terapia == "")
-        ).filter(
-            BaseGuia.carteirinha_id == record["carteirinha_id"]
-            if record["carteirinha_id"]
-            else BaseGuia.carteirinha_id.is_(None)
-        ).first()
+        norm_guia = record["guia"]
+        norm_conv = record["id_convenio"]
+        norm_ter = str(record["codigo_terapia"]).strip() if record["codigo_terapia"] else ""
+        norm_cid = record["carteirinha_id"]
+        
+        key = (norm_guia, norm_conv, norm_ter, norm_cid)
+        existing = existing_map.get(key)
         
         if existing:
-            # Verificar ownership
+            # Verify ownership
             if existing.user_id and existing.user_id != user_id:
                 skipped += 1
                 continue
             
             # Update
-            for key in ["senha", "status_guia", "data_autorizacao", "data_solicitacao",
-                        "validade", "qtde_solicitada", "sessoes_autorizadas",
-                        "nome_terapia", "guia_prestador", "codigo_beneficiario",
-                        "cod_prestador", "codigo_terapia"]:
-                if record.get(key) is not None:
-                    setattr(existing, key, record[key])
+            for key_attr in ["senha", "status_guia", "data_autorizacao", "data_solicitacao",
+                             "validade", "qtde_solicitada", "sessoes_autorizadas",
+                             "nome_terapia", "guia_prestador", "codigo_beneficiario",
+                             "cod_prestador"]:
+                if record.get(key_attr) is not None:
+                    setattr(existing, key_attr, record[key_attr])
+            if record.get("codigo_terapia") is not None:
+                existing.codigo_terapia = record["codigo_terapia"]
             existing.user_id = user_id
             existing.updated_at = datetime.now(timezone.utc)
             count_updated += 1
@@ -198,6 +207,7 @@ def bulk_upsert_guias_from_json(
             new_guia = BaseGuia(**{k: v for k, v in record.items() if k != "updated_at"})
             new_guia.created_at = datetime.now(timezone.utc)
             db.add(new_guia)
+            existing_map[key] = new_guia
             count_inserted += 1
     
     db.commit()

@@ -62,11 +62,14 @@ def list_guias(
     except Exception as e:
         print(f"Error syncing completed jobs during list_guias: {e}")
     
-    subq = db.query(
+    subq_query = db.query(
         Agendamento.numero_guia,
         func.sum(case((Agendamento.Status == 'Confirmado', 1), else_=0)).label('q_realizadas'),
         func.sum(case((Agendamento.Status == 'A Confirmar', 1), else_=0)).label('q_a_confirmar')
-    ).group_by(Agendamento.numero_guia).subquery()
+    )
+    if not current_user.is_admin:
+        subq_query = subq_query.filter(Agendamento.user_id == current_user.id)
+    subq = subq_query.group_by(Agendamento.numero_guia).subquery()
 
     query = db.query(
         BaseGuia,
