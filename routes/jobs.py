@@ -36,100 +36,99 @@ def create_jobs(
     import json
     
     # Enrich and normalize job parameters for authorization/job execution
-    if request.params:
-        try:
-            p_dict = json.loads(request.params)
-            
-            # 1. Fetch patient and convenio details
-            if request.carteirinha_ids and len(request.carteirinha_ids) > 0:
-                cart = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
-                if cart:
-                    p_dict["Paciente"] = cart.paciente or ""
-                    p_dict["Carteira"] = cart.carteirinha or ""
-                    p_dict["TarjaMagnetica"] = getattr(cart, "tarja_magnetica", "") or ""
-                    
-                    conv = db.query(Convenio).filter(Convenio.id_convenio == cart.id_convenio).first()
-                    if conv:
-                        p_dict["convenio"] = conv.nome or ""
-            
-            # 2. Extract Cod_procedimento_Aut and Qtde
-            procs = p_dict.get("procedimentos", [])
-            if procs and len(procs) > 0:
-                p_dict["Cod_procedimento_Aut"] = procs[0].get("codigo_procedimento") or ""
-                p_dict["Qtde"] = procs[0].get("qtde_solicitada") or 1
-            elif p_dict.get("codigo_procedimento"):
-                p_dict["Cod_procedimento_Aut"] = p_dict.get("codigo_procedimento")
-                p_dict["Qtde"] = p_dict.get("qtde_solicitada") or 1
+    try:
+        p_dict = json.loads(request.params) if request.params else {}
+        
+        # 1. Fetch patient and convenio details
+        if request.carteirinha_ids and len(request.carteirinha_ids) > 0:
+            cart = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
+            if cart:
+                p_dict["Paciente"] = p_dict.get("Paciente") or cart.paciente or ""
+                p_dict["Carteira"] = p_dict.get("Carteira") or cart.carteirinha or ""
+                p_dict["TarjaMagnetica"] = p_dict.get("TarjaMagnetica") or getattr(cart, "tarja_magnetica", "") or ""
                 
-            # 3. Retrieve professional details from database if id_profissional is provided
-            id_prof = p_dict.get("id_profissional")
-            if id_prof:
-                prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
-                if prof:
-                    p_dict["Profissional_nome"] = prof.nome or ""
-                    p_dict["Profissional_cod_convenio"] = prof.codigo_ipasgo or ""
-                    p_dict["Profissional_nomeConselho"] = prof.conselho or ""
-                    p_dict["Profisisonal_NumerConselho"] = prof.registro or ""
-                    p_dict["Profissional_UFConselho"] = prof.UF or ""
-                    p_dict["Profissional_CBO"] = prof.CBO or ""
-                    
-            # 4. Retrieve doctor (medico) details from database if id_medico is provided
-            id_med = p_dict.get("id_medico")
-            if id_med:
-                med = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_med).first()
-                if med:
-                    p_dict["Medico_Nome"] = med.nome or ""
-                    p_dict["Medico_NomeConselho"] = med.conselho or ""
-                    p_dict["Medico_NumeroConselho"] = med.registro or ""
-                    p_dict["Medico_UFConselho"] = med.UF or ""
-                    p_dict["Medico_CBO"] = med.CBO or ""
-            elif p_dict.get("medico_mesmo_profissional") and id_prof:
-                prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
-                if prof:
-                    p_dict["Medico_Nome"] = prof.nome or ""
-                    p_dict["Medico_NomeConselho"] = prof.conselho or ""
-                    p_dict["Medico_NumeroConselho"] = prof.registro or ""
-                    p_dict["Medico_UFConselho"] = prof.UF or ""
-                    p_dict["Medico_CBO"] = prof.CBO or ""
+                conv = db.query(Convenio).filter(Convenio.id_convenio == cart.id_convenio).first()
+                if conv:
+                    p_dict["convenio"] = p_dict.get("convenio") or conv.nome or ""
+        
+        # 2. Extract Cod_procedimento_Aut and Qtde
+        procs = p_dict.get("procedimentos", [])
+        if procs and len(procs) > 0:
+            p_dict["Cod_procedimento_Aut"] = p_dict.get("Cod_procedimento_Aut") or procs[0].get("codigo_procedimento") or ""
+            p_dict["Qtde"] = p_dict.get("Qtde") or procs[0].get("qtde_solicitada") or 1
+        elif p_dict.get("codigo_procedimento"):
+            p_dict["Cod_procedimento_Aut"] = p_dict.get("Cod_procedimento_Aut") or p_dict.get("codigo_procedimento")
+            p_dict["Qtde"] = p_dict.get("Qtde") or p_dict.get("qtde_solicitada") or 1
+            
+        # 3. Retrieve professional details from database if id_profissional is provided
+        id_prof = p_dict.get("id_profissional")
+        if id_prof:
+            prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
+            if prof:
+                p_dict["Profissional_nome"] = p_dict.get("Profissional_nome") or prof.nome or ""
+                p_dict["Profissional_cod_convenio"] = p_dict.get("Profissional_cod_convenio") or prof.codigo_ipasgo or ""
+                p_dict["Profissional_nomeConselho"] = p_dict.get("Profissional_nomeConselho") or prof.conselho or ""
+                p_dict["Profisisonal_NumerConselho"] = p_dict.get("Profisisonal_NumerConselho") or prof.registro or ""
+                p_dict["Profissional_UFConselho"] = p_dict.get("Profissional_UFConselho") or prof.UF or ""
+                p_dict["Profissional_CBO"] = p_dict.get("Profissional_CBO") or prof.CBO or ""
+                
+        # 4. Retrieve doctor (medico) details from database if id_medico is provided
+        id_med = p_dict.get("id_medico")
+        if id_med:
+            med = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_med).first()
+            if med:
+                p_dict["Medico_Nome"] = p_dict.get("Medico_Nome") or med.nome or ""
+                p_dict["Medico_NomeConselho"] = p_dict.get("Medico_NomeConselho") or med.conselho or ""
+                p_dict["Medico_NumeroConselho"] = p_dict.get("Medico_NumeroConselho") or med.registro or ""
+                p_dict["Medico_UFConselho"] = p_dict.get("Medico_UFConselho") or med.UF or ""
+                p_dict["Medico_CBO"] = p_dict.get("Medico_CBO") or med.CBO or ""
+        elif p_dict.get("medico_mesmo_profissional") and id_prof:
+            prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
+            if prof:
+                p_dict["Medico_Nome"] = p_dict.get("Medico_Nome") or prof.nome or ""
+                p_dict["Medico_NomeConselho"] = p_dict.get("Medico_NomeConselho") or prof.conselho or ""
+                p_dict["Medico_NumeroConselho"] = p_dict.get("Medico_NumeroConselho") or prof.registro or ""
+                p_dict["Medico_UFConselho"] = p_dict.get("Medico_UFConselho") or prof.UF or ""
+                p_dict["Medico_CBO"] = p_dict.get("Medico_CBO") or prof.CBO or ""
 
-            # 5. Flatten attachments (Anexo1, TipoAnexo1, Anexo2, TipoAnexo2 ...)
-            anex_list = p_dict.get("anexos", [])
-            if anex_list:
-                for idx, a in enumerate(anex_list):
-                    p_dict[f"Anexo{idx+1}"] = a.get("nome") or ""
-                    p_dict[f"TipoAnexo{idx+1}"] = a.get("tipo") or ""
-            
-            # 6. Fetch user credentials for the convenio and inject into params (makes job self-contained)
-            target_conv_id = request.id_convenio
-            if not target_conv_id and request.carteirinha_ids and len(request.carteirinha_ids) > 0:
-                cart = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
-                if cart:
-                    target_conv_id = cart.id_convenio
-            
-            if target_conv_id:
-                uconv = db.query(UserConvenio).filter(
-                    UserConvenio.user_id == current_user.id,
-                    UserConvenio.id_convenio == target_conv_id
-                ).first()
-                if uconv:
-                    p_dict["login"] = uconv.login
-                    p_dict["senha_criptografada"] = uconv.senha_criptografada
-                    p_dict["cod_prestador"] = uconv.cod_prestador
-                    p_dict["login_fat"] = uconv.login_fat
-                    p_dict["senha_fat_criptografada"] = uconv.senha_fat_criptografada
+        # 5. Flatten attachments (Anexo1, TipoAnexo1, Anexo2, TipoAnexo2 ...)
+        anex_list = p_dict.get("anexos", [])
+        if anex_list:
+            for idx, a in enumerate(anex_list):
+                p_dict[f"Anexo{idx+1}"] = p_dict.get(f"Anexo{idx+1}") or a.get("nome") or ""
+                p_dict[f"TipoAnexo{idx+1}"] = p_dict.get(f"TipoAnexo{idx+1}") or a.get("tipo") or ""
+        
+        # 6. Fetch user credentials for the convenio and inject into params (makes job self-contained)
+        target_conv_id = request.id_convenio
+        if not target_conv_id and request.carteirinha_ids and len(request.carteirinha_ids) > 0:
+            cart = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
+            if cart:
+                target_conv_id = cart.id_convenio
+        
+        if target_conv_id:
+            uconv = db.query(UserConvenio).filter(
+                UserConvenio.user_id == current_user.id,
+                UserConvenio.id_convenio == target_conv_id
+            ).first()
+            if uconv:
+                p_dict["login"] = p_dict.get("login") or uconv.login
+                p_dict["senha_criptografada"] = p_dict.get("senha_criptografada") or uconv.senha_criptografada
+                p_dict["cod_prestador"] = p_dict.get("cod_prestador") or uconv.cod_prestador
+                p_dict["login_fat"] = p_dict.get("login_fat") or uconv.login_fat
+                p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
 
-            # 7. Set strict_session_affinity (default True for Bradesco OP1 to avoid login conflicts)
-            is_bradesco_op1 = False
-            if target_conv_id == 1:
-                # Rotina 1 (consulta/faturamento) ou rotinas de consulta
-                if request.rotina in ['1', 'op1_consulta', 'op1_fature', 'op0_login']:
-                    is_bradesco_op1 = True
-            
-            p_dict["strict_session_affinity"] = p_dict.get("strict_session_affinity", is_bradesco_op1)
-            
-            request.params = json.dumps(p_dict)
-        except Exception as e:
-            print(f"Error parsing/augmenting job params: {e}")
+        # 7. Set strict_session_affinity (default True for Bradesco OP1 to avoid login conflicts)
+        is_bradesco_op1 = False
+        if target_conv_id == 1:
+            # Rotina 1 (consulta/faturamento) ou rotinas de consulta
+            if request.rotina in ['1', 'op1_consulta', 'op1_fature', 'op0_login']:
+                is_bradesco_op1 = True
+        
+        p_dict["strict_session_affinity"] = p_dict.get("strict_session_affinity", is_bradesco_op1)
+        
+        request.params = json.dumps(p_dict)
+    except Exception as e:
+        print(f"Error parsing/augmenting job params: {e}")
     
     # Validação para OP11 do IPASGO (requer ao menos 1 parâmetro: datas, guia ou carteirinha)
     if request.rotina in ['11', 'op11_import_guias_api']:

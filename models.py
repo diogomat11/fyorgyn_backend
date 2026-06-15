@@ -59,9 +59,9 @@ class Carteirinha(Base):
     is_temporary = Column(Boolean, default=False)
     expires_at = Column(DateTime(timezone=True), nullable=True)
 
-    jobs = relationship("Job", back_populates="carteirinha_rel", cascade="all, delete-orphan")
+    jobs = relationship("Job", primaryjoin="Carteirinha.id == Job.carteirinha_id", back_populates="carteirinha_rel", cascade="all, delete-orphan")
     guias = relationship("BaseGuia", back_populates="carteirinha_rel", cascade="all, delete-orphan")
-    logs = relationship("Log", back_populates="carteirinha_rel", cascade="all, delete-orphan")
+    logs = relationship("Log", primaryjoin="Carteirinha.id == Log.carteirinha_id", back_populates="carteirinha_rel", cascade="all, delete-orphan")
     convenio_rel = relationship("Convenio")
 
 class Job(Base):
@@ -83,7 +83,7 @@ class Job(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    carteirinha_rel = relationship("Carteirinha", back_populates="jobs")
+    carteirinha_rel = relationship("Carteirinha", primaryjoin="Job.carteirinha_id == Carteirinha.id", back_populates="jobs")
     convenio_rel = relationship("Convenio")
     logs = relationship("Log", back_populates="job_rel", cascade="all, delete-orphan")
 
@@ -161,7 +161,7 @@ class Log(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     job_rel = relationship("Job", back_populates="logs")
-    carteirinha_rel = relationship("Carteirinha", back_populates="logs")
+    carteirinha_rel = relationship("Carteirinha", primaryjoin="Log.carteirinha_id == Carteirinha.id", back_populates="logs")
 
 
 class Worker(Base):
