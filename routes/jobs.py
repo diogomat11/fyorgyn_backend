@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from dependencies import get_current_user
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Job, Carteirinha
+from models import Job, Carteirinha, Convenio, UserConvenio, CorpoClinico, BaseGuia, Log
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import date, datetime, timedelta
@@ -42,7 +42,6 @@ def create_jobs(
             
             # 1. Fetch patient and convenio details
             if request.carteirinha_ids and len(request.carteirinha_ids) > 0:
-                from models import Carteirinha, Convenio
                 cart = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
                 if cart:
                     p_dict["Paciente"] = cart.paciente or ""
@@ -64,7 +63,6 @@ def create_jobs(
                 
             # 3. Retrieve professional details from database if id_profissional is provided
             id_prof = p_dict.get("id_profissional")
-            from models import CorpoClinico
             if id_prof:
                 prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
                 if prof:
@@ -104,13 +102,11 @@ def create_jobs(
             # 6. Fetch user credentials for the convenio and inject into params (makes job self-contained)
             target_conv_id = request.id_convenio
             if not target_conv_id and request.carteirinha_ids and len(request.carteirinha_ids) > 0:
-                from models import Carteirinha
                 cart = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
                 if cart:
                     target_conv_id = cart.id_convenio
             
             if target_conv_id:
-                from models import UserConvenio
                 uconv = db.query(UserConvenio).filter(
                     UserConvenio.user_id == current_user.id,
                     UserConvenio.id_convenio == target_conv_id
@@ -223,7 +219,6 @@ def create_jobs(
                     p = json.loads(request.params or '{}')
                     guia_num = p.get("numero_guia")
                     if guia_num:
-                        from models import BaseGuia
                         # Check if this guide belongs to the user and is authorized
                         query_guia = db.query(BaseGuia).filter(
                             BaseGuia.guia == guia_num,
@@ -304,7 +299,6 @@ async def import_fature_batch(
             raise HTTPException(status_code=500, detail=f"Erro ao criptografar senha: {str(e)}")
             
     if not cod_prestador and login:
-        from models import UserConvenio
         uconv = db.query(UserConvenio).filter(
             UserConvenio.id_convenio == id_convenio,
             UserConvenio.login == login
@@ -380,7 +374,6 @@ def export_fature_jobs(
     jobs = query.order_by(Job.created_at.desc()).all()
     
     data = []
-    from models import Log
     for j in jobs:
         params_dict = {}
         try:
@@ -515,7 +508,6 @@ def list_jobs(
     jobs = query.order_by(Job.priority.desc(), Job.created_at.desc()).limit(limit).offset(skip).all()
     # Note: Changed order to desc created_at to show newest first
     
-    from models import Log
     results = []
     
     # Batch query error logs to avoid N+1 queries
