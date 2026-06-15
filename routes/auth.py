@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from database import get_db
 from models import User
 from pydantic import BaseModel
@@ -31,7 +31,6 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         )
 
     import jwt
-    from datetime import datetime, timedelta, timezone
     from dependencies import JWT_SECRET, JWT_ALGORITHM
     
     payload = {
@@ -46,7 +45,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     return {
         "token": jwt_token,
         "username": user.username,
-        "validade": user.validade,
+        "validade": user.validade.isoformat() if user.validade else None,
         "is_admin": user.is_admin
     }
 

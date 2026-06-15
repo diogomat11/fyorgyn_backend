@@ -69,9 +69,9 @@ class Job(Base):
     __table_args__ = {'schema': 'worker', 'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
-    carteirinha_id = Column(Integer, ForeignKey("public.carteirinhas.id", ondelete="CASCADE"), nullable=True)
-    id_convenio = Column(Integer, ForeignKey("public.convenios.id_convenio", ondelete="SET NULL"), nullable=True)
-    user_id = Column(Integer, ForeignKey("public.users.id", ondelete="SET NULL"), nullable=True, index=True)
+    carteirinha_id = Column(Integer, ForeignKey("carteirinhas.id", ondelete="CASCADE"), nullable=True)
+    id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     rotina = Column(Text) # consulta_guias, autorizacao, etc.
     params = Column(JSONB, nullable=True) # Arbitrary JSON parameters
     status = Column(Text, nullable=False, default="pending", index=True) # success, pending, processing, error
@@ -154,8 +154,8 @@ class Log(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     job_id = Column(Integer, ForeignKey("worker.jobs.id", ondelete="SET NULL"), nullable=True)
-    carteirinha_id = Column(Integer, ForeignKey("public.carteirinhas.id", ondelete="SET NULL"), nullable=True)
-    user_id = Column(Integer, ForeignKey("public.users.id", ondelete="SET NULL"), nullable=True, index=True)
+    carteirinha_id = Column(Integer, ForeignKey("carteirinhas.id", ondelete="SET NULL"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     level = Column(Text, default="INFO") # INFO, WARN, ERROR
     message = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -225,7 +225,7 @@ class ConvenioOperacao(Base):
 
 class PriorityRule(Base):
     __tablename__ = "priority_rules"
-    __table_args__ = {'extend_existing': True}
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
     id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="CASCADE"))
@@ -247,7 +247,7 @@ class ServerConfig(Base):
     its preferred (id_convenio, rotina), maximising Chrome session reuse.
     """
     __tablename__ = "server_configs"
-    __table_args__ = {'extend_existing': True}
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
     server_url = Column(Text, unique=True, nullable=False)  # e.g. "http://127.0.0.1:9000"
@@ -262,10 +262,10 @@ class ServerConfig(Base):
 
 class JobExecution(Base):
     __tablename__ = "job_executions"
-    __table_args__ = {'extend_existing': True}
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
-    job_id = Column(Integer, ForeignKey("jobs.id", ondelete="CASCADE"))
+    job_id = Column(Integer, ForeignKey("worker.jobs.id", ondelete="CASCADE"))
     id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True)
     rotina = Column(Text)
     status = Column(Text)
