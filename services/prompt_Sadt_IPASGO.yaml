@@ -1,0 +1,31 @@
+contexto_operacional:
+  objetivo: "Extrair dados de Guia SADT com texto possivelmente desordenado ou rotacionado."
+  metodologia: "Busca semântica por proximidade de termos e validação de máscara numérica."
+
+diretrizes_de_extracao:
+  NOME_BENEFICIARIO:
+    [cite_start]chave_busca: "10-Nome" [cite: 6]
+    [cite_start]regra: "Localize o nome completo do paciente. Ignore termos como 'OPERADORA' ou 'PRESTADOR'." [cite: 7]
+    validacao: "Deve ser um nome de pessoa física."
+
+  NUMERO_GUIA:
+    [cite_start]chave_busca: "7-Número da Guia Atribuido pela Operadora" [cite: 33]
+    [cite_start]regra: "Busque uma sequência numérica de EXATOS 8 dígitos em qualquer parte do texto associada a este rótulo." [cite: 33]
+    [cite_start]negativo: "NÃO extrair o campo '2- Nº Guia no Prestador' ou a 'Senha'." [cite: 32]
+
+  NUMERO_SENHA:
+    [cite_start]chave_busca: "5-Senha" [cite: 10]
+    [cite_start]regra: "Extrair sequência de 11 dígitos numéricos." [cite: 11]
+
+  CARTEIRA:
+    [cite_start]chaves_alternativas: ["B-Número da Carteira", "4-Número da Carteira"] [cite: 5]
+    [cite_start]regra: "Localize o número de identificação do beneficiário próximo aos dados pessoais." [cite: 5]
+    mascara: "Sequência numérica variável."
+
+  DATA_AUTORIZACAO:
+    [cite_start]chaves_alternativas: ["4- Data da Autorização", "22-Data da Solicitação"] [cite: 3, 23]
+    [cite_start]regra: "Capturar a data no formato DD/MM/AAAA." [cite: 3]
+
+formato_saida:
+  tipo: "JSON"
+  instrucao_final: "Se o campo não for encontrado devido à má qualidade do OCR, retorne null para o campo, mas mantenha a estrutura."

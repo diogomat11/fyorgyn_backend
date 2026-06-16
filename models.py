@@ -490,6 +490,7 @@ class ProtocoloLote(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    convenio = Column(Text, nullable=True, default="unimed_goiania")
     status = Column(Text, nullable=False, default="pending", index=True)  # pending, processing, completed, error
     total_arquivos = Column(Integer, default=0)
     total_processado = Column(Integer, default=0)

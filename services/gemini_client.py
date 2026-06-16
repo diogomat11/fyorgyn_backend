@@ -73,6 +73,39 @@ RESPONSE_SCHEMA = {
     ]
 }
 
+IPASGO_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "NUMERO_GUIA": {
+            "type": "STRING",
+            "description": "Número da Guia Atribuido pela Operadora (8 dígitos)"
+        },
+        "NOME_BENEFICIARIO": {
+            "type": "STRING",
+            "description": "Nome completo do paciente/beneficiário"
+        },
+        "NUMERO_SENHA": {
+            "type": "STRING",
+            "description": "Número da Senha (11 dígitos)"
+        },
+        "CARTEIRA": {
+            "type": "STRING",
+            "description": "Número da carteira do beneficiário"
+        },
+        "DATA_AUTORIZACAO": {
+            "type": "STRING",
+            "description": "Data da Autorização no formato DD/MM/AAAA"
+        }
+    },
+    "required": [
+        "NUMERO_GUIA",
+        "NOME_BENEFICIARIO",
+        "NUMERO_SENHA",
+        "CARTEIRA",
+        "DATA_AUTORIZACAO"
+    ]
+}
+
 # Model fallback priority
 MODELS_PRIORITY = ["gemini-2.0-flash", "gemini-2.5-flash"]
 
@@ -138,7 +171,12 @@ class GeminiClient:
 
     # -- Core extraction ---------------------------------------------------
 
-    def extract_from_pdf(self, pdf_bytes: bytes) -> dict:
+    def extract_from_pdf(
+        self,
+        pdf_bytes: bytes,
+        prompt: Optional[str] = None,
+        response_schema: Optional[dict] = None,
+    ) -> dict:
         """
         Send a PDF to Gemini and return the structured JSON extraction.
 
@@ -159,6 +197,10 @@ class GeminiClient:
         last_error: Optional[Exception] = None
         max_key_rotations = len(self._keys) * MAX_RETRIES_PER_KEY
 
+        # Select prompt and schema
+        active_prompt = prompt if prompt is not None else EXTRACTION_PROMPT
+        active_schema = response_schema if response_schema is not None else RESPONSE_SCHEMA
+
         for rotation in range(max_key_rotations):
             api_key = self._next_key()
             key_index = (self._current_key_idx - 1) % len(self._keys)
@@ -177,7 +219,7 @@ class GeminiClient:
                         contents=[
                             types.Content(
                                 parts=[
-                                    types.Part.from_text(text=EXTRACTION_PROMPT),
+                                    types.Part.from_text(text=active_prompt),
                                     types.Part.from_bytes(
                                         data=pdf_bytes,
                                         mime_type="application/pdf"
@@ -187,7 +229,7 @@ class GeminiClient:
                         ],
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
-                            response_schema=RESPONSE_SCHEMA,
+                            response_schema=active_schema,
                             temperature=0.1,
                         ),
                     )

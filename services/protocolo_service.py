@@ -81,7 +81,7 @@ def recalculate_lote_totals(db: Session, lote_id: int):
 # Lote Creation
 # ---------------------------------------------------------------------------
 
-def create_lote(db: Session, user_id: int, files: list) -> dict:
+def create_lote(db: Session, user_id: int, files: list, convenio: str = "unimed_goiania") -> dict:
     """
     Create a new lote and save uploaded files to disk.
 
@@ -89,6 +89,7 @@ def create_lote(db: Session, user_id: int, files: list) -> dict:
         db: Active DB session
         user_id: ID of the authenticated user
         files: List of UploadFile objects from FastAPI
+        convenio: Select of Convênio ('unimed_goiania' or 'ipasgo')
 
     Returns:
         dict with lote_id and file count
@@ -103,6 +104,7 @@ def create_lote(db: Session, user_id: int, files: list) -> dict:
         user_id=user_id,
         status="pending",
         total_arquivos=len(files),
+        convenio=convenio,
     )
     db.add(lote)
     db.flush()  # Get lote.id
@@ -233,21 +235,60 @@ def _process_lote_background(lote_id: int):
 
                 # Read PDF bytes
                 if not arquivo.caminho_original or not os.path.exists(arquivo.caminho_original):
-                    raise FileNotFoundError(f"Arquivo não encontrado: {arquivo.caminho_original}")
+                     raise FileNotFoundError(f"Arquivo não encontrado: {arquivo.caminho_original}")
+
+                # If IPASGO, perform guide rotation check and fix orientation if needed
+                if lote.convenio == "ipasgo":
+                    try:
+                        from services.pdf_rotator import check_and_fix_rotation
+                        check_and_fix_rotation(arquivo.caminho_original, arquivo.caminho_original, logger.info)
+                    except Exception as rot_err:
+                        logger.error(f"Erro ao rotacionar PDF {arquivo.id}: {rot_err}")
 
                 with open(arquivo.caminho_original, "rb") as f:
                     pdf_bytes = f.read()
 
                 # Call Gemini
-                gemini_result = gemini.extract_from_pdf(pdf_bytes)
+                if lote.convenio == "ipasgo":
+                    prompt_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "services", "prompt_Sadt_IPASGO.yaml")
+                    if not os.path.exists(prompt_path):
+                        # Fallback path if directory structure differs slightly
+                        prompt_path = os.path.join(os.path.dirname(__file__), "prompt_Sadt_IPASGO.yaml")
+                    
+                    with open(prompt_path, "r", encoding="utf-8") as f:
+                        ipasgo_prompt = f.read()
+                    
+                    from services.gemini_client import IPASGO_RESPONSE_SCHEMA
+                    gemini_result = gemini.extract_from_pdf(
+                        pdf_bytes,
+                        prompt=ipasgo_prompt,
+                        response_schema=IPASGO_RESPONSE_SCHEMA
+                    )
+                else:
+                    gemini_result = gemini.extract_from_pdf(pdf_bytes)
 
                 # Store meta about which model/key was used
                 meta = gemini_result.pop("_meta", {})
                 arquivo.gemini_model_used = meta.get("model", "unknown")
                 arquivo.gemini_api_key_index = meta.get("key_index", -1)
 
+                # Map IPASGO fields to standard names expected by the validation and extraction pipeline
+                if lote.convenio == "ipasgo":
+                    normalized_result = {
+                        "numeroGuiaPrestador": gemini_result.get("NUMERO_GUIA") or "",
+                        "nomeBeneficiario": gemini_result.get("NOME_BENEFICIARIO") or "",
+                        "numeroGuiaPrincipal": gemini_result.get("NUMERO_SENHA") or "VAZIO",
+                        "atendimentos": [
+                            {
+                                "data": gemini_result.get("DATA_AUTORIZACAO") or "",
+                                "assinatura": "Sim"
+                            }
+                        ] if gemini_result.get("DATA_AUTORIZACAO") else []
+                    }
+                    gemini_result = normalized_result
+
                 # Run extraction pipeline
-                pipeline_result = process_single_extraction(gemini_result)
+                pipeline_result = process_single_extraction(gemini_result, convenio=lote.convenio)
 
                 # Store extracted data
                 arquivo.numero_guia_prestador = gemini_result.get("numeroGuiaPrestador", "")
@@ -339,6 +380,7 @@ def get_lote_status(db: Session, lote_id: int) -> Optional[dict]:
     return {
         "lote_id": lote.id,
         "status": lote.status,
+        "convenio": lote.convenio,
         "total_arquivos": lote.total_arquivos,
         "total_processado": lote.total_processado,
         "total_sucesso": lote.total_sucesso,
@@ -383,6 +425,7 @@ def list_lotes(db: Session, user_id: Optional[int] = None, limit: int = 25, skip
             {
                 "id": l.id,
                 "status": l.status,
+                "convenio": l.convenio,
                 "total_arquivos": l.total_arquivos,
                 "total_processado": l.total_processado,
                 "total_sucesso": l.total_sucesso,

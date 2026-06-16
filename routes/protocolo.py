@@ -16,7 +16,7 @@ Endpoints:
 import os
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -52,6 +52,7 @@ class UpdateAtendimentosRequest(BaseModel):
 @router.post("/lotes")
 async def create_lote(
     files: List[UploadFile] = File(...),
+    convenio: str = Form("unimed_goiania"),
     db: Session = Depends(get_db),
     current_user=Depends(get_protocolo_user),
 ):
@@ -73,7 +74,7 @@ async def create_lote(
     from services.protocolo_service import create_lote as svc_create
 
     try:
-        result = svc_create(db, current_user.id, files)
+        result = svc_create(db, current_user.id, files, convenio)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

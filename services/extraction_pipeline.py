@@ -147,15 +147,20 @@ def validate_date(date_str: str) -> tuple[bool, str]:
         return False, ""
 
 
-def validate_guia_number(guia: str) -> tuple[bool, str]:
+def validate_guia_number(guia: str, convenio: str = "unimed_goiania") -> tuple[bool, str]:
     """
-    Validate guia number: prefix + '-' + exactly 8 digits.
-    Examples: 'O2-10073265' → True, 'ABC' → False
+    Validate guia number: prefix + '-' + exactly 8 digits (for Unimed) or exactly 8 digits (for IPASGO).
     """
     if not guia:
         return False, "Número da guia vazio"
 
-    # Pattern: 1-2 chars (alpha) + '-' + 8 digits
+    if convenio == "ipasgo":
+        # IPASGO expects exactly 8 digits
+        if re.match(r"^\d{8}$", guia):
+            return True, ""
+        return False, f"Formato inválido para IPASGO: '{guia}' (esperado: 8 dígitos)"
+
+    # Unimed Goiânia formats
     pattern = r"^[A-Z]{1,2}\d?-\d{8}$"
     if re.match(pattern, guia.upper()):
         return True, ""
@@ -165,10 +170,10 @@ def validate_guia_number(guia: str) -> tuple[bool, str]:
     if re.match(pattern_raw, guia):
         return True, ""
 
-    return False, f"Formato inválido: '{guia}' (esperado: XX-XXXXXXXX)"
+    return False, f"Formato inválido para Unimed: '{guia}' (esperado: XX-XXXXXXXX)"
 
 
-def validate_extraction(data: dict) -> list[str]:
+def validate_extraction(data: dict, convenio: str = "unimed_goiania") -> list[str]:
     """
     Validate the full extraction result from Gemini.
     Returns a list of error messages (empty = valid).
@@ -180,7 +185,7 @@ def validate_extraction(data: dict) -> list[str]:
     if not guia or guia.upper() == "VAZIO":
         errors.append("Número da Guia Prestador ausente")
     else:
-        valid, msg = validate_guia_number(guia)
+        valid, msg = validate_guia_number(guia, convenio=convenio)
         if not valid:
             errors.append(msg)
 
@@ -221,6 +226,7 @@ def build_filename(
     numero_guia_prestador: str,
     data_atendimento: str,
     nome_beneficiario: str,
+    convenio: str = "unimed_goiania",
 ) -> str:
     """
     Build the new filename according to spec:
@@ -229,9 +235,13 @@ def build_filename(
     Everything in UPPERCASE.
     """
     # Select guia with priority
-    guia = numero_guia_principal
-    if not guia or guia.upper() == "VAZIO":
+    if convenio == "ipasgo":
+        # IPASGO uses the Guia Prestador (8 digits) for the filename, not the Senha (which is stored in numero_guia_principal)
         guia = numero_guia_prestador
+    else:
+        guia = numero_guia_principal
+        if not guia or guia.upper() == "VAZIO":
+            guia = numero_guia_prestador
 
     # Get first date from atendimentos
     data = data_atendimento.strip() if data_atendimento else "SEM-DATA"
@@ -282,7 +292,7 @@ def rename_file_safe(
 # E. Full Pipeline (orchestration per single file)
 # ---------------------------------------------------------------------------
 
-def process_single_extraction(gemini_result: dict) -> dict:
+def process_single_extraction(gemini_result: dict, convenio: str = "unimed_goiania") -> dict:
     """
     Run the full post-processing pipeline on a single Gemini extraction result.
 
@@ -297,11 +307,17 @@ def process_single_extraction(gemini_result: dict) -> dict:
 
     # Step 1: Normalize prefix
     guia_raw = gemini_result.get("numeroGuiaPrestador", "")
-    guia_normalizada = normalize_guia_prefix(guia_raw)
+    if convenio != "ipasgo":
+        guia_normalizada = normalize_guia_prefix(guia_raw)
+    else:
+        guia_normalizada = guia_raw
 
     guia_principal = gemini_result.get("numeroGuiaPrincipal", "VAZIO")
     if guia_principal and guia_principal.upper() != "VAZIO":
-        guia_principal = normalize_guia_prefix(guia_principal)
+        if convenio != "ipasgo":
+            guia_principal = normalize_guia_prefix(guia_principal)
+        else:
+            guia_principal = guia_principal
 
     # Step 2: Validate blacklist
     nome = gemini_result.get("nomeBeneficiario", "")
@@ -313,7 +329,7 @@ def process_single_extraction(gemini_result: dict) -> dict:
     validation_errors = validate_extraction({
         **gemini_result,
         "numeroGuiaPrestador": guia_normalizada,
-    })
+    }, convenio=convenio)
     errors.extend(validation_errors)
 
     # Step 4: Build filename (use first atendimento date)
@@ -331,6 +347,7 @@ def process_single_extraction(gemini_result: dict) -> dict:
         guia_normalizada,
         first_date,
         nome,
+        convenio=convenio,
     )
 
     return {
