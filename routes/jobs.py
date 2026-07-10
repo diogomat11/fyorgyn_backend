@@ -8,6 +8,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 from datetime import date, datetime, timedelta
 import pandas as pd
+import json
 from io import BytesIO
 import os
 import shutil
@@ -436,9 +437,34 @@ def create_jobs(
         
         if not request.carteirinha_ids:
             if is_standalone and request.type == 'single':
-                # Create a standalone job without a specific patient
-                new_job = Job(carteirinha_id=None, status="pending", id_convenio=target_convenio, rotina=request.rotina, params=request.params, user_id=current_user.id)
-                db.add(new_job)
+                # Forward standalone job to backend_worker
+                p_dict = json.loads(request.params) if request.params else {}
+                p_dict["webhook_url"] = os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
+                
+                # Enrich with user credentials if convenio is set
+                if target_convenio and current_user.id:
+                    uconv = db.query(UserConvenio).filter(
+                        UserConvenio.user_id == current_user.id,
+                        UserConvenio.id_convenio == target_convenio
+                    ).first()
+                    if uconv:
+                        p_dict["login"] = p_dict.get("login") or uconv.login
+                        p_dict["senha_criptografada"] = p_dict.get("senha_criptografada") or uconv.senha_criptografada
+                        p_dict["cod_prestador"] = p_dict.get("cod_prestador") or uconv.cod_prestador
+                        p_dict["login_fat"] = p_dict.get("login_fat") or uconv.login_fat
+                        p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
+                
+                job_payload = {
+                    "carteirinha_id": None,
+                    "id_convenio": target_convenio,
+                    "rotina": request.rotina,
+                    "priority": 0,
+                    "params": p_dict,
+                    "max_attempts": 3
+                }
+                
+                from services.job_service import _send_jobs_to_worker
+                _send_jobs_to_worker([job_payload])
                 created_count = 1
             else:
                 raise HTTPException(status_code=400, detail="carteirinha_ids required for single/multiple")
@@ -594,6 +620,7 @@ async def import_fature_batch(
             if uconv:
                 cod_prestador = uconv.cod_prestador
 
+    jobs_payload = []
     for index, row in df.iterrows():
         guia_val = str(row[col_guia]).strip()
         if pd.isna(row[col_guia]) or guia_val == 'nan' or not guia_val:
@@ -605,7 +632,8 @@ async def import_fature_batch(
         params = {
             "guia": guia_val,
             "paciente": paciente_val,
-            "contexto": "fature"
+            "contexto": "fature",
+            "webhook_url": os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
         }
         if dataInicio: params["dataInicio"] = dataInicio
         if dataFim: params["dataFim"] = dataFim
@@ -619,17 +647,20 @@ async def import_fature_batch(
             params["cod_prestador"] = cod_prestador
             params["prestador_id"] = cod_prestador
         
-        new_job = Job(
-            carteirinha_id=None,
-            id_convenio=id_convenio,
-            rotina='1', # Rotina de consultar_guias no Bradesco Fature
-            params=json.dumps(params),
-            status='pending',
-            attempts=0,
-            user_id=current_user.id
-        )
-        db.add(new_job)
-        created_count += 1
+        job_data = {
+            "carteirinha_id": None,
+            "id_convenio": id_convenio,
+            "rotina": '1',
+            "priority": 0,
+            "params": params,
+            "max_attempts": 3
+        }
+        jobs_payload.append(job_data)
+        
+    if jobs_payload:
+        from services.job_service import _send_jobs_to_worker
+        _send_jobs_to_worker(jobs_payload)
+        created_count = len(jobs_payload)
         
     db.commit()
     try:
@@ -954,3 +985,59 @@ def submit_job_result(
     background_tasks.add_task(run_sync_in_bg)
         
     return {"status": "success", "message": "Result received and sync queued in background"}
+
+
+class WebhookPayload(BaseModel):
+    job_id: int
+    status: str
+    result_data: Optional[dict] = None
+    error_message: Optional[str] = None
+    attempts: int
+    rotina: str
+    id_convenio: Optional[int] = None
+    params: Optional[dict] = None
+
+@router.post("/webhook")
+def receive_worker_webhook(payload: WebhookPayload, db: Session = Depends(get_db)):
+    """
+    Recebe os resultados de jobs concluídos/falhos do backend_worker.
+    Executa o parsing e a gravação de dados local no banco de dados (public).
+    """
+    print(f"Recebido webhook para o Job {payload.job_id} ({payload.status})")
+    
+    # 1. Fetch the local job record
+    job = db.query(Job).filter(Job.id == payload.job_id).first()
+    
+    if not job:
+        # Se o job ainda não existir localmente no local_db (por atraso de replicação ou por ser outra base),
+        # nós criamos um registro local para manter logs ou associar guias
+        job = Job(
+            id=payload.job_id,
+            status=payload.status,
+            id_convenio=payload.id_convenio,
+            rotina=payload.rotina,
+            params=payload.params,
+            result_data=payload.result_data,
+            error_message=payload.error_message,
+            attempts=payload.attempts,
+            result_consumed=False
+        )
+        db.add(job)
+    else:
+        # Atualiza dados no registro existente
+        job.status = payload.status
+        job.result_data = payload.result_data
+        job.error_message = payload.error_message
+        job.attempts = payload.attempts
+        job.result_consumed = False
+    db.commit()
+    
+    # 2. Trigger parsing e sync síncrono imediatamente para as tabelas locais (public)
+    if payload.status == "success":
+        from services.guias_sync_service import sync_completed_worker_jobs
+        try:
+            sync_completed_worker_jobs(db)
+        except Exception as e:
+            print(f"Erro ao executar guias_sync_service via webhook: {e}")
+            
+    return {"status": "success", "message": f"Webhook processado para o Job {payload.job_id}"}
