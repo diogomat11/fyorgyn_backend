@@ -446,6 +446,7 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
         paciente=item.get('paciente', ''),
         id_paciente=item.get('id_paciente'),
         codigo_beneficiario=item.get('codigo_beneficiario'),
+        cid=item.get('cid'),
         status=item.get('status', 'ativo'),
         id_convenio=target_convenio,
         user_id=user.id
@@ -483,6 +484,8 @@ def update_carteirinha(carteirinha_id: int, item: dict = Body(...), db: Session 
         cart.id_paciente = item['id_paciente']
     if 'codigo_beneficiario' in item:
         cart.codigo_beneficiario = item['codigo_beneficiario']
+    if 'cid' in item:
+        cart.cid = item['cid'] or None
     if 'id_convenio' in item and item['id_convenio']:
         cart.id_convenio = item['id_convenio']
     if 'status' in item:

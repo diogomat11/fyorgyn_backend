@@ -17,6 +17,7 @@ class ConvenioCreate(ConvenioBase):
 
 class ConvenioUpdate(BaseModel):
     nome: Optional[str] = None
+    registro_ans: Optional[str] = None
 
 from pydantic import Field
 
@@ -30,6 +31,7 @@ class ConvenioOperacaoResponse(BaseModel):
 
 class ConvenioResponse(ConvenioBase):
     id_convenio: int
+    registro_ans: Optional[str] = None
     operacoes: List[ConvenioOperacaoResponse] = Field(default=[], validation_alias="operacoes_rel")
     
     class Config:
@@ -64,6 +66,7 @@ def update_convenio(id_convenio: int, conv: ConvenioUpdate, db: Session = Depend
         raise HTTPException(status_code=404, detail="Convenio not found")
     
     if conv.nome: db_conv.nome = conv.nome
+    if conv.registro_ans is not None: db_conv.registro_ans = conv.registro_ans
     
     db.commit()
     db.refresh(db_conv)

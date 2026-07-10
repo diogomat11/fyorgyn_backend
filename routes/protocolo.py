@@ -426,3 +426,321 @@ def get_config(
             "models": [],
             "status": f"error: {str(e)}",
         }
+
+
+# ---------------------------------------------------------------------------
+# POST /arquivos/{id}/gravar — Gravar itens do arquivo
+# ---------------------------------------------------------------------------
+
+@router.post("/arquivos/{arquivo_id}/gravar")
+def gravar_arquivo_route(
+    arquivo_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_protocolo_user),
+):
+    """Saves extracted atendimentos from a file to the protocolo_itens table."""
+    from models import ProtocoloArquivo, ProtocoloLote
+    from services.protocolo_service import gravar_arquivo_itens
+
+    arq = db.query(ProtocoloArquivo).filter(ProtocoloArquivo.id == arquivo_id).first()
+    if not arq:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == arq.lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote associado não encontrado")
+        
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
+
+    try:
+        res = gravar_arquivo_itens(db, arquivo_id)
+        return res
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# POST /lotes/{id}/gravar-todos — Gravar todos do lote
+# ---------------------------------------------------------------------------
+
+@router.post("/lotes/{lote_id}/gravar-todos")
+def gravar_lote_route(
+    lote_id: int,
+    ignore_unsigned: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_protocolo_user),
+):
+    """Saves extracted atendimentos from all successful files in a lote."""
+    from models import ProtocoloLote
+    from services.protocolo_service import gravar_lote_itens
+
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == lote_id).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote não encontrado")
+        
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
+
+    try:
+        res = gravar_lote_itens(db, lote_id, ignore_unsigned=ignore_unsigned)
+        return res
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /itens/exportar — Get all matching items for export
+# ---------------------------------------------------------------------------
+
+@router.get("/itens/exportar")
+def export_protocolo_itens(
+    id_convenio: Optional[int] = Query(None),
+    status_conciliacao: Optional[str] = Query(None),
+    nome: Optional[str] = Query(None),
+    guia: Optional[str] = Query(None),
+    data_inicio: Optional[str] = Query(None),
+    data_fim: Optional[str] = Query(None),
+    assinatura: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_protocolo_user),
+):
+    """Lists and filters all matching saved protocolo items (no limit) for exporting."""
+    from models import ProtocoloItem, FaturamentoLote, Agendamento, BaseGuia
+    from datetime import datetime
+
+    query = db.query(ProtocoloItem).filter(ProtocoloItem.user_id == current_user.id)
+
+    if id_convenio is not None:
+        query = query.filter(ProtocoloItem.id_convenio == id_convenio)
+    
+    if status_conciliacao:
+        query = query.filter(ProtocoloItem.status_conciliacao == status_conciliacao)
+
+    if assinatura:
+        query = query.filter(ProtocoloItem.assinatura == assinatura)
+
+    if nome:
+        query = query.filter(ProtocoloItem.nome.ilike(f"%{nome}%"))
+
+    if guia:
+        query = query.filter(
+            (ProtocoloItem.guia.ilike(f"%{guia}%")) | 
+            (ProtocoloItem.senha.ilike(f"%{guia}%")) | 
+            (ProtocoloItem.guia_prestador.ilike(f"%{guia}%"))
+        )
+
+    if data_inicio:
+        try:
+            dt_ini = datetime.strptime(data_inicio, "%Y-%m-%d").date()
+            query = query.filter(ProtocoloItem.data >= dt_ini)
+        except Exception:
+            pass
+
+    if data_fim:
+        try:
+            dt_fim = datetime.strptime(data_fim, "%Y-%m-%d").date()
+            query = query.filter(ProtocoloItem.data <= dt_fim)
+        except Exception:
+            pass
+
+    items = query.order_by(ProtocoloItem.data.desc(), ProtocoloItem.id.desc()).all()
+
+    data = []
+    for item in items:
+        fat_detail = None
+        if item.faturamento_rel:
+            fat_detail = {
+                "id": item.faturamento_rel.id,
+                "detalheId": item.faturamento_rel.detalheId,
+                "ValorProcedimento": item.faturamento_rel.ValorProcedimento,
+                "Guia": item.faturamento_rel.Guia,
+                "dataRealizacao": item.faturamento_rel.dataRealizacao.isoformat() if item.faturamento_rel.dataRealizacao else None
+            }
+
+        ag_detail = None
+        if item.agendamento_rel:
+            ag_detail = {
+                "id_agendamento": item.agendamento_rel.id_agendamento,
+                "Nome_Paciente": item.agendamento_rel.Nome_Paciente,
+                "numero_guia": item.agendamento_rel.numero_guia,
+                "data": item.agendamento_rel.data.isoformat() if item.agendamento_rel.data else None,
+                "nome_procedimento": item.agendamento_rel.nome_procedimento
+            }
+
+        bg_detail = None
+        if item.base_guia_rel:
+            bg_detail = {
+                "id": item.base_guia_rel.id,
+                "guia": item.base_guia_rel.guia,
+                "senha": item.base_guia_rel.senha
+            }
+
+        data.append({
+            "id": item.id,
+            "id_convenio": item.id_convenio,
+            "cod_prestador": item.cod_prestador,
+            "guia": item.guia,
+            "nome": item.nome,
+            "carteira": item.carteira,
+            "senha": item.senha,
+            "data": item.data.isoformat() if item.data else None,
+            "assinatura": item.assinatura,
+            "guia_prestador": item.guia_prestador,
+            "lote_id": item.lote_id,
+            "arquivo_id": item.arquivo_id,
+            "status_conciliacao": item.status_conciliacao,
+            "faturamento": fat_detail,
+            "agendamento": ag_detail,
+            "base_guia": bg_detail,
+            "caminho_arquivo": item.caminho_arquivo,
+            "created_at": item.created_at.isoformat() if item.created_at else None
+        })
+
+    return {
+        "data": data
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /itens — List and filter protocolo_itens
+# ---------------------------------------------------------------------------
+
+@router.get("/itens")
+def list_protocolo_itens(
+    id_convenio: Optional[int] = Query(None),
+    status_conciliacao: Optional[str] = Query(None),
+    nome: Optional[str] = Query(None),
+    guia: Optional[str] = Query(None),
+    data_inicio: Optional[str] = Query(None),
+    data_fim: Optional[str] = Query(None),
+    assinatura: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=250),
+    skip: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_protocolo_user),
+):
+    """Lists, filters, and paginates saved protocolo items."""
+    from models import ProtocoloItem, FaturamentoLote, Agendamento, BaseGuia
+    from datetime import datetime
+
+    query = db.query(ProtocoloItem).filter(ProtocoloItem.user_id == current_user.id)
+
+    if id_convenio is not None:
+        query = query.filter(ProtocoloItem.id_convenio == id_convenio)
+    
+    if status_conciliacao:
+        query = query.filter(ProtocoloItem.status_conciliacao == status_conciliacao)
+
+    if assinatura:
+        query = query.filter(ProtocoloItem.assinatura == assinatura)
+
+    if nome:
+        query = query.filter(ProtocoloItem.nome.ilike(f"%{nome}%"))
+
+    if guia:
+        query = query.filter(
+            (ProtocoloItem.guia.ilike(f"%{guia}%")) | 
+            (ProtocoloItem.senha.ilike(f"%{guia}%")) | 
+            (ProtocoloItem.guia_prestador.ilike(f"%{guia}%"))
+        )
+
+    if data_inicio:
+        try:
+            dt_ini = datetime.strptime(data_inicio, "%Y-%m-%d").date()
+            query = query.filter(ProtocoloItem.data >= dt_ini)
+        except Exception:
+            pass
+
+    if data_fim:
+        try:
+            dt_fim = datetime.strptime(data_fim, "%Y-%m-%d").date()
+            query = query.filter(ProtocoloItem.data <= dt_fim)
+        except Exception:
+            pass
+
+    total = query.count()
+
+    items = query.order_by(ProtocoloItem.data.desc(), ProtocoloItem.id.desc()).offset(skip).limit(limit).all()
+
+    data = []
+    for item in items:
+        fat_detail = None
+        if item.faturamento_rel:
+            fat_detail = {
+                "id": item.faturamento_rel.id,
+                "detalheId": item.faturamento_rel.detalheId,
+                "ValorProcedimento": item.faturamento_rel.ValorProcedimento,
+                "Guia": item.faturamento_rel.Guia,
+                "dataRealizacao": item.faturamento_rel.dataRealizacao.isoformat() if item.faturamento_rel.dataRealizacao else None
+            }
+
+        ag_detail = None
+        if item.agendamento_rel:
+            ag_detail = {
+                "id_agendamento": item.agendamento_rel.id_agendamento,
+                "Nome_Paciente": item.agendamento_rel.Nome_Paciente,
+                "numero_guia": item.agendamento_rel.numero_guia,
+                "data": item.agendamento_rel.data.isoformat() if item.agendamento_rel.data else None,
+                "nome_procedimento": item.agendamento_rel.nome_procedimento
+            }
+
+        bg_detail = None
+        if item.base_guia_rel:
+            bg_detail = {
+                "id": item.base_guia_rel.id,
+                "guia": item.base_guia_rel.guia,
+                "senha": item.base_guia_rel.senha
+            }
+
+        data.append({
+            "id": item.id,
+            "id_convenio": item.id_convenio,
+            "cod_prestador": item.cod_prestador,
+            "guia": item.guia,
+            "nome": item.nome,
+            "carteira": item.carteira,
+            "senha": item.senha,
+            "data": item.data.isoformat() if item.data else None,
+            "assinatura": item.assinatura,
+            "guia_prestador": item.guia_prestador,
+            "lote_id": item.lote_id,
+            "arquivo_id": item.arquivo_id,
+            "status_conciliacao": item.status_conciliacao,
+            "faturamento": fat_detail,
+            "agendamento": ag_detail,
+            "base_guia": bg_detail,
+            "caminho_arquivo": item.caminho_arquivo,
+            "created_at": item.created_at.isoformat() if item.created_at else None
+        })
+
+    return {
+        "total": total,
+        "data": data
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /itens/conciliar — Conciliar itens de protocolo
+# ---------------------------------------------------------------------------
+
+@router.post("/itens/conciliar")
+def conciliar_itens_route(
+    id_convenio: int = Query(..., description="ID do Convenio (3 ou 6)"),
+    faturamento_lote_id: Optional[int] = Query(None, description="Lote de Faturamento ID opcional"),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_protocolo_user),
+):
+    """Triggers the auto-conciliation process for saved items."""
+    from services.protocolo_service import conciliar_itens_protocolo
+
+    res = conciliar_itens_protocolo(
+        db, 
+        user_id=current_user.id, 
+        id_convenio=id_convenio, 
+        faturamento_lote_id=faturamento_lote_id
+    )
+    return res
+

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Body, Query, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Body, Query, UploadFile, File, Form, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from dependencies import get_current_user
 from sqlalchemy.orm import Session
@@ -9,11 +9,155 @@ from pydantic import BaseModel
 from datetime import date, datetime, timedelta
 import pandas as pd
 from io import BytesIO
+import os
+import shutil
+import uuid
+import requests
+import re
+import urllib.parse
+from security_utils import decrypt_password
 
 router = APIRouter(
     prefix="/jobs",
     tags=["Jobs"]
 )
+
+UPLOAD_DIR = os.path.join("uploads", "anexos")
+
+def get_evoluir_session(db: Session, user_id: int) -> requests.Session:
+    uconv = db.query(UserConvenio).filter(
+        UserConvenio.user_id == user_id,
+        UserConvenio.id_convenio == 100 # Evoluir
+    ).first()
+    if not uconv or not uconv.login or not uconv.senha_criptografada:
+        raise ValueError("Credenciais do Evoluir não encontradas para este usuário.")
+        
+    username = uconv.login
+    password = decrypt_password(uconv.senha_criptografada)
+    
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
+    
+    login_url = "https://sistemaevoluir.com.br/login"
+    try:
+        r_get = session.get(login_url, timeout=10)
+    except Exception as e:
+        raise ConnectionError(f"Erro de timeout ou conexão ao acessar Evoluir: {str(e)}")
+        
+    if r_get.status_code != 200:
+        raise ConnectionError(f"Erro ao acessar página de login da Evoluir: {r_get.status_code}")
+        
+    html = r_get.text
+    token_match = re.search(r'name="_token"\s+value="([^"]+)"', html)
+    if not token_match:
+        token_match = re.search(r'csrf-token"\s+content="([^"]+)"', html)
+        
+    if not token_match:
+        raise ValueError("Token CSRF não encontrado na página de login da Evoluir.")
+        
+    csrf_token = token_match.group(1)
+    
+    # Do login POST
+    login_data = {
+        "_token": csrf_token,
+        "user": username,
+        "password": password
+    }
+    
+    try:
+        r_post = session.post(login_url, data=login_data, allow_redirects=True, timeout=10)
+    except Exception as e:
+        raise ConnectionError(f"Erro de timeout ou conexão ao autenticar na Evoluir: {str(e)}")
+        
+    if r_post.status_code != 200 or "login" in r_post.url.lower():
+        raise ConnectionError("Falha na autenticação do portal Evoluir via API.")
+        
+    return session
+
+
+def download_evoluir_pdf_auth(db: Session, user_id: int, evoluir_url: str, base_url: str, session: Optional[requests.Session] = None) -> str:
+    # 1. GET the PDF content
+    parsed_url = urllib.parse.urlparse(evoluir_url)
+    encoded_path = urllib.parse.quote(parsed_url.path)
+    encoded_query = urllib.parse.quote(parsed_url.query, safe="=&")
+    
+    url_to_fetch = urllib.parse.urlunparse((
+        parsed_url.scheme,
+        parsed_url.netloc,
+        encoded_path,
+        parsed_url.params,
+        encoded_query,
+        parsed_url.fragment
+    ))
+
+    # If session is not provided, create one and login
+    if not session:
+        session = get_evoluir_session(db, user_id)
+
+    try:
+        r_pdf = session.get(url_to_fetch, timeout=15)
+    except Exception as e:
+        raise ConnectionError(f"Erro de timeout ou conexão ao baixar anexo da Evoluir: {str(e)}")
+        
+    if r_pdf.status_code != 200:
+        raise ConnectionError(f"Erro ao baixar PDF do Evoluir ({r_pdf.status_code}): {r_pdf.text[:200]}")
+        
+    # Save the file locally
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    
+    # Extract original filename and add suffix based on the URL type
+    original_basename = os.path.basename(parsed_url.path)
+    base_name, ext = os.path.splitext(original_basename)
+    if not ext:
+        ext = ".pdf"
+        
+    if "/pdf/ii/" in evoluir_url:
+        filename = f"{base_name}-ANEXOII{ext}"
+    elif "/pdf/" in evoluir_url:
+        filename = f"{base_name}-PTS{ext}"
+    else:
+        if not original_basename.lower().endswith(".pdf"):
+            filename = f"{original_basename}.pdf"
+        else:
+            filename = original_basename
+    
+    # Clean spaces/bad chars
+    clean_name = filename.replace(" ", "")
+    clean_name = re.sub(r'[\\/*?:"<>|]', '_', clean_name)
+    
+    unique_filename = f"{uuid.uuid4().hex}_{clean_name}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+    
+    with open(file_path, "wb") as f:
+        f.write(r_pdf.content)
+        
+    return f"{base_url}/uploads/anexos/{unique_filename}"
+
+
+@router.post("/upload-anexo")
+def upload_anexo(
+    file: UploadFile = File(...),
+    current_user = Depends(get_current_user)
+):
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    
+    # Remove apenas espaços e caracteres inválidos do SO, mantendo acentos, parênteses e hífens originais
+    clean_name = file.filename.replace(" ", "")
+    import re
+    clean_name = re.sub(r'[\\/*?:"<>|]', '_', clean_name)
+    unique_filename = f"{uuid.uuid4().hex}_{clean_name}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+    
+    # Salva o arquivo localmente no disco
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar anexo: {str(e)}")
+        
+    return {"url": f"/uploads/anexos/{unique_filename}"}
 
 class TemporaryPatientData(BaseModel):
     carteirinha: str
@@ -30,11 +174,54 @@ class CreateJobRequest(BaseModel):
 @router.post("/")
 def create_jobs(
     request: CreateJobRequest, 
+    fastapi_req: Request,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
     import json
     
+    # Interceptar e baixar URLs do Evoluir
+    if request.params:
+        try:
+            p_dict_temp = json.loads(request.params)
+            
+            shared_session = None
+            downloaded_urls_cache = {}
+            def get_or_download(url):
+                nonlocal shared_session
+                if url not in downloaded_urls_cache:
+                    if shared_session is None:
+                        try:
+                            shared_session = get_evoluir_session(db, current_user.id)
+                        except Exception as e:
+                            print(f"Error in lazy login session creation: {e}")
+                    
+                    downloaded_urls_cache[url] = download_evoluir_pdf_auth(
+                        db, current_user.id, url, str(fastapi_req.base_url).rstrip('/'), shared_session
+                    )
+                return downloaded_urls_cache[url]
+
+            def intercept_and_download_urls(obj):
+                if isinstance(obj, dict):
+                    new_dict = {}
+                    for k, v in obj.items():
+                        if isinstance(v, str) and "sistemaevoluir.com.br" in v.lower():
+                            new_dict[k] = get_or_download(v)
+                        else:
+                            new_dict[k] = intercept_and_download_urls(v)
+                    return new_dict
+                elif isinstance(obj, list):
+                    return [intercept_and_download_urls(item) for item in obj]
+                else:
+                    return obj
+
+            p_dict_temp = intercept_and_download_urls(p_dict_temp)
+            request.params = json.dumps(p_dict_temp)
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise e
+            raise HTTPException(status_code=400, detail=f"Erro ao interceptar e baixar anexos da Evoluir: {str(e)}")
+
     # Enrich and normalize job parameters for authorization/job execution
     try:
         p_dict = json.loads(request.params) if request.params else {}
@@ -47,6 +234,17 @@ def create_jobs(
                 p_dict["Carteira"] = p_dict.get("Carteira") or cart.carteirinha or ""
                 p_dict["TarjaMagnetica"] = p_dict.get("TarjaMagnetica") or getattr(cart, "tarja_magnetica", "") or ""
                 
+                # Enrich with exact keys for IPASGO
+                if request.id_convenio == 6 or cart.id_convenio == 6:
+                    p_dict["carteira"] = p_dict.get("carteira") or cart.carteirinha or ""
+                    p_dict["paciente_CID"] = p_dict.get("paciente_CID") or getattr(cart, "cid", "") or ""
+
+                # Enrich with exact keys for Evoluir
+                if request.id_convenio == 100 or cart.id_convenio == 100:
+                    p_dict["id_paciente"] = p_dict.get("id_paciente") or getattr(cart, "id_paciente", "") or ""
+                    p_dict["nome_paciente"] = p_dict.get("nome_paciente") or cart.paciente or ""
+                    p_dict["paciente"] = p_dict.get("paciente") or cart.paciente or ""
+
                 conv = db.query(Convenio).filter(Convenio.id_convenio == cart.id_convenio).first()
                 if conv:
                     p_dict["convenio"] = p_dict.get("convenio") or conv.nome or ""
@@ -56,14 +254,20 @@ def create_jobs(
         if procs and len(procs) > 0:
             p_dict["Cod_procedimento_Aut"] = p_dict.get("Cod_procedimento_Aut") or procs[0].get("codigo_procedimento") or ""
             p_dict["Qtde"] = p_dict.get("Qtde") or procs[0].get("qtde_solicitada") or 1
+            if request.id_convenio == 6:
+                p_dict["codigoProcedimento_aut"] = p_dict.get("codigoProcedimento_aut") or procs[0].get("codigo_procedimento") or ""
+                p_dict["qtde"] = p_dict.get("qtde") or str(procs[0].get("qtde_solicitada") or 1)
         elif p_dict.get("codigo_procedimento"):
             p_dict["Cod_procedimento_Aut"] = p_dict.get("Cod_procedimento_Aut") or p_dict.get("codigo_procedimento")
             p_dict["Qtde"] = p_dict.get("Qtde") or p_dict.get("qtde_solicitada") or 1
+            if request.id_convenio == 6:
+                p_dict["codigoProcedimento_aut"] = p_dict.get("codigoProcedimento_aut") or p_dict.get("codigo_procedimento") or ""
+                p_dict["qtde"] = p_dict.get("qtde") or str(p_dict.get("qtde_solicitada") or 1)
             
         # 3. Retrieve professional details from database if id_profissional is provided
         id_prof = p_dict.get("id_profissional")
         if id_prof:
-            prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
+            prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == str(id_prof)).first()
             if prof:
                 p_dict["Profissional_nome"] = p_dict.get("Profissional_nome") or prof.nome or ""
                 p_dict["Profissional_cod_convenio"] = p_dict.get("Profissional_cod_convenio") or prof.codigo_ipasgo or ""
@@ -72,10 +276,14 @@ def create_jobs(
                 p_dict["Profissional_UFConselho"] = p_dict.get("Profissional_UFConselho") or prof.UF or ""
                 p_dict["Profissional_CBO"] = p_dict.get("Profissional_CBO") or prof.CBO or ""
                 
+                if request.id_convenio == 6:
+                    p_dict["profissional_codigo_ipasgo"] = p_dict.get("profissional_codigo_ipasgo") or prof.codigo_ipasgo or ""
+                    p_dict["profissional_CBO"] = p_dict.get("profissional_CBO") or prof.CBO or ""
+                
         # 4. Retrieve doctor (medico) details from database if id_medico is provided
         id_med = p_dict.get("id_medico")
         if id_med:
-            med = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_med).first()
+            med = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == str(id_med)).first()
             if med:
                 p_dict["Medico_Nome"] = p_dict.get("Medico_Nome") or med.nome or ""
                 p_dict["Medico_NomeConselho"] = p_dict.get("Medico_NomeConselho") or med.conselho or ""
@@ -83,7 +291,7 @@ def create_jobs(
                 p_dict["Medico_UFConselho"] = p_dict.get("Medico_UFConselho") or med.UF or ""
                 p_dict["Medico_CBO"] = p_dict.get("Medico_CBO") or med.CBO or ""
         elif p_dict.get("medico_mesmo_profissional") and id_prof:
-            prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_prof).first()
+            prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == str(id_prof)).first()
             if prof:
                 p_dict["Medico_Nome"] = p_dict.get("Medico_Nome") or prof.nome or ""
                 p_dict["Medico_NomeConselho"] = p_dict.get("Medico_NomeConselho") or prof.conselho or ""
@@ -97,7 +305,37 @@ def create_jobs(
             for idx, a in enumerate(anex_list):
                 p_dict[f"Anexo{idx+1}"] = p_dict.get(f"Anexo{idx+1}") or a.get("nome") or ""
                 p_dict[f"TipoAnexo{idx+1}"] = p_dict.get(f"TipoAnexo{idx+1}") or a.get("tipo") or ""
-        
+            
+            # Map strict attachments for IPASGO
+            if request.id_convenio == 6:
+                TIPO_MAP = {
+                    "pedido médico":          "anexo_RM",
+                    "pedido medico":          "anexo_RM",
+                    "relatório médico":       "anexo_RM",
+                    "relatorio medico":       "anexo_RM",
+                    "rm":                     "anexo_RM",
+                    "avaliação inicial":      "anexo_AI",
+                    "avaliacao inicial":      "anexo_AI",
+                    "pts/relatório clínico":  "anexo_RC",
+                    "pts/relatorio clinico":  "anexo_RC",
+                    "relatório clínico":      "anexo_RC",
+                    "relatorio clinico":      "anexo_RC",
+                    "rc":                     "anexo_RC",
+                }
+                for a in anex_list:
+                    tipo_key = (a.get("tipo") or "").lower().strip()
+                    campo = TIPO_MAP.get(tipo_key)
+                    if campo and not p_dict.get(campo):
+                        p_dict[campo] = a.get("nome") or a.get("caminho") or ""
+
+        # Exact keys for IPASGO extra parameters
+        if request.id_convenio == 6:
+            from datetime import date as _date
+            p_dict["texto_Justificativa"] = p_dict.get("texto_Justificativa") or p_dict.get("observacao") or ""
+            if not p_dict.get("dataSolicitacao"):
+                p_dict["dataSolicitacao"] = _date.today().strftime("%d/%m/%Y")
+
+
         # 6. Fetch user credentials for the convenio and inject into params (makes job self-contained)
         target_conv_id = request.id_convenio
         if not target_conv_id and request.carteirinha_ids and len(request.carteirinha_ids) > 0:
@@ -183,7 +421,7 @@ def create_jobs(
         created_count = job_service.create_all_jobs(db, id_convenio=target_convenio, rotina=request.rotina, params=request.params, user_id=current_user.id)
             
     elif request.type in ['single', 'multiple']:
-        is_ipasgo_standalone = target_convenio == 6 and request.rotina in [
+        is_standalone = (target_convenio == 6 and request.rotina in [
             '3', 'op3_import_guias', 
             '6', 'op6_check_baixados', 
             '7', 'op7_fat_facplan', 
@@ -191,11 +429,14 @@ def create_jobs(
             '12', 'op12_impressao_api',
             '13', 'op13_criar_lote',
             '14', 'op14_cancelar_lote'
-        ]
+        ]) or (target_convenio == 100 and request.rotina in [
+            '1', 'op1', 'op1_importPacientes', 'op5_ImportCorpoClinico',
+            'op6_baixarFaturados', 'op4_atualizarDataPTS'
+        ])
         
         if not request.carteirinha_ids:
-            if is_ipasgo_standalone and request.type == 'single':
-                # Create a standalone job for IPASGO without a specific patient
+            if is_standalone and request.type == 'single':
+                # Create a standalone job without a specific patient
                 new_job = Job(carteirinha_id=None, status="pending", id_convenio=target_convenio, rotina=request.rotina, params=request.params, user_id=current_user.id)
                 db.add(new_job)
                 created_count = 1
@@ -247,6 +488,50 @@ def create_jobs(
         raise HTTPException(status_code=400, detail="Invalid job type")
 
     db.commit()
+    
+    # Se a rotina for op1_autorizar_facplan, vamos criar registros na tabela solicitacoes
+    if request.rotina == 'op1_autorizar_facplan' and request.params:
+        try:
+            import json
+            p_dict = json.loads(request.params)
+            
+            # Buscar os jobs correspondentes criados recentemente
+            recent_jobs = db.query(Job).filter(
+                Job.user_id == current_user.id,
+                Job.rotina == 'op1_autorizar_facplan',
+                Job.status == 'pending'
+            ).order_by(Job.id.desc()).limit(created_count).all()
+            
+            from models import Solicitacao
+            for job_row_obj in recent_jobs:
+                existing_sol = db.query(Solicitacao).filter(Solicitacao.job_id == job_row_obj.id).first()
+                if existing_sol:
+                    continue
+                    
+                sol = Solicitacao(
+                    user_id=current_user.id,
+                    carteirinha_id=job_row_obj.carteirinha_id,
+                    id_convenio=job_row_obj.id_convenio,
+                    guia=f"Solicitação #{job_row_obj.id}",
+                    codigo_terapia=p_dict.get("codigoProcedimento_aut") or p_dict.get("codigo_procedimento") or "",
+                    nome_terapia=p_dict.get("nome_terapia") or "Aguardando autorização...",
+                    qtde_solicitada=int(p_dict.get("qtde") or p_dict.get("qtde_solicitada") or 1),
+                    sessoes_autorizadas=0,
+                    status_solicitacao="Pendente",
+                    id_profissional=p_dict.get("id_profissional"),
+                    id_medico=p_dict.get("id_medico"),
+                    observacao=p_dict.get("texto_Justificativa") or p_dict.get("observacao"),
+                    paciente_CID=p_dict.get("paciente_CID"),
+                    anexo_RM=p_dict.get("anexo_RM"),
+                    anexo_AI=p_dict.get("anexo_AI"),
+                    anexo_RC=p_dict.get("anexo_RC"),
+                    job_id=job_row_obj.id
+                )
+                db.add(sol)
+            db.commit()
+        except Exception as e_sol:
+            print(f"Error creating Solicitacao records: {e_sol}")
+
     try:
         from cache import cache
         cache.invalidate_tenant(current_user.id)
@@ -457,7 +742,8 @@ def list_jobs(
     limit: int = 25, 
     skip: int = 0,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    background_tasks: BackgroundTasks = None
 ):
     cache_params = {
         "status": status,
@@ -473,12 +759,13 @@ def list_jobs(
     if cached_res:
         return cached_res
 
-    # Auto-sincronizar guias extraídas pelo worker
-    try:
-        from services.guias_sync_service import sync_completed_worker_jobs
-        sync_completed_worker_jobs(db)
-    except Exception as e:
-        print(f"Error syncing completed jobs during list_jobs: {e}")
+    # Auto-sincronizar guias extraídas pelo worker em background para evitar travamento
+    if background_tasks:
+        try:
+            from services.guias_sync_service import sync_completed_worker_jobs_bg
+            background_tasks.add_task(sync_completed_worker_jobs_bg)
+        except Exception as e:
+            print(f"Error scheduling completed jobs during list_jobs: {e}")
 
     query = db.query(Job)
     if not current_user.is_admin:
@@ -559,7 +846,7 @@ def delete_job(id: int, db: Session = Depends(get_db), current_user = Depends(ge
     # User said: "probido exclusao de jobs em andamento ou com status sucess"
     # "um Job so podera ser excluido se status seja error e tentativas maior que 3"
     
-    allowed = (job.status == 'error' and job.attempts > 3)
+    allowed = (job.status == 'error' and (job.attempts or 0) > 3)
     # Or maybe allow pending if it's stuck? User didn't specify. Sticking to strict rule.
     
     if not allowed:
@@ -626,3 +913,44 @@ def sync_results(db: Session = Depends(get_db), current_user = Depends(get_curre
             detail=f"Erro ao sincronizar resultados do worker: {str(e)}"
         )
 
+@router.post("/{job_id}/result")
+def submit_job_result(
+    job_id: int,
+    background_tasks: BackgroundTasks,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Webhook call from worker/dispatcher to submit job results.
+    """
+    # 1. Fetch the job
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    # 2. Update job status and result_data
+    job.status = "success"
+    job.result_data = payload
+    job.result_consumed = False
+    job.updated_at = datetime.utcnow()
+    db.commit()
+    
+    # 3. Immediately trigger synchronization in background
+    def run_sync_in_bg():
+        from database import SessionLocal
+        bg_db = SessionLocal()
+        try:
+            from services.guias_sync_service import sync_completed_worker_jobs
+            sync_completed_worker_jobs(bg_db)
+        except Exception as sync_err:
+            try:
+                bg_db.rollback()
+            except:
+                pass
+            print(f"Error executing immediate sync for job {job_id} in background: {sync_err}")
+        finally:
+            bg_db.close()
+
+    background_tasks.add_task(run_sync_in_bg)
+        
+    return {"status": "success", "message": "Result received and sync queued in background"}

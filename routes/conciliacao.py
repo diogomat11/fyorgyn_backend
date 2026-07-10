@@ -32,6 +32,7 @@ class ConciliarManualRequest(BaseModel):
     id_faturamento_lote: int
     id_agendamento: int
     auto_envio: Optional[bool] = False
+    data_realizacao: Optional[date] = None
 
 class ReverterRequest(BaseModel):
     id_lote_ag: int
@@ -549,7 +550,7 @@ def conciliar_manual(
     
     # Vincular
     fat.agendamento_id = ag.id_agendamento
-    fat.dataRealizacao = ag.data
+    fat.dataRealizacao = request.data_realizacao if request.data_realizacao else ag.data
     fat.StatusConferencia = 67
     fat.StatusConciliacao = "Conciliado"
     
@@ -758,6 +759,7 @@ class ConciliarManualPorAgendamentoRequest(BaseModel):
     id_agendamento: int
     id_faturamento_lote: int  # id (PK) da tabela faturamento_lotes
     auto_envio: Optional[bool] = False
+    data_realizacao: Optional[date] = None
 
 @router.post("/conciliar-manual-ag")
 def conciliar_manual_por_agendamento(
@@ -782,7 +784,7 @@ def conciliar_manual_por_agendamento(
         raise HTTPException(status_code=400, detail="Este item de faturamento já está conciliado.")
     
     fat.agendamento_id = ag.id_agendamento
-    fat.dataRealizacao = ag.data
+    fat.dataRealizacao = request.data_realizacao if request.data_realizacao else ag.data
     fat.StatusConferencia = 67
     fat.StatusConciliacao = "Conciliado"
     

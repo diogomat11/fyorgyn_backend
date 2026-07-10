@@ -231,8 +231,8 @@ def update_lote_item(
     if request.status_conferencia is not None:
         item.StatusConferencia = request.status_conferencia
         
-    # Se status_conferencia for alterado e auto_envio for True e for IPASGO
-    if request.status_conferencia is not None and request.auto_envio and lote.id_convenio == 6:
+    # Se auto_envio for True e for IPASGO
+    if request.auto_envio and lote.id_convenio == 6:
         import json
         new_job = Job(
             carteirinha_id=None,
@@ -240,7 +240,7 @@ def update_lote_item(
             rotina="7",
             params=json.dumps({
                 "detalheId": item.detalheId,
-                "status": request.status_conferencia,
+                "status": item.StatusConferencia,
                 "dataRealizacao": item.dataRealizacao.strftime("%d/%m/%Y") if item.dataRealizacao else None,
                 "valorProcedimento": item.ValorProcedimento or ""
             }),

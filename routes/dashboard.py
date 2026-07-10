@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Job, Carteirinha, BaseGuia
@@ -15,6 +15,7 @@ from typing import Optional
 
 @router.get("/stats")
 def get_dashboard_stats(
+    background_tasks: BackgroundTasks,
     id_convenio: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
@@ -23,12 +24,12 @@ def get_dashboard_stats(
         "id_convenio": id_convenio
     }
     
-    # Auto-sincronizar antes do dashboard para garantir dados novos
+    # Auto-sincronizar antes do dashboard em background para não travar
     try:
-        from services.guias_sync_service import sync_completed_worker_jobs
-        sync_completed_worker_jobs(db)
+        from services.guias_sync_service import sync_completed_worker_jobs_bg
+        background_tasks.add_task(sync_completed_worker_jobs_bg)
     except Exception as e:
-        print(f"Error syncing completed jobs during dashboard load: {e}")
+        print(f"Error scheduling completed jobs during dashboard load: {e}")
         
     from cache import cache
     cached_res = cache.get(current_user.id, "dashboard", cache_params)
@@ -74,11 +75,50 @@ def get_dashboard_stats(
     jobs_error = job_stats.error or 0
     jobs_pending = job_stats.pending or 0
     
+    # Obter contagens de solicitações por status
+    from models import Solicitacao
+    sol_query = db.query(Solicitacao)
+    if not current_user.is_admin:
+        sol_query = sol_query.filter(Solicitacao.user_id == current_user.id)
+    
+    if id_convenio:
+        sol_query = sol_query.filter(Solicitacao.id_convenio == id_convenio)
+    elif allowed_ids:
+        sol_query = sol_query.filter(Solicitacao.id_convenio.in_(allowed_ids))
+        
+    sol_status_counts = sol_query.group_by(Solicitacao.status_solicitacao).with_entities(
+        Solicitacao.status_solicitacao, func.count(Solicitacao.id)
+    ).all()
+    
+    sol_counts = {"Pendente": 0, "Negada": 0, "Cancelada": 0}
+    for status_name, count_val in sol_status_counts:
+        status_clean = str(status_name).strip().lower()
+        if "autorizad" in status_clean or "liberad" in status_clean:
+            continue
+        elif "pendente" in status_clean or "estudo" in status_clean or "fila" in status_clean:
+            sol_counts["Pendente"] += count_val
+        elif "negad" in status_clean:
+            sol_counts["Negada"] += count_val
+        elif "cancelad" in status_clean:
+            sol_counts["Cancelada"] += count_val
+        else:
+            sol_counts["Pendente"] += count_val
+            
+    total_autorizadas = total_guias
+    total_all = total_autorizadas + sum(sol_counts.values())
+    
     res_payload = {
         "overview": {
             "total_carteirinhas": total_carteirinhas,
             "total_guias": total_guias,
-            "total_jobs": total_jobs
+            "total_jobs": total_jobs,
+            "guias_status": {
+                "total": total_all,
+                "autorizadas": total_autorizadas,
+                "pendentes": sol_counts["Pendente"],
+                "negadas": sol_counts["Negada"],
+                "canceladas": sol_counts["Cancelada"]
+            }
         },
         "jobs_status": {
             "success": jobs_success,

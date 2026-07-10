@@ -45,6 +45,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     return {
         "token": jwt_token,
         "username": user.username,
+        "user_id": user.id,
         "validade": user.validade.isoformat() if user.validade else None,
         "is_admin": user.is_admin
     }

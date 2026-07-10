@@ -29,8 +29,8 @@ MAX_FILES_PER_LOTE = 100
 # Max file size (10MB)
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
-# ZIP split size (10MB)
-ZIP_SPLIT_SIZE_BYTES = 10 * 1024 * 1024
+# ZIP split size (90MB)
+ZIP_SPLIT_SIZE_BYTES = 90 * 1024 * 1024
 
 
 def _get_db_session():
@@ -274,16 +274,19 @@ def _process_lote_background(lote_id: int):
 
                 # Map IPASGO fields to standard names expected by the validation and extraction pipeline
                 if lote.convenio == "ipasgo":
+                    atends_raw = gemini_result.get("ATENDIMENTOS") or []
+                    if not atends_raw and gemini_result.get("DATA_AUTORIZACAO"):
+                        atends_raw = [{
+                            "data": gemini_result.get("DATA_AUTORIZACAO") or "",
+                            "assinatura": "Sim"
+                        }]
+                    
                     normalized_result = {
                         "numeroGuiaPrestador": gemini_result.get("NUMERO_GUIA") or "",
                         "nomeBeneficiario": gemini_result.get("NOME_BENEFICIARIO") or "",
                         "numeroGuiaPrincipal": gemini_result.get("NUMERO_SENHA") or "VAZIO",
-                        "atendimentos": [
-                            {
-                                "data": gemini_result.get("DATA_AUTORIZACAO") or "",
-                                "assinatura": "Sim"
-                            }
-                        ] if gemini_result.get("DATA_AUTORIZACAO") else []
+                        "carteira": gemini_result.get("CARTEIRA") or "VAZIO",
+                        "atendimentos": atends_raw
                     }
                     gemini_result = normalized_result
 
@@ -294,6 +297,9 @@ def _process_lote_background(lote_id: int):
                 arquivo.numero_guia_prestador = gemini_result.get("numeroGuiaPrestador", "")
                 arquivo.nome_beneficiario = pipeline_result.get("nome_beneficiario", "")
                 arquivo.numero_guia_principal = gemini_result.get("numeroGuiaPrincipal", "")
+                arquivo.carteira = gemini_result.get("carteira", "")
+                if arquivo.carteira == "VAZIO":
+                    arquivo.carteira = None
                 arquivo.atendimentos = gemini_result.get("atendimentos", [])
                 arquivo.guia_normalizada = pipeline_result.get("guia_normalizada", "")
 
@@ -542,18 +548,66 @@ def update_arquivo_nome(db: Session, arquivo_id: int, novo_nome: str) -> Optiona
 
 
 def update_arquivo_atendimentos(db: Session, arquivo_id: int, atendimentos: list[dict]) -> Optional[dict]:
-    """Update the atendimentos JSON of an arquivo."""
-    from models import ProtocoloArquivo
+    """Update the atendimentos JSON of an arquivo and rename final file if needed."""
+    from models import ProtocoloArquivo, ProtocoloLote
+    from services.extraction_pipeline import build_filename, validate_date, rename_file_safe, normalize_guia_prefix
 
     arquivo = db.query(ProtocoloArquivo).filter(ProtocoloArquivo.id == arquivo_id).first()
     if not arquivo:
+        return None
+
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == arquivo.lote_id).first()
+    if not lote:
         return None
 
     arquivo.atendimentos = atendimentos
     arquivo.status = "sucesso"  # Promoting to success after manual adjustment
     arquivo.erro_mensagem = None
     arquivo.updated_at = datetime.utcnow()
-    
+
+    # Recalculate proposed final filename based on new date of atendimentos
+    first_date = ""
+    if atendimentos:
+        first_date = atendimentos[0].get("data", "")
+        # Normalize date format
+        _, normalized = validate_date(first_date)
+        if normalized:
+            first_date = normalized
+
+    guia_raw = arquivo.numero_guia_prestador or ""
+    if lote.convenio != "ipasgo":
+        guia_normalizada = normalize_guia_prefix(guia_raw)
+    else:
+        guia_normalizada = guia_raw
+
+    guia_principal = arquivo.numero_guia_principal or "VAZIO"
+    if guia_principal and guia_principal.upper() != "VAZIO":
+        if lote.convenio != "ipasgo":
+            guia_principal = normalize_guia_prefix(guia_principal)
+
+    novo_nome = build_filename(
+        guia_principal,
+        guia_normalizada,
+        first_date,
+        arquivo.nome_beneficiario,
+        convenio=lote.convenio,
+    )
+
+    if novo_nome != arquivo.nome_final:
+        try:
+            source_path = arquivo.caminho_final or arquivo.caminho_original
+            if source_path and os.path.exists(source_path):
+                final_path = rename_file_safe(
+                    source_path,
+                    OUTPUT_DIR,
+                    novo_nome,
+                )
+                arquivo.caminho_final = final_path
+            arquivo.nome_final = novo_nome
+        except Exception as rename_err:
+            logger.error(f"Erro ao renomear arquivo apos alteracao de data: {str(rename_err)}")
+            arquivo.nome_final = novo_nome
+
     db.commit()
     
     # Recalculate totals
@@ -564,7 +618,8 @@ def update_arquivo_atendimentos(db: Session, arquivo_id: int, atendimentos: list
     return {
         "id": arquivo.id,
         "atendimentos": arquivo.atendimentos,
-        "status": arquivo.status
+        "status": arquivo.status,
+        "nome_final": arquivo.nome_final
     }
 
 
@@ -608,7 +663,6 @@ def generate_download_zip(db: Session, lote_id: int) -> list[io.BytesIO]:
     arquivos = db.query(ProtocoloArquivo).filter(
         ProtocoloArquivo.lote_id == lote_id,
         ProtocoloArquivo.status == "sucesso",
-        ProtocoloArquivo.caminho_final != None,
     ).all()
 
     if not arquivos:
@@ -617,8 +671,14 @@ def generate_download_zip(db: Session, lote_id: int) -> list[io.BytesIO]:
     # Collect valid files
     valid_files = []
     for a in arquivos:
+        filepath = None
         if a.caminho_final and os.path.exists(a.caminho_final):
-            valid_files.append((a.nome_final or a.nome_original, a.caminho_final))
+            filepath = a.caminho_final
+        elif a.caminho_original and os.path.exists(a.caminho_original):
+            filepath = a.caminho_original
+
+        if filepath:
+            valid_files.append((a.nome_final or a.nome_original, filepath))
 
     if not valid_files:
         return []
@@ -628,6 +688,7 @@ def generate_download_zip(db: Session, lote_id: int) -> list[io.BytesIO]:
     current_buffer = io.BytesIO()
     current_zip = zipfile.ZipFile(current_buffer, "w", zipfile.ZIP_DEFLATED)
     current_size = 0
+    used_names = set()
 
     for filename, filepath in valid_files:
         file_size = os.path.getsize(filepath)
@@ -642,8 +703,18 @@ def generate_download_zip(db: Session, lote_id: int) -> list[io.BytesIO]:
             current_buffer = io.BytesIO()
             current_zip = zipfile.ZipFile(current_buffer, "w", zipfile.ZIP_DEFLATED)
             current_size = 0
+            used_names = set()
 
-        current_zip.write(filepath, arcname=filename)
+        # Deduplicate filename to prevent warnings/skips on extraction
+        base, ext = os.path.splitext(filename)
+        counter = 1
+        unique_filename = filename
+        while unique_filename.lower() in used_names:
+            unique_filename = f"{base}_{counter}{ext}"
+            counter += 1
+        used_names.add(unique_filename.lower())
+
+        current_zip.write(filepath, arcname=unique_filename)
         current_size += file_size
 
     # Close the last ZIP
@@ -672,3 +743,229 @@ def get_arquivo_file_path(db: Session, arquivo_id: int) -> Optional[tuple[str, s
         return arquivo.caminho_original, arquivo.nome_original
 
     return None
+
+
+def gravar_arquivo_itens(db: Session, arquivo_id: int, ignore_unsigned: bool = False) -> dict:
+    """
+    Saves all atendimentos (sessions) extracted from a ProtocoloArquivo as ProtocoloItem rows.
+    """
+    from models import ProtocoloArquivo, ProtocoloLote, ProtocoloItem, UserConvenio, BaseGuia
+    from datetime import datetime
+
+    arquivo = db.query(ProtocoloArquivo).filter(ProtocoloArquivo.id == arquivo_id).first()
+    if not arquivo:
+        raise ValueError("Arquivo não encontrado")
+
+    lote = db.query(ProtocoloLote).filter(ProtocoloLote.id == arquivo.lote_id).first()
+    if not lote:
+        raise ValueError("Lote associado não encontrado")
+
+    # Mapear convenio string para id_convenio
+    id_convenio = 3
+    if lote.convenio == "ipasgo":
+        id_convenio = 6
+    elif lote.convenio == "unimed_goiania":
+        id_convenio = 3
+
+    # Resolve cod_prestador
+    cod_prestador = None
+    if lote.user_id:
+        user_conv = db.query(UserConvenio).filter(
+            UserConvenio.user_id == lote.user_id,
+            UserConvenio.id_convenio == id_convenio
+        ).first()
+        if user_conv:
+            cod_prestador = user_conv.cod_prestador
+
+    # Determinar a guia principal e guia prestador
+    guia_val = arquivo.guia_normalizada or arquivo.numero_guia_prestador or ""
+    senha_val = arquivo.numero_guia_principal
+    if senha_val == "VAZIO":
+        senha_val = None
+
+    # Tenta achar a relação com base_guias
+    base_guia_id = None
+    if guia_val:
+        bg = db.query(BaseGuia).filter(
+            BaseGuia.id_convenio == id_convenio,
+            (BaseGuia.guia == guia_val) | (BaseGuia.senha == guia_val)
+        ).first()
+        if bg:
+            base_guia_id = bg.id
+    if not base_guia_id and senha_val:
+        bg = db.query(BaseGuia).filter(
+            BaseGuia.id_convenio == id_convenio,
+            (BaseGuia.guia == senha_val) | (BaseGuia.senha == senha_val)
+        ).first()
+        if bg:
+            base_guia_id = bg.id
+
+    # Deletar itens antigos deste arquivo para garantir idempotência
+    db.query(ProtocoloItem).filter(ProtocoloItem.arquivo_id == arquivo_id).delete()
+
+    # Criar um ProtocoloItem para cada atendimento
+    atendimentos_list = arquivo.atendimentos or []
+    items_created = 0
+
+    for atend in atendimentos_list:
+        # Se ignore_unsigned for True, ignorar registros que não estejam assinados
+        if ignore_unsigned and atend.get("assinatura", "Não") != "Sim":
+            continue
+
+        data_str = atend.get("data")
+        if not data_str:
+            continue
+        
+        try:
+            data_clean = data_str.replace("-", "/").strip()
+            dt_obj = datetime.strptime(data_clean, "%d/%m/%Y").date()
+        except Exception:
+            try:
+                dt_obj = datetime.strptime(data_clean, "%Y/%m/%d").date()
+            except Exception:
+                dt_obj = None
+
+        item = ProtocoloItem(
+            user_id=lote.user_id,
+            id_convenio=id_convenio,
+            cod_prestador=cod_prestador,
+            guia=guia_val,
+            nome=arquivo.nome_beneficiario,
+            carteira=arquivo.carteira,
+            senha=senha_val,
+            data=dt_obj,
+            assinatura=atend.get("assinatura", "Não"),
+            guia_prestador=arquivo.numero_guia_prestador,
+            lote_id=lote.id,
+            arquivo_id=arquivo.id,
+            base_guia_id=base_guia_id,
+            caminho_arquivo=arquivo.caminho_final or arquivo.caminho_original,
+            status_conciliacao="Não Conciliado"
+        )
+        db.add(item)
+        items_created += 1
+
+    arquivo.gravado = True
+    db.commit()
+
+    return {
+        "arquivo_id": arquivo_id,
+        "items_created": items_created,
+        "gravado": True
+    }
+
+
+def gravar_lote_itens(db: Session, lote_id: int, ignore_unsigned: bool = False) -> dict:
+    """
+    Grava os atendimentos de TODOS os arquivos com sucesso de um lote.
+    """
+    from models import ProtocoloArquivo
+    arquivos = db.query(ProtocoloArquivo).filter(
+        ProtocoloArquivo.lote_id == lote_id,
+        ProtocoloArquivo.status == "sucesso"
+    ).all()
+
+    total_gravados = 0
+    total_itens = 0
+    for arq in arquivos:
+        res = gravar_arquivo_itens(db, arq.id, ignore_unsigned=ignore_unsigned)
+        total_gravados += 1
+        total_itens += res["items_created"]
+
+    return {
+        "lote_id": lote_id,
+        "arquivos_gravados": total_gravados,
+        "total_itens_criados": total_itens
+    }
+
+
+def conciliar_itens_protocolo(db: Session, user_id: int, id_convenio: int, faturamento_lote_id: Optional[int] = None) -> dict:
+    """
+    Algoritmo de auto-conciliação para ProtocoloItem.
+    Realiza o match baseado na guia e no match exato da data do atendimento/realização.
+    """
+    from models import ProtocoloItem, FaturamentoLote, Agendamento
+
+    query_itens = db.query(ProtocoloItem).filter(
+        ProtocoloItem.user_id == user_id,
+        ProtocoloItem.id_convenio == id_convenio,
+        ProtocoloItem.status_conciliacao == "Não Conciliado"
+    )
+    itens = query_itens.all()
+
+    conciliados_count = 0
+
+    for item in itens:
+        if not item.data:
+            continue
+
+        # 1. Tentar conciliar com FaturamentoLote
+        query_fat = db.query(FaturamentoLote).filter(
+            FaturamentoLote.user_id == user_id,
+            FaturamentoLote.dataRealizacao == item.data,
+            FaturamentoLote.StatusConciliacao != "Conciliado"
+        )
+        if faturamento_lote_id:
+            query_fat = query_fat.filter(FaturamentoLote.id_lote == faturamento_lote_id)
+
+        fats = query_fat.all()
+        fat_match = None
+        for f in fats:
+            if f.Guia and f.Guia.strip():
+                f_guia = f.Guia.strip()
+                if (item.guia and f_guia in item.guia) or \
+                   (item.senha and f_guia in item.senha) or \
+                   (item.guia_prestador and f_guia in item.guia_prestador) or \
+                   (item.guia and item.guia in f_guia) or \
+                   (item.senha and item.senha in f_guia) or \
+                   (item.guia_prestador and item.guia_prestador in f_guia):
+                    fat_match = f
+                    break
+
+        # 2. Tentar conciliar com Agendamento
+        ag_match = None
+        if fat_match and fat_match.agendamento_id:
+            ag_match = db.query(Agendamento).filter(Agendamento.id_agendamento == fat_match.agendamento_id).first()
+        else:
+            query_ag = db.query(Agendamento).filter(
+                Agendamento.user_id == user_id,
+                Agendamento.id_convenio == id_convenio,
+                Agendamento.data == item.data,
+                Agendamento.Status != "Cancelado"
+            )
+            ags = query_ag.all()
+            for ag in ags:
+                if ag.numero_guia and ag.numero_guia.strip():
+                    ag_guia = ag.numero_guia.strip()
+                    if (item.guia and ag_guia in item.guia) or \
+                       (item.senha and ag_guia in item.senha) or \
+                       (item.guia_prestador and ag_guia in item.guia_prestador) or \
+                       (item.guia and item.guia in ag_guia) or \
+                       (item.senha and item.senha in ag_guia) or \
+                       (item.guia_prestador and item.guia_prestador in ag_guia):
+                        ag_match = ag
+                        break
+
+        if fat_match or ag_match:
+            if fat_match:
+                item.faturamento_lote_id = fat_match.id
+                fat_match.StatusConciliacao = "Conciliado"
+                fat_match.StatusConferencia = 67 # Conferido
+                
+                if fat_match.agendamento_id:
+                    item.agendamento_id = fat_match.agendamento_id
+
+            if ag_match:
+                item.agendamento_id = ag_match.id_agendamento
+                if fat_match and not fat_match.agendamento_id:
+                    fat_match.agendamento_id = ag_match.id_agendamento
+
+            item.status_conciliacao = "Conciliado"
+            conciliados_count += 1
+
+    db.commit()
+    return {
+        "status": "success",
+        "processed": len(itens),
+        "conciliated": conciliados_count
+    }

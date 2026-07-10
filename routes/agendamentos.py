@@ -24,7 +24,7 @@ router = APIRouter(
 class CreateAgendamentoRequest(BaseModel):
     carteirinha: str
     id_convenio: int
-    Id_profissional: int
+    Id_profissional: str
     cod_procedimento_aut: str
     data: date
     hora_inicio: time
@@ -753,6 +753,8 @@ def list_profissionais(
         {
             "id_profissional": p.id_profissional,
             "nome": p.nome,
+            "cpf": p.cpf or "",
+            "area": p.area or "",
             "conselho": p.conselho or "",
             "registro": p.registro or "",
             "UF": p.UF or "",
@@ -762,5 +764,113 @@ def list_profissionais(
         }
         for p in profissionais
     ]
+
+
+class ProfissionalCreateSchema(BaseModel):
+    nome: str
+    cpf: Optional[str] = None
+    area: Optional[str] = None
+    conselho: Optional[str] = None
+    registro: Optional[str] = None
+    UF: Optional[str] = None
+    CBO: Optional[str] = None
+    codigo_ipasgo: Optional[str] = None
+    tipo_profissional: Optional[str] = "profissional"
+
+
+@router.post("/profissionais")
+def create_profissional(
+    req: ProfissionalCreateSchema,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    new_prof = CorpoClinico(
+        nome=req.nome,
+        cpf=req.cpf,
+        area=req.area,
+        conselho=req.conselho,
+        registro=req.registro,
+        UF=req.UF,
+        CBO=req.CBO,
+        codigo_ipasgo=req.codigo_ipasgo,
+        tipo_profissional=req.tipo_profissional,
+        status="ativo",
+        user_id=current_user.id
+    )
+    db.add(new_prof)
+    db.commit()
+    db.refresh(new_prof)
+    return {
+        "status": "success",
+        "id_profissional": new_prof.id_profissional,
+        "profissional": {
+            "id_profissional": new_prof.id_profissional,
+            "nome": new_prof.nome,
+            "cpf": new_prof.cpf or "",
+            "area": new_prof.area or "",
+            "conselho": new_prof.conselho,
+            "registro": new_prof.registro,
+            "UF": new_prof.UF,
+            "CBO": new_prof.CBO,
+            "codigo_ipasgo": new_prof.codigo_ipasgo,
+            "tipo_profissional": new_prof.tipo_profissional
+        }
+    }
+
+
+@router.put("/profissionais/{id_profissional}")
+def update_profissional(
+    id_profissional: str,
+    req: ProfissionalCreateSchema,
+    area: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    query = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_profissional)
+    if area:
+        query = query.filter(CorpoClinico.area == area)
+    prof = query.first()
+    if not prof:
+        raise HTTPException(status_code=404, detail="Profissional não encontrado.")
+    
+    if not current_user.is_admin and prof.user_id != current_user.id and prof.user_id is not None:
+        raise HTTPException(status_code=403, detail="Sem permissão para editar este profissional.")
+        
+    prof.nome = req.nome
+    prof.cpf = req.cpf
+    prof.area = req.area
+    prof.conselho = req.conselho
+    prof.registro = req.registro
+    prof.UF = req.UF
+    prof.CBO = req.CBO
+    prof.codigo_ipasgo = req.codigo_ipasgo
+    prof.tipo_profissional = req.tipo_profissional
+    
+    db.commit()
+    db.refresh(prof)
+    return {"status": "success", "id_profissional": prof.id_profissional}
+
+
+@router.delete("/profissionais/{id_profissional}")
+def delete_profissional(
+    id_profissional: str,
+    area: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    query = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == id_profissional)
+    if area:
+        query = query.filter(CorpoClinico.area == area)
+    prof = query.first()
+    if not prof:
+        raise HTTPException(status_code=404, detail="Profissional não encontrado.")
+        
+    if not current_user.is_admin and prof.user_id != current_user.id and prof.user_id is not None:
+        raise HTTPException(status_code=403, detail="Sem permissão para remover este profissional.")
+        
+    prof.status = "inativo"
+    db.commit()
+    return {"status": "success", "message": "Profissional desativado com sucesso."}
+
 
 

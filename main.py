@@ -1,18 +1,29 @@
 from fastapi import FastAPI
 # Trigger Redeploy
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from database import engine, Base
 from routes import auth, carteirinhas, jobs, guias, logs, dashboard, debug_optimization
+import os
 
 # Create tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="FyorGyn API", version="1.0.0")
 
+# Monta a pasta de uploads para arquivos estáticos de forma nativa
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+
 # Configure CORS
 origins = [
     "http://localhost:3000",
     "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
     "https://clmf-gestor.vercel.app",
     "https://clmf-hub-unimed-frontend.vercel.app"
 ]
@@ -31,13 +42,14 @@ def read_root():
 
 import asyncio
 from database import SessionLocal
-from services.cleanup_service import delete_expired_patients
+from services.cleanup_service import delete_expired_patients, cleanup_expired_attachments
 
 async def run_cleanup_loop():
     while True:
         try:
             db = SessionLocal()
             delete_expired_patients(db)
+            cleanup_expired_attachments(db)
             db.close()
         except Exception as e:
             print(f"Cleanup Loop Error: {e}")

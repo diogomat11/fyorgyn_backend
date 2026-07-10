@@ -3,8 +3,8 @@ task: extracao_terapias_relatorio_medico
 language: pt-BR
 
 objetivo: >
-  Extrair do arquivo de relatório médico anexo (PDF, JPG, PNG) as áreas terapêuticas prescritas
-  e suas respectivas cargas horárias, lidando com erros, abreviações ou variações.
+  Extrair do arquivo de relatório médico anexo (PDF, JPG, PNG) as áreas terapêuticas prescritas,
+  suas respectivas cargas horárias, e a data de emissão/prescrição do relatório médico.
   Retornar os dados em formato JSON, mapeando o id_paciente requisitado e separando
   as áreas médicas não listadas no padrão.
 
@@ -80,6 +80,7 @@ regras_extracao:
   - mapear texto encontrado para uma das areas_padrao usando o mapeamento_areas.
   - classificar as áreas médicas solicitadas que NÃO constam em 'areas_padrao' (ex: Psiquiatria, Neurologia) como itens ignorados.
   - extrair carga horaria com regex.
+  - localizar a data de emissão ou prescrição do relatório médico (geralmente próxima da assinatura ou cabeçalho). Formatar no formato ISO 'YYYY-MM-DD'. Se não houver data explícita, retornar null.
 
 regex_carga_horaria:
   padroes:
@@ -96,6 +97,7 @@ formato_saida:
   tipo: json
   estrutura_exemplo:
     id_paciente: 12345
+    data_relatorio: "2026-02-15"
     areas_extraidas:
       - Area: "PSICOLOGIA"
         area_carga_horaria: 2

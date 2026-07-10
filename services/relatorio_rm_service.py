@@ -59,6 +59,10 @@ RM_RESPONSE_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "id_paciente": {"type": "STRING", "description": "ID do paciente"},
+        "data_relatorio": {
+            "type": "STRING",
+            "description": "Data de emissão/prescrição do relatório médico no formato ISO YYYY-MM-DD. Se não for encontrada, retorne null."
+        },
         "areas_extraidas": {
             "type": "ARRAY",
             "description": "Lista de áreas terapêuticas extraídas",
@@ -290,6 +294,17 @@ def parse_gemini_to_db_fields(gemini_result: dict) -> dict:
     db_fields["tipo_carga_horaria"] = None
     db_fields["itens_ignorados"] = ignorados if ignorados else None
 
+    # Parse data_relatorio
+    data_str = gemini_result.get("data_relatorio")
+    if data_str:
+        from datetime import datetime
+        try:
+            db_fields["data_relatorio"] = datetime.strptime(data_str.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            db_fields["data_relatorio"] = None
+    else:
+        db_fields["data_relatorio"] = None
+
     for area in areas:
         area_name = (area.get("Area") or "").upper().strip()
         carga = area.get("area_carga_horaria", 0)
@@ -450,9 +465,15 @@ def update_extraction(db: Session, extraction_id: int, updates: dict) -> Optiona
         return None
 
     # Allowed update fields
-    allowed_fields = set(AREAS_PADRAO.values()) | {"tipo_carga_horaria", "nome_paciente", "id_paciente"}
+    allowed_fields = set(AREAS_PADRAO.values()) | {"tipo_carga_horaria", "nome_paciente", "id_paciente", "data_relatorio"}
     for key, value in updates.items():
         if key in allowed_fields:
+            if key == "data_relatorio" and isinstance(value, str):
+                from datetime import datetime
+                try:
+                    value = datetime.strptime(value.strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    value = None
             setattr(record, key, value)
 
     # Recalculate status after manual edit
@@ -522,6 +543,7 @@ def _record_to_dict(record: RelatorioMedicoExtracao) -> dict:
         "tipo_carga_horaria": record.tipo_carga_horaria,
         "status_extracao": record.status_extracao,
         "itens_ignorados": record.itens_ignorados,
+        "data_relatorio": record.data_relatorio.isoformat() if record.data_relatorio else None,
         "created_at": record.created_at.isoformat() if record.created_at else None,
         "updated_at": record.updated_at.isoformat() if record.updated_at else None,
     }

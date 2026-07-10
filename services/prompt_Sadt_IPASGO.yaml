@@ -23,8 +23,12 @@ diretrizes_de_extracao:
     mascara: "Sequência numérica variável."
 
   DATA_AUTORIZACAO:
-    [cite_start]chaves_alternativas: ["4- Data da Autorização", "22-Data da Solicitação"] [cite: 3, 23]
-    [cite_start]regra: "Capturar a data no formato DD/MM/AAAA." [cite: 3]
+    chaves_alternativas: ["4- Data da Autorização", "22-Data da Solicitação"]
+    regra: "Capturar a data no formato DD/MM/AAAA."
+
+  ATENDIMENTOS:
+    chave_busca: "56 - Data Realização Procedimentos em Série"
+    regra: "Localize a tabela/grade do campo '56 - Data Realização Procedimentos em Série'. Para cada linha onde há uma data preenchida (geralmente manuscrita), extraia essa data no formato DD/MM/AAAA. Verifique a coluna correspondente de assinatura; se houver uma rubrica/assinatura manuscrita preenchida nessa linha, marque 'Sim', caso contrário marque 'Não'. Retorne apenas as linhas que possuem datas preenchidas."
 
 formato_saida:
   tipo: "JSON"

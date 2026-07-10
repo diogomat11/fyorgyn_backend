@@ -48,6 +48,7 @@ class UpdateExtractionRequest(BaseModel):
     tipo_carga_horaria: Optional[str] = None
     nome_paciente: Optional[str] = None
     id_paciente: Optional[str] = None
+    data_relatorio: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

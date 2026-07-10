@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from dependencies import get_current_user
-from models import BaseGuia, Carteirinha
+from models import BaseGuia, Carteirinha, Job
 from typing import Optional
 from datetime import date, datetime, timedelta
 from openpyxl import Workbook
@@ -29,7 +29,8 @@ def list_guias(
     limit: int = 25,
     skip: int = 0,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    background_tasks: BackgroundTasks = None
 ):
     from sqlalchemy import func, case, and_, or_
     from models import Agendamento
@@ -55,12 +56,13 @@ def list_guias(
     if cached_res:
         return cached_res
 
-    # Auto-sincronizar guias extraídas pelo worker
-    try:
-        from services.guias_sync_service import sync_completed_worker_jobs
-        sync_completed_worker_jobs(db)
-    except Exception as e:
-        print(f"Error syncing completed jobs during list_guias: {e}")
+    # Auto-sincronizar guias extraídas pelo worker em background para evitar travamento
+    if background_tasks:
+        try:
+            from services.guias_sync_service import sync_completed_worker_jobs_bg
+            background_tasks.add_task(sync_completed_worker_jobs_bg)
+        except Exception as e:
+            print(f"Error scheduling completed jobs during list_guias: {e}")
     
     subq_query = db.query(
         Agendamento.numero_guia,
@@ -118,32 +120,190 @@ def list_guias(
         query = query.filter(BaseGuia.codigo_terapia.ilike(f'%{codigo_terapia}%'))
         
     if aba == "autorizadas":
-        query = query.filter(BaseGuia.status_guia.ilike('%autorizad%'))
-    elif aba == "solicitacoes":
-        query = query.filter(~BaseGuia.status_guia.ilike('%autorizad%'))
+        query = query.filter(
+            or_(
+                BaseGuia.status_guia.ilike('%autorizad%'),
+                BaseGuia.status_guia.ilike('%liberad%')
+            )
+        )
 
-    total = query.count()
-    results = query.order_by(BaseGuia.created_at.desc()).limit(limit).offset(skip).all()
-    
-    guias_data = []
-    for row in results:
-        guia_obj = row[0]
-        q_realizadas = int(row[1] or 0)
-        q_a_confirmar = int(row[2] or 0)
-        nome_paciente = row[3]
-        carteirinha_numero = row[4]
+    # Fetch active/failed jobs when looking at solicitacoes
+    jobs_data = []
+    if aba == "solicitacoes":
+        job_query = db.query(Job, Carteirinha.paciente.label('nome_paciente'), Carteirinha.carteirinha.label('carteirinha_numero'))\
+            .outerjoin(Carteirinha, Job.carteirinha_id == Carteirinha.id)
+        if not current_user.is_admin:
+            job_query = job_query.filter(Job.user_id == current_user.id)
+        if id_convenio:
+            job_query = job_query.filter(Job.id_convenio == id_convenio)
+        if status:
+            status_lower = status.lower()
+            if "pendente" in status_lower:
+                job_query = job_query.filter(Job.status.in_(["pending", "processing"]))
+            elif "negad" in status_lower:
+                job_query = job_query.filter(Job.status == "error")
+            else:
+                job_query = job_query.filter(Job.id == -1)
+        else:
+            job_query = job_query.filter(Job.status.in_(["pending", "processing", "error"]))
+        db_jobs = job_query.order_by(Job.created_at.desc()).all()
         
-        g_dict = {c.name: getattr(guia_obj, c.name) for c in guia_obj.__table__.columns}
-        g_dict['sessoes_realizadas'] = q_realizadas
-        g_dict['nome_paciente'] = nome_paciente
-        g_dict['carteirinha_numero'] = carteirinha_numero
+        for job_row in db_jobs:
+            job_obj = job_row[0]
+            nome_paciente = job_row[1]
+            carteirinha_numero = job_row[2]
+            
+            params = job_obj.params or {}
+            if isinstance(params, str):
+                try:
+                    import json
+                    params = json.loads(params)
+                except Exception:
+                    params = {}
+            elif not isinstance(params, dict):
+                params = {}
+                
+            status_desc = job_obj.status
+            if job_obj.status == "error" and job_obj.error_message:
+                status_desc = f"Erro: {job_obj.error_message}"
+            elif job_obj.status == "pending":
+                status_desc = "Pendente (Fila)"
+            elif job_obj.status == "processing":
+                status_desc = "Processando"
+                
+            jobs_data.append({
+                "id": f"job-{job_obj.id}",
+                "carteirinha_id": job_obj.carteirinha_id,
+                "id_convenio": job_obj.id_convenio,
+                "cod_prestador": params.get("codigo_prestador") or "",
+                "codigo_beneficiario": params.get("carteira") or carteirinha_numero or "",
+                "guia": f"Solicitação #{job_obj.id}",
+                "guia_prestador": "",
+                "data_solicitacao": job_obj.created_at.date() if job_obj.created_at else None,
+                "data_autorizacao": None,
+                "senha": "",
+                "status_guia": status_desc,
+                "validade": None,
+                "codigo_terapia": params.get("codigoProcedimento_aut") or "",
+                "nome_terapia": "Solicitação em andamento...",
+                "qtde_solicitada": int(params.get("qtde") or 1),
+                "sessoes_autorizadas": 0,
+                "sessoes_realizadas": 0,
+                "saldo": 0,
+                "created_at": job_obj.created_at,
+                "updated_at": job_obj.updated_at,
+                "nome_paciente": nome_paciente or "Paciente",
+                "carteirinha_numero": carteirinha_numero or params.get("carteira") or ""
+            })
+
+    if aba == "solicitacoes":
+        from models import Solicitacao
         
-        # Saldo dinâmico (Autorizado - realizadas - a confirmar)
-        auth = g_dict.get('sessoes_autorizadas') or 0
-        g_dict['saldo'] = auth - (q_realizadas + q_a_confirmar)
+        sol_query = db.query(
+            Solicitacao,
+            Carteirinha.paciente.label('nome_paciente'),
+            Carteirinha.carteirinha.label('carteirinha_numero')
+        ).select_from(Solicitacao)\
+         .outerjoin(Carteirinha, and_(
+             Solicitacao.carteirinha_id == Carteirinha.id,
+             or_(
+                 Solicitacao.user_id == Carteirinha.user_id,
+                 Carteirinha.user_id.is_(None),
+                 Solicitacao.user_id.is_(None)
+             )
+         ))
+         
+        if not current_user.is_admin:
+            sol_query = sol_query.filter(Solicitacao.user_id == current_user.id)
+            
+        # Excluir guias autorizadas/liberadas e solicitações que já possuem guias correspondentes na base_guias para evitar duplicação
+        from sqlalchemy import exists
         
-        guias_data.append(g_dict)
-    
+        has_base_guia_subq = exists().where(
+            and_(
+                BaseGuia.guia == Solicitacao.guia,
+                BaseGuia.id_convenio == Solicitacao.id_convenio,
+                BaseGuia.codigo_terapia == Solicitacao.codigo_terapia,
+                BaseGuia.user_id == Solicitacao.user_id
+            )
+        )
+        sol_query = sol_query.filter(
+            and_(
+                ~or_(
+                    Solicitacao.status_solicitacao.ilike('%autorizad%'),
+                    Solicitacao.status_solicitacao.ilike('%liberad%')
+                ),
+                Solicitacao.base_guia_id.is_(None),
+                ~has_base_guia_subq
+            )
+        )
+            
+        if id_convenio:
+            sol_query = sol_query.filter(Solicitacao.id_convenio == id_convenio)
+        elif allowed_ids:
+            sol_query = sol_query.filter(Solicitacao.id_convenio.in_(allowed_ids))
+            
+        if created_at_start:
+            sol_query = sol_query.filter(Solicitacao.updated_at >= created_at_start)
+        if created_at_end:
+            end_dt = datetime.combine(created_at_end, datetime.min.time()) + timedelta(days=1)
+            sol_query = sol_query.filter(Solicitacao.updated_at < end_dt)
+        if carteirinha_id:
+            sol_query = sol_query.filter(Solicitacao.carteirinha_id == carteirinha_id)
+        if status:
+            sol_query = sol_query.filter(Solicitacao.status_solicitacao.ilike(f'%{status}%'))
+        if senha:
+            sol_query = sol_query.filter(Solicitacao.senha.ilike(f'%{senha}%'))
+        if codigo_terapia:
+            sol_query = sol_query.filter(Solicitacao.codigo_terapia.ilike(f'%{codigo_terapia}%'))
+            
+        db_sols = sol_query.order_by(Solicitacao.created_at.desc()).all()
+        
+        from sqlalchemy import inspect
+        sol_mapper = inspect(Solicitacao)
+        solicitacoes_data = []
+        for row in db_sols:
+            sol_obj = row[0]
+            nome_paciente = row[1]
+            carteirinha_numero = row[2]
+            
+            s_dict = {attr.key: getattr(sol_obj, attr.key) for attr in sol_mapper.column_attrs}
+            s_dict['status_guia'] = s_dict['status_solicitacao']
+            s_dict['nome_paciente'] = nome_paciente
+            s_dict['carteirinha_numero'] = carteirinha_numero
+            s_dict['sessoes_realizadas'] = 0
+            s_dict['saldo'] = s_dict.get('sessoes_autorizadas', 0)
+            
+            solicitacoes_data.append(s_dict)
+            
+        combined = jobs_data + solicitacoes_data
+        combined.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
+        total = len(combined)
+        guias_data = combined[skip : skip + limit]
+        
+    else:
+        from sqlalchemy import inspect
+        base_guia_mapper = inspect(BaseGuia)
+        results = query.order_by(BaseGuia.created_at.desc()).limit(limit).offset(skip).all()
+        guias_data = []
+        for row in results:
+            guia_obj = row[0]
+            q_realizadas = int(row[1] or 0)
+            q_a_confirmar = int(row[2] or 0)
+            nome_paciente = row[3]
+            carteirinha_numero = row[4]
+            
+            g_dict = {attr.key: getattr(guia_obj, attr.key) for attr in base_guia_mapper.column_attrs}
+            g_dict['sessoes_realizadas'] = q_realizadas
+            g_dict['nome_paciente'] = nome_paciente
+            g_dict['carteirinha_numero'] = carteirinha_numero
+            
+            auth = g_dict.get('sessoes_autorizadas') or 0
+            g_dict['saldo'] = auth - (q_realizadas + q_a_confirmar)
+            guias_data.append(g_dict)
+            
+        total = query.count()
+        
     res_payload = {"data": guias_data, "total": total, "skip": skip, "limit": limit}
     cache.set(current_user.id, "guias", cache_params, res_payload, ttl=30)
     return res_payload
@@ -280,3 +440,26 @@ def export_guias(
         # Return the actual error details for debugging instead of generic 500
         # In production this might be bad, but for debugging now it's essential
         raise HTTPException(status_code=500, detail=f"Erro ao gerar arquivo: {str(e)}")
+
+@router.get("/relatorios")
+def list_relatorios(
+    id_paciente: Optional[str] = None,
+    tipo_relatorio: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    from models import RelatorioClinico
+    query = db.query(RelatorioClinico)
+    
+    # Se não for admin, filtra pelo user_id logado (tenant)
+    if not current_user.is_admin:
+        query = query.filter(RelatorioClinico.user_id == current_user.id)
+        
+    if id_paciente:
+        query = query.filter(RelatorioClinico.id_paciente == id_paciente)
+        
+    if tipo_relatorio:
+        query = query.filter(RelatorioClinico.tipo_relatorio == tipo_relatorio)
+        
+    relatorios = query.order_by(RelatorioClinico.data.desc(), RelatorioClinico.id.desc()).all()
+    return relatorios

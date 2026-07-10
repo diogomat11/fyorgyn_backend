@@ -29,6 +29,7 @@ Instruções:
 - Para cada data preenchida, verificar a coluna '15-Assinatura' correspondente. Marcar 'Sim' se houver assinatura na linha, 'Não' caso contrário.
 - Capturar o 'Nome do Beneficiário'. ATENÇÃO: NUNCA confunda com o nome do prestador ou clínica (ex: LARISSA MARTINS FERREIRA). O beneficiário é sempre o paciente.
 - Capturar o 'Número da Guia Principal' (coluna 14), retornar 'VAZIO' se não houver.
+- Capturar o 'Número da Carteira' (caso disponível), retornar 'VAZIO' se não encontrar.
 - NUNCA derivar guia principal do número do prestador, apenas se explícito.
 - REGRA DE DATAS (MUITO IMPORTANTE): Extraia APENAS as linhas onde a 'Data do Atendimento' está explicitamente preenchida com uma data válida. IGNORE COMPLETAMENTE linhas em branco. Se a tabela tem 22 linhas mas só 2 estão preenchidas, retorne APENAS 2 itens no array de atendimentos."""
 
@@ -46,6 +47,10 @@ RESPONSE_SCHEMA = {
         "numeroGuiaPrincipal": {
             "type": "STRING",
             "description": "Número da Guia Principal ou 'VAZIO'"
+        },
+        "carteira": {
+            "type": "STRING",
+            "description": "Número da carteira do beneficiário ou 'VAZIO'"
         },
         "atendimentos": {
             "type": "ARRAY",
@@ -69,6 +74,7 @@ RESPONSE_SCHEMA = {
         "numeroGuiaPrestador",
         "nomeBeneficiario",
         "numeroGuiaPrincipal",
+        "carteira",
         "atendimentos"
     ]
 }
@@ -95,6 +101,24 @@ IPASGO_RESPONSE_SCHEMA = {
         "DATA_AUTORIZACAO": {
             "type": "STRING",
             "description": "Data da Autorização no formato DD/MM/AAAA"
+        },
+        "ATENDIMENTOS": {
+            "type": "ARRAY",
+            "description": "Lista de datas de realização extraídas do campo '56 - Data Realização Procedimentos em Série' e status de assinatura",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "data": {
+                        "type": "STRING",
+                        "description": "Data no formato DD/MM/AAAA"
+                    },
+                    "assinatura": {
+                        "type": "STRING",
+                        "description": "'Sim' se houver assinatura manuscrita correspondente a esta data, 'Não' caso contrário"
+                    }
+                },
+                "required": ["data", "assinatura"]
+            }
         }
     },
     "required": [
@@ -102,12 +126,13 @@ IPASGO_RESPONSE_SCHEMA = {
         "NOME_BENEFICIARIO",
         "NUMERO_SENHA",
         "CARTEIRA",
-        "DATA_AUTORIZACAO"
+        "DATA_AUTORIZACAO",
+        "ATENDIMENTOS"
     ]
 }
 
 # Model fallback priority
-MODELS_PRIORITY = ["gemini-2.0-flash", "gemini-2.5-flash"]
+MODELS_PRIORITY = ["gemini-2.5-flash"]
 
 # Max retries per key before moving to the next
 MAX_RETRIES_PER_KEY = 2
