@@ -22,21 +22,30 @@ class TenantCache:
         self.lock = threading.Lock()
         self.in_memory_db = {}  # key -> (expiry_timestamp, value_json_str)
         
+        REDIS_URL = os.getenv("REDIS_URL")
         REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
         REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
         REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
         REDIS_DB = int(os.getenv("REDIS_DB", 0))
         
         try:
-            self.redis_client = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                password=REDIS_PASSWORD,
-                db=REDIS_DB,
-                socket_timeout=2.0,
-                socket_connect_timeout=2.0,
-                retry_on_timeout=True
-            )
+            if REDIS_URL:
+                self.redis_client = redis.Redis.from_url(
+                    REDIS_URL,
+                    socket_timeout=2.0,
+                    socket_connect_timeout=2.0,
+                    retry_on_timeout=True
+                )
+            else:
+                self.redis_client = redis.Redis(
+                    host=REDIS_HOST,
+                    port=REDIS_PORT,
+                    password=REDIS_PASSWORD,
+                    db=REDIS_DB,
+                    socket_timeout=2.0,
+                    socket_connect_timeout=2.0,
+                    retry_on_timeout=True
+                )
             # Test connection
             self.redis_client.ping()
             self.redis_enabled = True
