@@ -7,7 +7,10 @@ from typing import List, Optional
 from dependencies import get_current_user
 from security_utils import encrypt_password
 
-router = APIRouter()
+router = APIRouter(
+    prefix="/convenios",
+    tags=["convenios"]
+)
 
 class ConvenioBase(BaseModel):
     nome: str
@@ -38,6 +41,43 @@ class ConvenioResponse(ConvenioBase):
         from_attributes = True
         populate_by_name = True
 
+@router.get("/active-in-range")
+def list_convenios_active_in_range(
+    data_inicio: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Retorna apenas os convênios que possuem agendamentos no período de datas selecionado.
+    """
+    from models import Agendamento, Convenio
+    from datetime import datetime
+
+    query = db.query(Agendamento.id_convenio, Agendamento.nome_convenio).distinct()
+    if not current_user.is_admin:
+        query = query.filter(Agendamento.user_id == current_user.id)
+
+    if data_inicio:
+        try:
+            d_ini = datetime.strptime(data_inicio[:10], "%Y-%m-%d").date()
+            query = query.filter(Agendamento.data >= d_ini)
+        except Exception: pass
+
+    if data_fim:
+        try:
+            d_fim = datetime.strptime(data_fim[:10], "%Y-%m-%d").date()
+            query = query.filter(Agendamento.data <= d_fim)
+        except Exception: pass
+
+    results = query.all()
+    convs = [{"id_convenio": cid, "nome": cnome or f"Convênio #{cid}"} for cid, cnome in results if cid]
+    if not convs:
+        all_c = db.query(Convenio).all()
+        return [{"id_convenio": c.id_convenio, "nome": c.nome} for c in all_c]
+    return convs
+
+@router.get("", response_model=List[ConvenioResponse])
 @router.get("/", response_model=List[ConvenioResponse])
 def list_convenios(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     from sqlalchemy.orm import joinedload
@@ -211,4 +251,204 @@ def delete_credential(id: int, db: Session = Depends(get_db), current_user = Dep
     db.delete(uc)
     db.commit()
     return {"message": "Credenciais removidas com sucesso."}
+
+
+@router.get("/all", response_model=List[ConvenioResponse])
+def list_all_convenios(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """Retorna todos os convênios cadastrados no sistema (sem filtro por usuário)."""
+    from sqlalchemy.orm import joinedload
+    return db.query(Convenio).options(joinedload(Convenio.operacoes_rel)).all()
+
+
+@router.get("/worker-convenios")
+def list_worker_convenios(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """Lista convênios do schema worker."""
+    from models import WorkerConvenio
+    w_convs = db.query(WorkerConvenio).filter(WorkerConvenio.ativo == True).all()
+    return [
+        {
+            "id_convenio": c.id_convenio,
+            "nome": c.nome,
+            "sigla": c.sigla,
+            "ativo": c.ativo
+        }
+        for c in w_convs
+    ]
+
+
+class UserConvenioAssignRequest(BaseModel):
+    user_id: int
+    id_convenio: int
+    worker_id_convenio: Optional[int] = None
+    auto_confirmar: Optional[bool] = False
+    auto_executar: Optional[bool] = False
+    auto_faturar: Optional[bool] = False
+
+
+@router.get("/user-assignments")
+def list_user_assignments(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    
+    uconvs = db.query(UserConvenio).all()
+    users = {u.id: u.username for u in db.query(User).all()}
+    convs = {c.id_convenio: c.nome for c in db.query(Convenio).all()}
+    
+    from models import WorkerConvenio
+    w_convs = {c.id_convenio: c.nome for c in db.query(WorkerConvenio).all()}
+    
+    res = []
+    for uc in uconvs:
+        # Resolve worker_id_convenio automatically if match exists in worker schema
+        effective_worker_id = uc.worker_id_convenio or (uc.id_convenio if uc.id_convenio in w_convs else None)
+        worker_nome = w_convs.get(effective_worker_id)
+        
+        res.append({
+            "id": uc.id,
+            "user_id": uc.user_id,
+            "username": users.get(uc.user_id, "Desconhecido"),
+            "id_convenio": uc.id_convenio,
+            "nome_convenio": convs.get(uc.id_convenio, "Desconhecido"),
+            "worker_id_convenio": effective_worker_id,
+            "nome_worker_convenio": worker_nome,
+            "has_automacao": bool(worker_nome),
+            "auto_confirmar": bool(uc.auto_confirmar),
+            "auto_executar": bool(uc.auto_executar),
+            "auto_faturar": bool(uc.auto_faturar)
+        })
+    return res
+
+
+@router.post("/user-assignments")
+def create_user_assignment(req: UserConvenioAssignRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    
+    existing = db.query(UserConvenio).filter(
+        UserConvenio.user_id == req.user_id,
+        UserConvenio.id_convenio == req.id_convenio
+    ).first()
+    
+    if existing:
+        if req.worker_id_convenio is not None:
+            existing.worker_id_convenio = req.worker_id_convenio
+        if req.auto_confirmar is not None:
+            existing.auto_confirmar = req.auto_confirmar
+        if req.auto_executar is not None:
+            existing.auto_executar = req.auto_executar
+        if req.auto_faturar is not None:
+            existing.auto_faturar = req.auto_faturar
+        db.commit()
+        return {"message": "Atribuição e workflow atualizados com sucesso.", "id": existing.id}
+    
+    new_uc = UserConvenio(
+        user_id=req.user_id,
+        id_convenio=req.id_convenio,
+        worker_id_convenio=req.worker_id_convenio,
+        auto_confirmar=req.auto_confirmar or False,
+        auto_executar=req.auto_executar or False,
+        auto_faturar=req.auto_faturar or False
+    )
+    db.add(new_uc)
+    db.commit()
+    db.refresh(new_uc)
+    return {"message": "Convênio atribuído ao usuário com sucesso.", "id": new_uc.id}
+
+
+@router.delete("/user-assignments/{id}")
+def delete_user_assignment(id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    
+    uc = db.query(UserConvenio).filter(UserConvenio.id == id).first()
+    if not uc:
+        raise HTTPException(status_code=404, detail="Atribuição não encontrada.")
+    
+    db.delete(uc)
+    db.commit()
+    return {"message": "Atribuição removida com sucesso."}
+
+
+class UpdateWorkflowPipelineRequest(BaseModel):
+    auto_confirmar: Optional[bool] = None
+    auto_executar: Optional[bool] = None
+    auto_faturar: Optional[bool] = None
+
+@router.put("/user-assignments/{id}/workflow")
+def update_user_assignment_workflow(id: int, req: UpdateWorkflowPipelineRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    
+    uc = db.query(UserConvenio).filter(UserConvenio.id == id).first()
+    if not uc:
+        raise HTTPException(status_code=404, detail="Atribuição de convênio não encontrada.")
+    
+    if req.auto_confirmar is not None:
+        uc.auto_confirmar = req.auto_confirmar
+    if req.auto_executar is not None:
+        uc.auto_executar = req.auto_executar
+    if req.auto_faturar is not None:
+        uc.auto_faturar = req.auto_faturar
+        
+    db.commit()
+    return {"message": "Configurações de automação do workflow atualizadas.", "id": uc.id}
+
+
+@router.get("/worker-operacoes")
+def list_worker_operacoes(id_convenio: Optional[int] = None, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """Lista rotinas/operações de workflow do worker, opcionalmente filtradas estritamente por convênio."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    
+    from models import WorkerConvenioOperacao, WorkerConvenio
+    query = db.query(WorkerConvenioOperacao)
+    if id_convenio is not None:
+        query = query.filter(WorkerConvenioOperacao.id_convenio == id_convenio)
+
+    ops = query.all()
+    convs = {c.id_convenio: c.nome for c in db.query(WorkerConvenio).all()}
+    
+    return [
+        {
+            "id": op.id,
+            "id_convenio": op.id_convenio,
+            "nome_convenio": convs.get(op.id_convenio, f"Convênio {op.id_convenio}"),
+            "rotina": op.rotina,
+            "descricao": op.descricao,
+            "ativo": op.ativo,
+            "modo_execucao": op.modo_execucao or "automatico"
+        }
+        for op in ops
+    ]
+
+
+class UpdateOperacaoRequest(BaseModel):
+    ativo: Optional[bool] = None
+    modo_execucao: Optional[str] = None
+
+@router.put("/worker-operacoes/{id}")
+def update_worker_operacao(id: int, req: UpdateOperacaoRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """Atualiza status (ativo/inativo) e modo de execução (automático/manual) de uma rotina no worker."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    
+    from models import WorkerConvenioOperacao
+    op = db.query(WorkerConvenioOperacao).filter(WorkerConvenioOperacao.id == id).first()
+    if not op:
+        raise HTTPException(status_code=404, detail="Operação não encontrada.")
+    
+    if req.ativo is not None:
+        op.ativo = req.ativo
+    if req.modo_execucao is not None:
+        op.modo_execucao = req.modo_execucao
+        
+    db.commit()
+    return {
+        "message": "Operação de workflow atualizada com sucesso.", 
+        "id": op.id, 
+        "ativo": op.ativo,
+        "modo_execucao": op.modo_execucao
+    }
+
+
 

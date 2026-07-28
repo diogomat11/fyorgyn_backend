@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Body, Query, UploadFile, File, Form, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from dependencies import get_current_user
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 from database import get_db
 from models import Job, Carteirinha, Convenio, UserConvenio, CorpoClinico, BaseGuia, Log
 from typing import List, Optional
 from pydantic import BaseModel
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import pandas as pd
 import json
 from io import BytesIO
@@ -17,6 +17,7 @@ import requests
 import re
 import urllib.parse
 from security_utils import decrypt_password
+from timezone_utils import localize_datetime
 
 router = APIRouter(
     prefix="/jobs",
@@ -360,7 +361,7 @@ def create_jobs(
         is_bradesco_op1 = False
         if target_conv_id == 1:
             # Rotina 1 (consulta/faturamento) ou rotinas de consulta
-            if request.rotina in ['1', 'op1_consulta', 'op1_fature', 'op0_login']:
+            if request.rotina in ['1', 'op1_consulta', 'op1_fature', 'op0_login', 'op1_consultar_guias', 'op1_consultar_guias_fature']:
                 is_bradesco_op1 = True
         
         p_dict["strict_session_affinity"] = p_dict.get("strict_session_affinity", is_bradesco_op1)
@@ -433,6 +434,8 @@ def create_jobs(
         ]) or (target_convenio == 100 and request.rotina in [
             '1', 'op1', 'op1_importPacientes', 'op5_ImportCorpoClinico',
             'op6_baixarFaturados', 'op4_atualizarDataPTS'
+        ]) or (target_convenio == 101 and request.rotina in [
+            'op1_importar_agendamentos'
         ])
         
         if not request.carteirinha_ids:
@@ -457,6 +460,7 @@ def create_jobs(
                 job_payload = {
                     "carteirinha_id": None,
                     "id_convenio": target_convenio,
+                    "user_id": current_user.id,
                     "rotina": request.rotina,
                     "priority": 0,
                     "params": p_dict,
@@ -584,7 +588,6 @@ async def import_fature_batch(
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids and id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
-
     content = await file.read()
     try:
         df = pd.read_excel(BytesIO(content))
@@ -596,9 +599,36 @@ async def import_fature_batch(
     # Identificar colunas possíveis independentemente do case
     col_guia = next((c for c in df.columns if str(c).strip().lower() in ['guia', 'guias']), None)
     col_pac = next((c for c in df.columns if str(c).strip().lower() in ['paciente', 'nome']), None)
+    col_dataini = next((c for c in df.columns if str(c).strip().lower() in ['datainicio', 'data_inicio', 'data inicio', 'dt_inicial', 'dt_inicio']), None)
+    col_datafim = next((c for c in df.columns if str(c).strip().lower() in ['datafim', 'data_fim', 'data fim', 'dt_final', 'dt_fim']), None)
+    col_regans = next((c for c in df.columns if str(c).strip().lower() in ['regans', 'reg_ans', 'ans', 'registroans', 'registro ans']), None)
     
     if not col_guia:
         raise HTTPException(status_code=400, detail="Coluna 'Guia' (ou 'Guias') não encontrada na planilha.")
+
+    def format_excel_date(val):
+        if pd.isna(val) or val is None:
+            return None
+        if isinstance(val, (datetime, date)):
+            return val.strftime("%Y-%m-%d")
+        try:
+            dt = pd.to_datetime(val)
+            if not pd.isna(dt):
+                return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        val_str = str(val).strip()
+        if " " in val_str:
+            val_str = val_str.split(" ")[0]
+        return val_str
+
+    def format_reg_ans(val):
+        if pd.isna(val) or val is None:
+            return None
+        val_str = str(val).strip()
+        if val_str.endswith(".0"):
+            val_str = val_str[:-2]
+        return val_str
 
     encrypted_password = None
     if password:
@@ -629,15 +659,24 @@ async def import_fature_batch(
         paciente_val = str(row[col_pac]).strip() if col_pac else ""
         if pd.isna(row[col_pac]) or paciente_val == 'nan': paciente_val = ""
 
+        # Obter valores das colunas do Excel como fallback
+        row_dataini_val = format_excel_date(row[col_dataini]) if col_dataini is not None else None
+        row_datafim_val = format_excel_date(row[col_datafim]) if col_datafim is not None else None
+        row_regans_val = format_reg_ans(row[col_regans]) if col_regans is not None else None
+
+        final_dataini = dataInicio or row_dataini_val
+        final_datafim = dataFim or row_datafim_val
+        final_regans = regAns or row_regans_val
+
         params = {
             "guia": guia_val,
             "paciente": paciente_val,
             "contexto": "fature",
             "webhook_url": os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
         }
-        if dataInicio: params["dataInicio"] = dataInicio
-        if dataFim: params["dataFim"] = dataFim
-        if regAns: params["regAns"] = regAns
+        if final_dataini: params["dataInicio"] = final_dataini
+        if final_datafim: params["dataFim"] = final_datafim
+        if final_regans: params["regAns"] = final_regans
         
         if login:
             params["login"] = login
@@ -650,6 +689,7 @@ async def import_fature_batch(
         job_data = {
             "carteirinha_id": None,
             "id_convenio": id_convenio,
+            "user_id": current_user.id,
             "rotina": '1',
             "priority": 0,
             "params": params,
@@ -691,10 +731,13 @@ def export_fature_jobs(
     data = []
     for j in jobs:
         params_dict = {}
-        try:
-            params_dict = json.loads(j.params or '{}')
-        except:
-            pass
+        if isinstance(j.params, dict):
+            params_dict = j.params
+        elif isinstance(j.params, str):
+            try:
+                params_dict = json.loads(j.params or '{}')
+            except:
+                pass
         
         guia = params_dict.get('guia') or params_dict.get('numero_guia') or ''
         paciente = params_dict.get('paciente', '')
@@ -742,9 +785,10 @@ def export_fature_jobs(
         else:
             status_guia_api = j.status
             
+        loc_created = localize_datetime(j.created_at) if j.created_at else None
         data.append({
             "Job ID": j.id,
-            "Data Criação": j.created_at.strftime("%d/%m/%Y %H:%M:%S") if j.created_at else "",
+            "Data Criação": loc_created.strftime("%d/%m/%Y %H:%M:%S") if loc_created else "",
             "Guia": guia,
             "Paciente": paciente,
             "Rotina": j.rotina,
@@ -798,7 +842,7 @@ def list_jobs(
         except Exception as e:
             print(f"Error scheduling completed jobs during list_jobs: {e}")
 
-    query = db.query(Job)
+    query = db.query(Job).options(defer(Job.result_data))
     if not current_user.is_admin:
         query = query.filter(Job.user_id == current_user.id)
     
@@ -836,19 +880,26 @@ def list_jobs(
             error_logs_map[log.job_id] = log.message
 
     for j in jobs:
+        cleaned_params = j.params
+        if isinstance(cleaned_params, dict):
+            cleaned_params = dict(cleaned_params)
+            for k, v in cleaned_params.items():
+                if isinstance(v, str) and len(v) > 1000:
+                    cleaned_params[k] = f"<hidden large data: {len(v)} chars>"
+
         j_dict = {
             "id": j.id,
             "carteirinha_id": j.carteirinha_id,
             "id_convenio": j.id_convenio,
             "rotina": j.rotina,
-            "params": j.params,
+            "params": cleaned_params,
             "status": j.status,
             "attempts": j.attempts,
             "priority": j.priority,
             "locked_by": j.locked_by,
             "timeout": j.timeout,
-            "created_at": j.created_at,
-            "updated_at": j.updated_at,
+            "created_at": localize_datetime(j.created_at),
+            "updated_at": localize_datetime(j.updated_at),
             "error_message": None
         }
         if j.status == 'error':
@@ -874,11 +925,7 @@ def delete_job(id: int, db: Session = Depends(get_db), current_user = Depends(ge
         raise HTTPException(status_code=403, detail="Sem permissao para este job.")
         
     # Validation: Only delete if error and attempts > 3
-    # User said: "probido exclusao de jobs em andamento ou com status sucess"
-    # "um Job so podera ser excluido se status seja error e tentativas maior que 3"
-    
     allowed = (job.status == 'error' and (job.attempts or 0) > 3)
-    # Or maybe allow pending if it's stuck? User didn't specify. Sticking to strict rule.
     
     if not allowed:
          raise HTTPException(status_code=400, detail="Exclusao permitida apenas para Jobs com erro e mais de 3 tentativas.")
@@ -900,12 +947,7 @@ def retry_job(id: int, db: Session = Depends(get_db), current_user = Depends(get
     if not current_user.is_admin and job.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Sem permissao para este job.")
 
-    # Validation: Same as delete?
-    # "ao clicar em reenviar exibir mensagem de confirmação, o status será alterado para pending"
-    # User implied logic for buttons "Jobs error... e habilita botões de ação"
-    # So implies retry is available for error jobs. 
-    # And "reenviar(caso estatus seja error e tentativas maior que 3)"
-    
+    # Validation: Reenviar caso status seja error
     allowed = (job.status == 'error')
     
     if not allowed:
@@ -914,7 +956,7 @@ def retry_job(id: int, db: Session = Depends(get_db), current_user = Depends(get
     job.status = 'pending'
     job.attempts = 0
     job.locked_by = None
-    job.updated_at = datetime.utcnow()
+    job.updated_at = datetime.now(timezone.utc)
     
     db.commit()
     try:
@@ -954,37 +996,39 @@ def submit_job_result(
     """
     Webhook call from worker/dispatcher to submit job results.
     """
-    # 1. Fetch the job
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        rotina = "op1_importar_agendamentos"
+        id_convenio = 101
+        if isinstance(payload, dict):
+            rotina = payload.get("rotina", rotina)
+            id_convenio = payload.get("id_convenio", id_convenio)
+            
+        job = Job(
+            id=job_id,
+            id_convenio=id_convenio,
+            rotina=rotina,
+            status="success",
+            result_data=payload,
+            result_consumed=False,
+            user_id=1,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc)
+        )
+        db.add(job)
+    else:
+        job.status = "success"
+        job.result_data = payload
+        job.result_consumed = False
+        job.updated_at = datetime.now(timezone.utc)
         
-    # 2. Update job status and result_data
-    job.status = "success"
-    job.result_data = payload
-    job.result_consumed = False
-    job.updated_at = datetime.utcnow()
     db.commit()
     
-    # 3. Immediately trigger synchronization in background
-    def run_sync_in_bg():
-        from database import SessionLocal
-        bg_db = SessionLocal()
-        try:
-            from services.guias_sync_service import sync_completed_worker_jobs
-            sync_completed_worker_jobs(bg_db)
-        except Exception as sync_err:
-            try:
-                bg_db.rollback()
-            except:
-                pass
-            print(f"Error executing immediate sync for job {job_id} in background: {sync_err}")
-        finally:
-            bg_db.close()
-
-    background_tasks.add_task(run_sync_in_bg)
+    if job.status == "success":
+        from services.guias_sync_service import sync_completed_worker_jobs_bg
+        background_tasks.add_task(sync_completed_worker_jobs_bg)
         
-    return {"status": "success", "message": "Result received and sync queued in background"}
+    return {"status": "success", "message": "Result received and background sync initiated"}
 
 
 class WebhookPayload(BaseModel):
@@ -992,25 +1036,26 @@ class WebhookPayload(BaseModel):
     status: str
     result_data: Optional[dict] = None
     error_message: Optional[str] = None
-    attempts: int
-    rotina: str
+    attempts: int = 1
+    rotina: str = "op1_importar_agendamentos"
     id_convenio: Optional[int] = None
     params: Optional[dict] = None
 
 @router.post("/webhook")
-def receive_worker_webhook(payload: WebhookPayload, db: Session = Depends(get_db)):
+def receive_worker_webhook(
+    payload: WebhookPayload,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
     """
     Recebe os resultados de jobs concluídos/falhos do backend_worker.
-    Executa o parsing e a gravação de dados local no banco de dados (public).
+    Executa o parsing e a gravação de dados local em background sem bloquear a resposta HTTP.
     """
     print(f"Recebido webhook para o Job {payload.job_id} ({payload.status})")
     
-    # 1. Fetch the local job record
     job = db.query(Job).filter(Job.id == payload.job_id).first()
     
     if not job:
-        # Se o job ainda não existir localmente no local_db (por atraso de replicação ou por ser outra base),
-        # nós criamos um registro local para manter logs ou associar guias
         job = Job(
             id=payload.job_id,
             status=payload.status,
@@ -1024,7 +1069,6 @@ def receive_worker_webhook(payload: WebhookPayload, db: Session = Depends(get_db
         )
         db.add(job)
     else:
-        # Atualiza dados no registro existente
         job.status = payload.status
         job.result_data = payload.result_data
         job.error_message = payload.error_message
@@ -1032,12 +1076,8 @@ def receive_worker_webhook(payload: WebhookPayload, db: Session = Depends(get_db
         job.result_consumed = False
     db.commit()
     
-    # 2. Trigger parsing e sync síncrono imediatamente para as tabelas locais (public)
     if payload.status == "success":
-        from services.guias_sync_service import sync_completed_worker_jobs
-        try:
-            sync_completed_worker_jobs(db)
-        except Exception as e:
-            print(f"Erro ao executar guias_sync_service via webhook: {e}")
+        from services.guias_sync_service import sync_completed_worker_jobs_bg
+        background_tasks.add_task(sync_completed_worker_jobs_bg)
             
-    return {"status": "success", "message": f"Webhook processado para o Job {payload.job_id}"}
+    return {"status": "success", "message": f"Webhook processado com sucesso para o Job {payload.job_id}"}

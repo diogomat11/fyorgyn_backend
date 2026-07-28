@@ -14,11 +14,9 @@ def update_patient_pei(db: Session, carteirinha_id: int, codigo_terapia: str, gu
     if not cart:
         return
     
-    # Dynamic check: Find ID of UNIMED
-    unimed = db.query(Convenio).filter(Convenio.nome.ilike("%UNIMED%")).first()
-    unimed_id = unimed.id_convenio if unimed else 2 # Default to 2 based on seed
-    
-    if cart.id_convenio != unimed_id:
+    # Dynamic check: Only calculate PEI if Convenio has pei_automatico enabled
+    convenio = db.query(Convenio).filter(Convenio.id_convenio == cart.id_convenio).first()
+    if not convenio or not convenio.pei_automatico:
         # PEI not applicable to other convenios
         return
 
@@ -115,9 +113,14 @@ def update_patient_pei(db: Session, carteirinha_id: int, codigo_terapia: str, gu
     if not patient_pei:
         patient_pei = PatientPei(
             carteirinha_id=carteirinha_id,
-            codigo_terapia=codigo_terapia
+            codigo_terapia=codigo_terapia,
+            user_id=cart.user_id
         )
         db.add(patient_pei)
+    else:
+        # Garante que o user_id seja sempre populado/atualizado
+        if not patient_pei.user_id and cart.user_id:
+            patient_pei.user_id = cart.user_id
     
     patient_pei.base_guia_id = latest_guia.id
     patient_pei.pei_semanal = pei_semanal

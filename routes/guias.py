@@ -8,6 +8,7 @@ from typing import Optional
 from datetime import date, datetime, timedelta
 from openpyxl import Workbook
 import io
+from timezone_utils import localize_datetime
 
 router = APIRouter(
     prefix="/guias",
@@ -127,6 +128,8 @@ def list_guias(
             )
         )
 
+
+
     # Fetch active/failed jobs when looking at solicitacoes
     jobs_data = []
     if aba == "solicitacoes":
@@ -171,6 +174,8 @@ def list_guias(
             elif job_obj.status == "processing":
                 status_desc = "Processando"
                 
+            loc_created = localize_datetime(job_obj.created_at) if job_obj.created_at else None
+            loc_updated = localize_datetime(job_obj.updated_at) if job_obj.updated_at else None
             jobs_data.append({
                 "id": f"job-{job_obj.id}",
                 "carteirinha_id": job_obj.carteirinha_id,
@@ -179,7 +184,7 @@ def list_guias(
                 "codigo_beneficiario": params.get("carteira") or carteirinha_numero or "",
                 "guia": f"Solicitação #{job_obj.id}",
                 "guia_prestador": "",
-                "data_solicitacao": job_obj.created_at.date() if job_obj.created_at else None,
+                "data_solicitacao": loc_created.date() if loc_created else None,
                 "data_autorizacao": None,
                 "senha": "",
                 "status_guia": status_desc,
@@ -190,8 +195,8 @@ def list_guias(
                 "sessoes_autorizadas": 0,
                 "sessoes_realizadas": 0,
                 "saldo": 0,
-                "created_at": job_obj.created_at,
-                "updated_at": job_obj.updated_at,
+                "created_at": loc_created,
+                "updated_at": loc_updated,
                 "nome_paciente": nome_paciente or "Paciente",
                 "carteirinha_numero": carteirinha_numero or params.get("carteira") or ""
             })
@@ -274,6 +279,11 @@ def list_guias(
             s_dict['sessoes_realizadas'] = 0
             s_dict['saldo'] = s_dict.get('sessoes_autorizadas', 0)
             
+            # Localize datetimes
+            s_dict['created_at'] = localize_datetime(s_dict.get('created_at'))
+            s_dict['updated_at'] = localize_datetime(s_dict.get('updated_at'))
+            s_dict['data_solicitacao'] = s_dict['created_at'].date() if s_dict['created_at'] else None
+            
             solicitacoes_data.append(s_dict)
             
         combined = jobs_data + solicitacoes_data
@@ -297,6 +307,12 @@ def list_guias(
             g_dict['sessoes_realizadas'] = q_realizadas
             g_dict['nome_paciente'] = nome_paciente
             g_dict['carteirinha_numero'] = carteirinha_numero
+            
+            # Localize datetimes
+            g_dict['created_at'] = localize_datetime(g_dict.get('created_at'))
+            g_dict['updated_at'] = localize_datetime(g_dict.get('updated_at'))
+            g_dict['data_autorizacao'] = localize_datetime(g_dict.get('data_autorizacao'))
+            g_dict['validade'] = localize_datetime(g_dict.get('validade'))
             
             auth = g_dict.get('sessoes_autorizadas') or 0
             g_dict['saldo'] = auth - (q_realizadas + q_a_confirmar)

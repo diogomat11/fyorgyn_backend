@@ -326,6 +326,7 @@ def list_carteirinhas(
     codigo_beneficiario: Optional[str] = None,
     id_convenio: Optional[int] = None,
     paciente: Optional[str] = None,
+    sem_carteirinha: Optional[bool] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
@@ -337,7 +338,8 @@ def list_carteirinhas(
         "status": status,
         "codigo_beneficiario": codigo_beneficiario,
         "id_convenio": id_convenio,
-        "paciente": paciente
+        "paciente": paciente,
+        "sem_carteirinha": sem_carteirinha
     }
     
     from cache import cache
@@ -345,12 +347,82 @@ def list_carteirinhas(
     if cached_res:
         return cached_res
 
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(user)
+
+    if sem_carteirinha:
+        from models import Agendamento
+        
+        # Build query for unique patients in agendamentos
+        query = db.query(
+            Agendamento.id_paciente,
+            Agendamento.Nome_Paciente,
+            Agendamento.id_convenio,
+            Agendamento.nome_convenio
+        )
+        
+        if not user.is_admin:
+            query = query.filter(Agendamento.user_id == user.id)
+            
+        if id_convenio:
+            if allowed_ids and id_convenio not in allowed_ids:
+                 raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+            query = query.filter(Agendamento.id_convenio == id_convenio)
+        elif allowed_ids:
+            query = query.filter(Agendamento.id_convenio.in_(allowed_ids))
+            
+        # Filter: does not exist in carteirinhas for this patient + convenio
+        query = query.filter(
+            ~db.query(Carteirinha).filter(
+                Carteirinha.id_paciente == Agendamento.id_paciente,
+                Carteirinha.id_convenio == Agendamento.id_convenio,
+                or_(Carteirinha.user_id == user.id, Carteirinha.user_id.is_(None))
+            ).exists()
+        )
+        
+        # Search / Filters
+        if search:
+            search_filter = f"%{search}%"
+            query = query.filter(Agendamento.Nome_Paciente.ilike(search_filter))
+        if paciente:
+            query = query.filter(Agendamento.Nome_Paciente.ilike(f"%{paciente}%"))
+            
+        query = query.group_by(
+            Agendamento.id_paciente,
+            Agendamento.Nome_Paciente,
+            Agendamento.id_convenio,
+            Agendamento.nome_convenio
+        ).order_by(Agendamento.Nome_Paciente.asc())
+        
+        total = query.count()
+        results = query.offset(skip).limit(limit).all()
+        
+        data = []
+        for r in results:
+            data.append({
+                "id": None, # Virtual ID
+                "carteirinha": "",
+                "paciente": r.Nome_Paciente,
+                "id_paciente": r.id_paciente,
+                "codigo_beneficiario": "",
+                "id_convenio": r.id_convenio,
+                "status": "inativo", # Treat as inactive or pending
+                "is_virtual": True,
+                "nome_convenio": r.nome_convenio
+            })
+            
+        res_payload = {
+            "data": data,
+            "total": total,
+            "skip": skip,
+            "limit": limit
+        }
+        cache.set(user.id, "carteirinhas", cache_params, res_payload, ttl=300)
+        return res_payload
+
     query = db.query(Carteirinha)
     if not user.is_admin:
         query = query.filter(Carteirinha.user_id == user.id)
-    
-    from dependencies import get_allowed_convenio_ids
-    allowed_ids = get_allowed_convenio_ids(user)
     
     if id_convenio:
         if allowed_ids and id_convenio not in allowed_ids:

@@ -72,6 +72,7 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
         job_data = {
             "carteirinha_id": cart.id,
             "id_convenio": target_conv_id,
+            "user_id": user_id,
             "rotina": rotina,
             "priority": 0,
             "params": p_dict,
@@ -121,6 +122,7 @@ def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Opti
         job_data = {
             "carteirinha_id": cart.id,
             "id_convenio": target_conv_id,
+            "user_id": user_id,
             "rotina": rotina,
             "priority": 0,
             "params": p_dict,
@@ -183,6 +185,7 @@ def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: O
     job_data = {
         "carteirinha_id": cart_id,
         "id_convenio": id_convenio,
+        "user_id": user_id,
         "rotina": rotina,
         "priority": 0,
         "params": p_dict,

@@ -19,6 +19,10 @@ class UserConvenio(Base):
     login_fat = Column(Text, nullable=True)
     senha_fat_criptografada = Column(Text, nullable=True)
     url_portal_fat = Column(Text, nullable=True)
+    worker_id_convenio = Column(Integer, nullable=True)
+    auto_confirmar = Column(Boolean, default=False)
+    auto_executar = Column(Boolean, default=False)
+    auto_faturar = Column(Boolean, default=False)
 
 class User(Base):
     __tablename__ = "users"
@@ -258,6 +262,7 @@ class Convenio(Base):
     timeout_captura = Column(Boolean, default=False)
     pei_automatico = Column(Boolean, default=False)
     registro_ans = Column(Text, nullable=True)
+    modo_execucao = Column(Text, default="automatico") # 'automatico' ou 'manual'
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -677,6 +682,78 @@ class RelatorioClinico(Base):
     data = Column(Date)
     nome_profissional = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class WorkerConvenio(Base):
+    __tablename__ = "convenios"
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
+
+    id_convenio = Column(Integer, primary_key=True, index=True)
+    nome = Column(Text, nullable=False)
+    sigla = Column(Text, nullable=True)
+    ativo = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class WorkerConvenioOperacao(Base):
+    __tablename__ = "convenio_operacoes"
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_convenio = Column(Integer, ForeignKey("worker.convenios.id_convenio", ondelete="CASCADE"), nullable=False)
+    rotina = Column(Text, nullable=False)
+    descricao = Column(Text, nullable=True)
+    ativo = Column(Boolean, default=True)
+    modo_execucao = Column(Text, default="automatico") # 'automatico' ou 'manual'
+    params_schema = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    convenio_rel = relationship("WorkerConvenio", primaryjoin="WorkerConvenioOperacao.id_convenio == WorkerConvenio.id_convenio")
+
+class MotivoFalta(Base):
+    __tablename__ = "motivos_faltas"
+    __table_args__ = {'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    descricao = Column(Text, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    id_mapeado = Column(Integer, nullable=True)
+    status = Column(Text, default="Ativo")
+    tipo = Column(Text, nullable=True)
+    anexo = Column(Text, default="NÃO")
+
+
+class UserConvenioWorkflow(Base):
+    __tablename__ = "user_convenio_workflows"
+    __table_args__ = (
+        UniqueConstraint('user_id', 'id_convenio', name='uq_user_convenio_workflow'),
+        {'extend_existing': True}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="CASCADE"), nullable=False)
+    nome_workflow = Column(Text, nullable=False)
+    fluxo_passos = Column(JSONB, default=list)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Unidade(Base):
+    __tablename__ = "unidades"
+    __table_args__ = (
+        UniqueConstraint('id_unidade', 'user_id', name='uq_unidade_user_id'),
+        {'extend_existing': True}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_unidade = Column(Integer, nullable=False)
+    nome = Column(String(255), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String(50), default="ativo")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

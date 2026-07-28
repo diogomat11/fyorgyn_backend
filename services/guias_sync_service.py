@@ -4,7 +4,8 @@ Consome JSON retornado pelo worker e insere/atualiza em base_guias via INSERT ON
 
 Substitui o loop row-by-row do dispatcher por uma única query batch.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
+
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import text
@@ -35,11 +36,120 @@ def _parse_int(val, default=0):
         return default
 
 
+def _trigger_next_workflow_node(db: Session, job):
+    """Verifica se há um fluxo de workflow encadeado configurado em user_convenio_workflows.
+    Dada a conclusão do nó atual, busca todos os nós filhos vinculados (em paralelo se for grafo)
+    e enfileira automaticamente aqueles configurados como modo_execucao=='automatico'."""
+    if not job or not job.user_id or not job.id_convenio:
+        return
+
+    from models import UserConvenioWorkflow, Job as JobModel
+    import json
+
+    wf = db.query(UserConvenioWorkflow).filter(
+        UserConvenioWorkflow.user_id == job.user_id,
+        UserConvenioWorkflow.id_convenio == job.id_convenio
+    ).first()
+
+    if not wf or not wf.fluxo_passos:
+        return
+
+    passos = wf.fluxo_passos
+    current_rotina = str(job.rotina).lower()
+
+    # Encontra o nó atual no grafo pelo código de rotina ou id
+    current_node = None
+    current_idx = -1
+    for i, p in enumerate(passos):
+        cod = str(p.get("codigo_rotina", p.get("acao", ""))).lower()
+        if cod == current_rotina or (current_rotina in cod):
+            current_node = p
+            current_idx = i
+            break
+
+    if not current_node and current_idx == -1:
+        return
+
+    # Determina os próximos nós no grafo
+    next_passos = []
+    
+    # Formato Grafo / Mapa Mental (next_nodes list)
+    next_node_ids = current_node.get("next_nodes") if current_node else None
+    if not next_node_ids and current_node:
+        next_node_ids = current_node.get("next_node_ids")
+
+    if next_node_ids and isinstance(next_node_ids, list):
+        for n_id in next_node_ids:
+            found_child = next((p for p in passos if p.get("id") == n_id or p.get("step_id") == n_id), None)
+            if found_child:
+                next_passos.append(found_child)
+
+    # Fallback Sequencial (se não houver next_nodes explícito)
+    if not next_passos and current_idx != -1 and current_idx + 1 < len(passos):
+        next_passos.append(passos[current_idx + 1])
+
+    params_data = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+
+    # Dispara cada nó filho em paralelo caso o modo de execução seja automático
+    for next_p in next_passos:
+        if next_p.get("modo_execucao") == "automatico":
+            next_rotina = next_p.get("codigo_rotina") or next_p.get("acao")
+            if not next_rotina:
+                continue
+
+            existing_next = db.query(JobModel).filter(
+                JobModel.user_id == job.user_id,
+                JobModel.id_convenio == job.id_convenio,
+                JobModel.rotina == next_rotina,
+                JobModel.status.in_(["pending", "processing"])
+            ).first()
+
+            if not existing_next:
+                new_next_job = JobModel(
+                    user_id=job.user_id,
+                    id_convenio=job.id_convenio,
+                    rotina=next_rotina,
+                    status="pending",
+                    params=json.dumps(params_data),
+                    priority=0
+                )
+                db.add(new_next_job)
+                print(f"[WORKFLOW GRAPH CHAIN] Nó ramificado '{next_p.get('nome_passo', next_p.get('nome'))}' ({next_rotina}) enfileirado em paralelo com sucesso!")
+
+
+def _unlink_guia_if_eligible(db: Session, agendamento):
+    """
+    Desvincula a guia do agendamento se ele receber status 'Falta' ou 'Excluído',
+    desde que o lote do agendamento NÃO esteja com status 'Enviado' ou 'Fechado'.
+    Incrementa o saldo na tabela base_guias.
+    """
+    if not agendamento or not agendamento.numero_guia:
+        return
+
+    # Verifica se o lote está enviado ou fechado
+    lote_status = str(getattr(agendamento, 'status_faturamento', '') or getattr(agendamento, 'status_lote', '') or "").lower().strip()
+    if lote_status in ["enviado", "fechado"]:
+        # Não desvincula se o lote já tiver sido fechado ou enviado
+        return
+
+    numero_guia = agendamento.numero_guia
+    agendamento.numero_guia = None
+
+    from models import BaseGuia
+    base_guia = db.query(BaseGuia).filter(
+        BaseGuia.guia == numero_guia,
+        BaseGuia.user_id == agendamento.user_id
+    ).first()
+
+    if base_guia:
+        base_guia.saldo = (base_guia.saldo or 0) + 1
+
+
 def _normalize_status(status_raw, id_convenio: int, item: dict) -> str:
-    """Normaliza status da guia considerando mapeamentos por convênio."""
+    """Normaliza status da guia considerando mapeamentos por convênio e converte termos liberado -> autorizado."""
     status = str(status_raw).strip() if status_raw else "Autorizado"
     
-    # Mapeamento Bradesco (Orizon)
+    # Mapeamento Bradesco (Orizon) - ID 1: Liberada / Exportada são apenas para faturamento e não entram na tabela Guias
     if id_convenio == 1:
         if item.get("descricao"):
             return str(item["descricao"]).strip()
@@ -50,26 +160,44 @@ def _normalize_status(status_raw, id_convenio: int, item: dict) -> str:
         }
         if status in status_map:
             return status_map[status]
+        if status.lower() in ["liberada", "exportada"]:
+            return status
+
+    status_lower = status.lower()
+    # Converte termos semelhantes a Liberado/Liberada para os padrões Autorizado/Autorizada/Parcialmente autorizada
+    if "parcialmente" in status_lower and ("liberad" in status_lower or "autorizad" in status_lower):
+        return "Parcialmente autorizada"
+    elif "liberada" in status_lower or status_lower == "liberado":
+        return "Autorizada" if (status.endswith("a") or "liberada" in status_lower) else "Autorizado"
+    elif "autorizada" in status_lower:
+        return "Autorizada"
+    elif "autorizado" in status_lower:
+        return "Autorizado"
     
     return status
 
 
+
 # Status válidos para inserção de novas guias
 VALID_STATUS = {
-    "AUTORIZADO", "EM ESTUDO", "SOLICITADO", "EM AVALIAÇÃO",
+    "AUTORIZADO", "AUTORIZADA", "PARCIALMENTE AUTORIZADA",
+    "EM ESTUDO", "SOLICITADO", "EM AVALIAÇÃO",
     "EM APROVAÇÃO E AGUARDANDO P", "NEGADO", "CANCELADO",
     "EXPORTADA", "EXPORTADO", "PENDENTE", "FATURADA", "LIBERADA"
 }
 
 
 def is_authorized_status(status_val: str, id_convenio: int) -> bool:
+    """
+    Verifica se o status normalizado é estritamente autorizado (Autorizado, Autorizada, Parcialmente autorizada).
+    Apenas status contendo 'autorizad' são gravados na tabela base_guias.
+    Status como Liberada/Exportada do Bradesco Faturamento retornam False e vão para a aba Solicitações.
+    """
     if not status_val:
         return False
     status_lower = str(status_val).lower()
-    if id_convenio == 6:  # IPASGO
-        return "autorizad" in status_lower
-    else:  # Outros convênios
-        return "autorizad" in status_lower or "liberad" in status_lower
+    return "autorizad" in status_lower
+
 
 
 def bulk_upsert_guias_from_json(
@@ -127,7 +255,22 @@ def bulk_upsert_guias_from_json(
         current_cid = carteirinha_id or item.get("carteirinha_id")
         if not current_cid and item.get("codigo_beneficiario"):
             current_cid = carteirinha_map.get(item["codigo_beneficiario"])
-        
+
+        # Parse timestamp_captura
+        ts_captura_raw = item.get("timestamp_captura")
+        ts_captura_val = None
+        if ts_captura_raw:
+            if isinstance(ts_captura_raw, datetime):
+
+                ts_captura_val = ts_captura_raw
+            else:
+                for fmt in ["%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%fZ"]:
+                    try:
+                        ts_captura_val = datetime.strptime(str(ts_captura_raw).strip(), fmt)
+                        break
+                    except ValueError:
+                        continue
+
         records.append({
             "id_convenio": id_convenio,
             "carteirinha_id": current_cid,
@@ -152,7 +295,8 @@ def bulk_upsert_guias_from_json(
             ),
             "codigo_beneficiario": item.get("codigo_beneficiario"),
             "cod_prestador": item.get("cod_prestador"),
-            "user_id": user_id
+            "user_id": user_id,
+            "timestamp_captura": ts_captura_val
         })
     
     if not records:
@@ -207,7 +351,7 @@ def bulk_upsert_guias_from_json(
                 for key_attr in ["senha", "status_guia", "data_autorizacao", "data_solicitacao",
                                  "validade", "qtde_solicitada", "sessoes_autorizadas",
                                  "nome_terapia", "guia_prestador", "codigo_beneficiario",
-                                 "cod_prestador"]:
+                                 "cod_prestador", "timestamp_captura"]:
                     if record.get(key_attr) is not None:
                         setattr(existing, key_attr, record[key_attr])
                 if record.get("carteirinha_id") is not None:
@@ -380,6 +524,12 @@ def bulk_upsert_guias_from_json(
                 db.delete(existing_base)
                 
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(user_id)
+    except Exception as cache_err:
+        print(f"Error invalidating cache for user {user_id} in bulk_upsert_guias_from_json: {cache_err}")
+
     
     return {
         "total": len(results),
@@ -448,6 +598,24 @@ def bulk_insert_carteirinhas(
     }
 
 
+def _extract_results_list(result_data):
+    if not result_data:
+        return []
+    if isinstance(result_data, list):
+        return result_data
+    if isinstance(result_data, dict):
+        d1 = result_data.get("data")
+        if isinstance(d1, list):
+            return d1
+        if isinstance(d1, dict):
+            d2 = d1.get("data")
+            if isinstance(d2, list):
+                return d2
+            return [d1]
+        return [result_data]
+    return []
+
+
 def sync_completed_worker_jobs(db: Session) -> dict:
     """
     Consome resultados de jobs concluídos com sucesso e sincroniza com a base de guias.
@@ -471,17 +639,7 @@ def sync_completed_worker_jobs(db: Session) -> dict:
         if job.id_convenio == 100:
             import json
             rotina = str(job.rotina).lower()
-            results_list = []
-            if isinstance(job.result_data, list):
-                results_list = job.result_data
-            elif isinstance(job.result_data, dict):
-                data_payload = job.result_data.get("data")
-                if isinstance(data_payload, list):
-                    results_list = data_payload
-                elif isinstance(data_payload, dict):
-                    results_list = [data_payload]
-                else:
-                    results_list = [job.result_data]
+            results_list = _extract_results_list(job.result_data)
             
             if results_list:
                 if "op1" in rotina or rotina == "1":
@@ -741,6 +899,402 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             db.commit()
             continue
 
+        # Se for convênio ABA_clmf (ID 101)
+        if job.id_convenio == 101:
+            import json
+            rotina = str(job.rotina).lower()
+            results_list = _extract_results_list(job.result_data)
+
+            if "op1" in rotina or "importar_agendamentos" in rotina or rotina == "1":
+                _sync_aba_clmf_op1(db, job, results_list, synced_counts)
+            elif "op2" in rotina or "consultar_carteirinha" in rotina or rotina == "2":
+                _sync_aba_clmf_op2(db, job, results_list, synced_counts)
+            elif "op3" in rotina or "confirmar_agendamento" in rotina or rotina == "3":
+                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                ids = p_params.get("id_agendamento", [])
+                if isinstance(ids, (int, str)): ids = [int(ids)]
+                else: ids = [int(i) for i in ids]
+                num_situacao = p_params.get("num_situacao", 1)
+                new_status = "Confirmado" if num_situacao == 1 else "A Confirmar"
+                if ids:
+                    from models import Agendamento, UserConvenio, Job as JobModel
+                    db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).update({
+                        Agendamento.Status: new_status,
+                        Agendamento.execucao_status: "concluido"
+                    }, synchronize_session=False)
+
+                    # Automated Workflow Pipeline Chain: If auto_executar is enabled for user+convenio, auto-enqueue execution
+                    if num_situacao == 1:
+                        uc = db.query(UserConvenio).filter(
+                            UserConvenio.user_id == job.user_id,
+                            UserConvenio.id_convenio == 101
+                        ).first()
+                        if uc and uc.auto_executar:
+                            for ag_id in ids:
+                                exec_job = JobModel(
+                                    status="pending",
+                                    id_convenio=101,
+                                    user_id=job.user_id,
+                                    rotina="op3_execucao",
+                                    params=json.dumps({"agendamento_id": ag_id}),
+                                    priority=0
+                                )
+                                db.add(exec_job)
+
+            elif "op4" in rotina or "registrar_falta" in rotina or rotina == "4":
+                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                ids = p_params.get("id_agendamento", [])
+                if isinstance(ids, (int, str)): ids = [int(ids)]
+                else: ids = [int(i) for i in ids]
+                if ids:
+                    from models import Agendamento
+                    falta_ags = db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).all()
+                    for ag in falta_ags:
+                        ag.Status = "Falta"
+                        ag.execucao_status = "concluido"
+                        _unlink_guia_if_eligible(db, ag)
+            elif "op5" in rotina or "remover_falta" in rotina or rotina == "5":
+                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                ids = p_params.get("id_agendamento", [])
+                if isinstance(ids, (int, str)): ids = [int(ids)]
+                else: ids = [int(i) for i in ids]
+                if ids:
+                    from models import Agendamento
+                    db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).update({
+                        Agendamento.Status: "A Confirmar",
+                        Agendamento.execucao_status: "concluido"
+                    }, synchronize_session=False)
+
+            _trigger_next_workflow_node(db, job)
+            job.result_consumed = True
+            synced_counts["jobs_processed"] += 1
+            db.commit()
+            continue
+
+        # Se for convênio IPASGO (ID 6)
+        if job.id_convenio == 6:
+            rotina = str(job.rotina).lower()
+            res_data = job.result_data
+            
+            if rotina == "6" and res_data:
+                import json
+
+                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                numero_lote = p_params.get("numero_lote", p_params.get("loteId"))
+                codigo_prestador = p_params.get("codigoPrestador", "")
+                id_lote_interno = p_params.get("id_lote_interno")
+                
+                results_list = []
+                if isinstance(res_data, list):
+                    results_list = res_data
+                elif isinstance(res_data, dict):
+                    results_list = res_data.get("data", [])
+                    if not isinstance(results_list, list):
+                        if isinstance(res_data, dict) and "detalheId" in res_data:
+                            results_list = [res_data]
+                        else:
+                            results_list = []
+                
+                from models import LoteConvenio, FaturamentoLote, LoteAgendamentoItem, LoteAgendamento
+                lote_interno = None
+                if id_lote_interno:
+                    lote_interno = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
+                if not lote_interno and numero_lote:
+                    lote_interno = db.query(LoteConvenio).filter(
+                        LoteConvenio.numero_lote == int(numero_lote),
+                        LoteConvenio.id_convenio == 6
+                    ).first()
+                
+                if not lote_interno and numero_lote:
+                    datas = []
+                    for item in results_list:
+                        dt_val = item.get('dataRealizacao')
+                        if dt_val:
+                            try:
+                                if isinstance(dt_val, str):
+                                    dt = datetime.fromisoformat(dt_val.split('T')[0])
+                                    datas.append(dt.date())
+                            except Exception:
+                                pass
+                    data_inicio_lote = min(datas) if datas else None
+                    data_fim_lote = max(datas) if datas else None
+                    
+                    lote_interno = LoteConvenio(
+                        id_convenio=6,
+                        numero_lote=int(numero_lote),
+                        cod_prestador=codigo_prestador,
+                        status="Aberto",
+                        user_id=job.user_id,
+                        data_inicio=data_inicio_lote,
+                        data_fim=data_fim_lote
+                    )
+                    db.add(lote_interno)
+                    db.flush()
+                
+                lote_interno_id = lote_interno.id_lote if lote_interno else None
+                
+                if results_list and lote_interno_id:
+                    detalhe_ids = [item['detalheId'] for item in results_list if 'detalheId' in item]
+                    existing_items = {}
+                    chunk_size = 900
+                    for i in range(0, len(detalhe_ids), chunk_size):
+                        chunk = detalhe_ids[i:i+chunk_size]
+                        db_items = db.query(FaturamentoLote).filter(FaturamentoLote.detalheId.in_(chunk)).all()
+                        for db_item in db_items:
+                            existing_items[db_item.detalheId] = db_item
+                    
+                    now_utc = datetime.now(timezone.utc)
+                    lotes_ag_para_reconciliar = set()
+                    
+                    for item in results_list:
+                        det_id = item['detalheId']
+                        existing = existing_items.get(det_id)
+                        new_data_realizacao = item.get('dataRealizacao')
+                        if new_data_realizacao and isinstance(new_data_realizacao, str):
+                            try:
+                                new_data_realizacao = datetime.fromisoformat(new_data_realizacao.split('T')[0]).date()
+                            except:
+                                pass
+                        
+                        new_status = item.get('StatusConferencia', 0)
+                        
+                        if existing:
+                            data_mudou = str(existing.dataRealizacao) != str(new_data_realizacao)
+                            status_era_conferido = existing.StatusConferencia == 67
+                            status_mudou = existing.StatusConferencia != new_status
+                            
+                            deve_desvincular = (
+                                existing.agendamento_id is not None and
+                                (data_mudou or (status_era_conferido and status_mudou))
+                            )
+                            
+                            if deve_desvincular:
+                                lai = db.query(LoteAgendamentoItem).filter(
+                                    LoteAgendamentoItem.id_faturamento_lote == existing.id
+                                ).first()
+                                if lai:
+                                    lotes_ag_para_reconciliar.add(lai.id_lote_ag)
+                                    lai.status_conciliacao = "Não Conciliado"
+                                    lai.id_faturamento_lote = None
+                                
+                                existing.agendamento_id = None
+                                existing.StatusConciliacao = "pendente"
+                            
+                            existing.dataRealizacao = new_data_realizacao
+                            existing.Guia = str(item.get('Guia', ''))
+                            existing.StatusConferencia = new_status
+                            existing.ValorProcedimento = item.get('ValorProcedimento', 0.0)
+                            existing.CodigoBeneficiario = item.get('CodigoBeneficiario', '')
+                            existing.cod_procedimento_fat = item.get('cod_procedimento_fat', '')
+                            existing.updated_at = now_utc
+                            existing.id_lote = lote_interno_id
+                            existing.user_id = job.user_id
+                        else:
+                            novo = FaturamentoLote(
+                                detalheId=det_id,
+                                CodigoBeneficiario=item.get('CodigoBeneficiario', ''),
+                                dataRealizacao=new_data_realizacao,
+                                Guia=str(item.get('Guia', '')),
+                                StatusConferencia=new_status,
+                                ValorProcedimento=item.get('ValorProcedimento', 0.0),
+                                cod_procedimento_fat=item.get('cod_procedimento_fat', ''),
+                                id_lote=lote_interno_id,
+                                StatusConciliacao="pendente",
+                                updated_at=now_utc,
+                                user_id=job.user_id
+                            )
+                            db.add(novo)
+                    
+                    db.commit()
+                    
+                    if lotes_ag_para_reconciliar:
+                        try:
+                            from routes.conciliacao import process_conciliacao_bg
+                            for id_lote_ag in lotes_ag_para_reconciliar:
+                                lote_ag = db.query(LoteAgendamento).filter_by(id_lote_ag=id_lote_ag).first()
+                                if lote_ag and lote_ag.id_lote_convenio:
+                                    process_conciliacao_bg(lote_ag.id_lote_convenio, id_lote_ag, job.user_id)
+                        except Exception as e:
+                            print(f"Error triggering background reconciliation: {e}")
+                
+                job.result_consumed = True
+                synced_counts["jobs_processed"] += 1
+                db.commit()
+                continue
+                
+            elif rotina == "7" and isinstance(res_data, dict):
+                itens_sucesso = res_data.get("itens_sucesso", [])
+                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                status_env = p_params.get("status")
+                
+                status_map = {}
+                if not status_env:
+                    itens_param = p_params.get("itens", [])
+                    status_map = {str(it.get("detalheId")): it.get("status") for it in itens_param}
+                
+                from models import FaturamentoLote
+                if itens_sucesso:
+                    fats = db.query(FaturamentoLote).filter(
+                        FaturamentoLote.detalheId.in_(itens_sucesso)
+                    ).all()
+                    for f in fats:
+                        f.StatusConferencia = status_map.get(str(f.detalheId), status_env or 67)
+                        f.updated_at = datetime.now(timezone.utc)
+                    db.commit()
+                
+                job.result_consumed = True
+                synced_counts["jobs_processed"] += 1
+                db.commit()
+                continue
+                
+            elif rotina == "13" and isinstance(res_data, dict):
+                id_lote_interno = res_data.get("id_lote_interno")
+                cod_prestador = res_data.get("cod_prestador")
+                data_fim = res_data.get("data_fim")
+                
+                from models import LoteConvenio, Job as JobModel
+                if id_lote_interno:
+                    lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
+                    if lote_obj:
+                        lote_obj.status = "Criando"
+                        db.commit()
+                
+                if data_fim:
+                    parts = data_fim.split('/')
+                    data_fim_iso = f"{parts[2]}-{parts[1]}-{parts[0]}" if len(parts) == 3 else data_fim
+                    poll_params = {
+                        "cod_prestador": cod_prestador,
+                        "data_fim": data_fim,
+                        "data_fim_iso": data_fim_iso,
+                        "id_lote_interno": id_lote_interno,
+                        "poll_attempt": 0
+                    }
+                    new_job = JobModel(
+                        id_convenio=job.id_convenio,
+                        rotina="13_poll",
+                        params=json.dumps(poll_params),
+                        status="pending",
+                        priority=10,
+                        user_id=job.user_id
+                    )
+                    db.add(new_job)
+                    db.commit()
+                
+                job.result_consumed = True
+                synced_counts["jobs_processed"] += 1
+                db.commit()
+                continue
+                
+            elif rotina == "13_poll" and isinstance(res_data, dict):
+                status_lote = res_data.get("status")
+                id_lote_interno = res_data.get("id_lote_interno")
+                lote_id_api = res_data.get("lote_id_api")
+                cod_prestador = res_data.get("cod_prestador")
+                poll_attempt = res_data.get("poll_attempt", 0)
+                
+                from models import LoteConvenio, Job as JobModel
+                if status_lote == "ready" and lote_id_api:
+                    if id_lote_interno:
+                        lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
+                        if lote_obj:
+                            lote_obj.numero_lote = lote_id_api
+                            lote_obj.status = "Aberto"
+                            db.commit()
+                    
+                    op6_params = {
+                        "codigoPrestador": cod_prestador,
+                        "numero_lote": lote_id_api,
+                        "id_lote_interno": id_lote_interno
+                    }
+                    new_job = JobModel(
+                        id_convenio=job.id_convenio,
+                        rotina="6",
+                        params=json.dumps(op6_params),
+                        status="pending",
+                        priority=10,
+                        user_id=job.user_id
+                    )
+                    db.add(new_job)
+                    db.commit()
+                elif status_lote == "processing":
+                    p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                    poll_params = {
+                        "cod_prestador": cod_prestador,
+                        "data_fim": p_params.get("data_fim"),
+                        "data_fim_iso": p_params.get("data_fim_iso"),
+                        "id_lote_interno": id_lote_interno,
+                        "poll_attempt": poll_attempt + 1
+                    }
+                    new_job = JobModel(
+                        id_convenio=job.id_convenio,
+                        rotina="13_poll",
+                        params=json.dumps(poll_params),
+                        status="pending",
+                        priority=15,
+                        user_id=job.user_id
+                    )
+                    db.add(new_job)
+                    db.commit()
+                
+                job.result_consumed = True
+                synced_counts["jobs_processed"] += 1
+                db.commit()
+                continue
+                
+            elif rotina == "14":
+                import json
+                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                id_lote_interno = p_params.get("id_lote_interno")
+                numero_lote = p_params.get("numero_lote")
+                
+                from models import LoteConvenio, FaturamentoLote
+                lote_obj = None
+                if id_lote_interno:
+                    lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
+                if not lote_obj and numero_lote:
+                    lote_obj = db.query(LoteConvenio).filter_by(numero_lote=numero_lote).first()
+                
+                if lote_obj:
+                    lote_obj.status = "Cancelado"
+                    items = db.query(FaturamentoLote).filter_by(id_lote=lote_obj.id_lote).all()
+                    for item in items:
+                        item.StatusConciliacao = "bloqueado"
+                    db.commit()
+                
+                job.result_consumed = True
+                synced_counts["jobs_processed"] += 1
+                db.commit()
+                continue
+
+        # Se for convênio Unimeds (ID 2 ou 3)
+        if job.id_convenio in [2, 3]:
+            rotina = str(job.rotina).lower()
+            res_data = job.result_data
+            
+            if rotina in ["3", "op3_execucao"] and res_data:
+                results_list = []
+                if isinstance(res_data, list):
+                    results_list = res_data
+                elif isinstance(res_data, dict):
+                    results_list = res_data.get("data", [])
+                    if not isinstance(results_list, list):
+                        results_list = [results_list]
+                        
+                from models import Agendamento
+                for item in results_list:
+                    ag_id = item.get("agendamento_id")
+                    executado = item.get("executado", False)
+                    if ag_id and executado:
+                        agenda = db.query(Agendamento).filter(Agendamento.id_agendamento == int(ag_id)).first()
+                        if agenda:
+                            agenda.execucao_status = "sucesso"
+                db.commit()
+                
+                job.result_consumed = True
+                synced_counts["jobs_processed"] += 1
+                db.commit()
+                continue
+
         results_list = []
         if isinstance(job.result_data, dict):
             # Se for dicionário, pode ter a chave 'data' ou 'op11_data' que contém a lista
@@ -772,20 +1326,21 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             synced_counts["updated"] += res.get("updated", 0)
             synced_counts["skipped"] += res.get("skipped", 0)
             
-        # Invalidação do cache para o usuário proprietário do job
-        try:
-            from cache import cache
-            cache.invalidate_tenant(job.user_id)
-        except Exception as e:
-            print(f"Error invalidating cache for user {job.user_id} during sync: {e}")
-
         job.result_consumed = True
         synced_counts["jobs_processed"] += 1
         
     if synced_counts["jobs_processed"] > 0:
         db.commit()
+        try:
+            from cache import cache
+            for j in jobs:
+                if j.user_id:
+                    cache.invalidate_tenant(j.user_id)
+        except Exception as e:
+            print(f"Error invalidating cache after sync_completed_worker_jobs: {e}")
         
     return synced_counts
+
 
 def sync_completed_worker_jobs_bg():
     """
@@ -803,4 +1358,502 @@ def sync_completed_worker_jobs_bg():
         print(f"Error in background sync: {e}")
     finally:
         db.close()
+
+
+def _normalize_and_resolve_convenio_id(db: Session, conv_text_or_id: str | int | None = None, pagamento_id: int | None = None, is_carteirinha: bool = False) -> tuple[int, str]:
+    """
+    Mapeia texto do convênio ou pagamento_id para (id_convenio, nome_convenio).
+    Regras estritas:
+    1. IDs Fixos (3, 6, 8, 9, 21, 31): vinculação direta por ID no banco.
+    2. Demais convênios: match EXATO e ÚNICO pelo nome do convênio. Se não existir, cadastra novo convênio com nome real.
+    3. Carteirinhas (is_carteirinha=True): de-para de texto específico:
+       - IPASGO - TEA -> IPASGO (id=6)
+       - Unimed Goiânia Guia -> Unimed Goiânia (id=3)
+       - Sulamérica -> SULAMERICA (id=8)
+    """
+    from models import Convenio
+    import unicodedata
+
+    def strip_accents(text):
+        if not text: return ""
+        return "".join(c for c in unicodedata.normalize('NFD', str(text)) if unicodedata.category(c) != 'Mn').lower().strip()
+
+    KNOWN_IDS = {
+        3: "UNIMED GOIANIA",
+        6: "IPASGO",
+        8: "SULAMERICA",
+        9: "AMIL",
+        21: "UNIMED INTERCAMBIO",
+        31: "IPASGO - GERAL"
+    }
+
+    # 1. Tentar por pagamento_id se for um dos IDs conhecidos
+    if pagamento_id is not None:
+        try:
+            pid = int(pagamento_id)
+            if pid in KNOWN_IDS:
+                conv = db.query(Convenio).filter(Convenio.id_convenio == pid).first()
+                nome = conv.nome if conv else KNOWN_IDS[pid]
+                return (pid, nome)
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Tentar por conv_text_or_id se for numérico e for um dos IDs conhecidos
+    if conv_text_or_id is not None:
+        try:
+            cid = int(conv_text_or_id)
+            if cid in KNOWN_IDS:
+                conv = db.query(Convenio).filter(Convenio.id_convenio == cid).first()
+                nome = conv.nome if conv else KNOWN_IDS[cid]
+                return (cid, nome)
+        except (ValueError, TypeError):
+            pass
+
+        raw_str = str(conv_text_or_id).strip()
+        clean_str = strip_accents(raw_str)
+
+        if not clean_str:
+            return (None, None)
+
+        # 3. Parse específico de nomes exclusivamente para carteirinhas
+        if is_carteirinha:
+            if "ipasgo" in clean_str and "geral" not in clean_str and "eventual" not in clean_str:
+                return (6, "IPASGO")
+            if "unimed goiania" in clean_str or "unimed goiânia" in clean_str or clean_str == "unimed goiania guia":
+                return (3, "UNIMED GOIANIA")
+            if "sulamerica" in clean_str or "sul america" in clean_str or "sulamérica" in clean_str:
+                return (8, "SULAMERICA")
+
+        # 4. Match EXATO e ÚNICO por igualdade de nome para todos os outros convênios
+        all_convs = db.query(Convenio).all()
+        for c in all_convs:
+            if strip_accents(c.nome) == clean_str:
+                return (c.id_convenio, c.nome)
+
+        # Se não encontrou por nome exato, insere novo convênio com o nome real
+        conv_db = Convenio(nome=raw_str)
+        db.add(conv_db)
+        db.flush()
+        return (conv_db.id_convenio, conv_db.nome)
+
+    return (None, None)
+
+
+def _sync_aba_clmf_op1(db: Session, job, agendamentos_data: list, synced_counts: dict):
+    """
+    Processa resultados da OP1 (Importar Agendamentos) do ABA_clmf.
+    Garante que 100% dos agendamentos do JSON sejam salvos imediatamente na tabela agendamentos em alta velocidade.
+    """
+    from models import Agendamento, Carteirinha, Convenio, Job as JobModel
+    import json
+
+    if not agendamentos_data:
+        return
+
+    # Pre-fetch convênios and carteirinhas in bulk for extreme performance (no N+1 queries)
+    all_convs = db.query(Convenio).all()
+    convs_by_id = {c.id_convenio: c for c in all_convs}
+    
+    import unicodedata
+    def _strip_accents(text):
+        if not text: return ""
+        return "".join(c for c in unicodedata.normalize('NFD', str(text)) if unicodedata.category(c) != 'Mn').lower().strip()
+    
+    convs_by_clean_name = {_strip_accents(c.nome): c for c in all_convs}
+
+    def resolve_conv_fast(conv_text_or_id, pagamento_id):
+        KNOWN_IDS = {3: "UNIMED GOIANIA", 6: "IPASGO", 8: "SULAMERICA", 9: "AMIL", 21: "UNIMED INTERCAMBIO", 31: "IPASGO - GERAL"}
+        # 1. Busca por pagamento_id SOMENTE se for um dos IDs conhecidos
+        if pagamento_id is not None:
+            try:
+                pid = int(pagamento_id)
+                if pid in KNOWN_IDS:
+                    c = convs_by_id.get(pid)
+                    return (pid, c.nome if c else KNOWN_IDS[pid])
+            except (ValueError, TypeError): pass
+
+        # 2. Busca por id numérico SOMENTE se for um dos IDs conhecidos
+        if conv_text_or_id is not None:
+            try:
+                cid = int(conv_text_or_id)
+                if cid in KNOWN_IDS:
+                    c = convs_by_id.get(cid)
+                    return (cid, c.nome if c else KNOWN_IDS[cid])
+            except (ValueError, TypeError): pass
+
+            raw_str = str(conv_text_or_id).strip()
+            clean_str = _strip_accents(raw_str)
+            if clean_str:
+                # 3. Match EXATO e ÚNICO pelo nome do convênio (ex: Social/Gratuidade)
+                if clean_str in convs_by_clean_name:
+                    c = convs_by_clean_name[clean_str]
+                    return (c.id_convenio, c.nome)
+                # 4. Se o nome não existir no banco, cadastra o novo convênio com o nome real
+                new_c = Convenio(nome=raw_str)
+                db.add(new_c)
+                db.flush()
+                convs_by_id[new_c.id_convenio] = new_c
+                convs_by_clean_name[clean_str] = new_c
+                return (new_c.id_convenio, new_c.nome)
+
+        return (None, None)
+
+    # Bulk pre-fetch all user carteirinhas
+    all_carts = db.query(Carteirinha).filter(Carteirinha.user_id == job.user_id).all()
+    carts_by_pac_conv = {(str(c.id_paciente).strip(), c.id_convenio): c for c in all_carts if c.id_paciente}
+
+    # Pre-fetch pending OP2 jobs to avoid querying inside loop
+    existing_op2_jobs = db.query(JobModel).filter(
+        JobModel.id_convenio == 101,
+        JobModel.rotina.in_(["op2_consultar_carteirinha", "op2"]),
+        JobModel.status.in_(["pending", "processing"]),
+        JobModel.user_id == job.user_id
+    ).all()
+    
+    op2_patients_map = {}
+    for p_job in existing_op2_jobs:
+        try:
+            p_params = json.loads(p_job.params) if isinstance(p_job.params, str) else (p_job.params or {})
+            pid = str(p_params.get("id_paciente", "")).strip()
+            if pid:
+                op2_patients_map[pid] = (p_job, p_params)
+        except Exception: pass
+
+    op2_new_payloads = {}
+
+    ag_dicts_to_upsert = []
+    from datetime import datetime
+
+    for item in agendamentos_data:
+        if not isinstance(item, dict):
+            continue
+
+        id_ag = item.get("id_agendamento")
+        id_paciente = str(item.get("id_paciente", "")).strip()
+        id_unidade = item.get("id_unidade", 0)
+
+        if not id_ag or not id_paciente:
+            continue
+
+        if id_unidade not in (1, 3, 5):
+            synced_counts["skipped"] += 1
+            continue
+
+        pagamento_id = _parse_int(item.get("schedule_pagamento_id"), default=0)
+        id_convenio, nome_conv = resolve_conv_fast(item.get("convenio_nome"), pagamento_id)
+
+        cart = carts_by_pac_conv.get((id_paciente, id_convenio))
+        id_carteirinha = cart.id if cart else None
+        carteirinha_num = cart.carteirinha if cart else ""
+
+        if not cart:
+            if id_paciente in op2_patients_map:
+                p_job, p_params = op2_patients_map[id_paciente]
+                ag_list = p_params.get("agendamentos_pendentes") or []
+                ag_list.append(item)
+                p_params["agendamentos_pendentes"] = ag_list
+                p_job.params = json.dumps(p_params)
+            elif id_paciente not in op2_new_payloads:
+                op2_new_payloads[id_paciente] = [item]
+            else:
+                op2_new_payloads[id_paciente].append(item)
+
+        data_val = item.get("data")
+        if isinstance(data_val, str) and data_val:
+            try: data_val = datetime.strptime(data_val[:10], "%Y-%m-%d").date()
+            except ValueError: data_val = None
+
+        hora_val = item.get("hora_inicio")
+        if isinstance(hora_val, str) and hora_val:
+            try: hora_val = datetime.strptime(hora_val[:8], "%H:%M:%S").time()
+            except ValueError:
+                try: hora_val = datetime.strptime(hora_val[:5], "%H:%M").time()
+                except ValueError: hora_val = None
+
+        ag_dicts_to_upsert.append({
+            "id_agendamento": int(id_ag),
+            "id_paciente": str(id_paciente),
+            "id_unidade": int(id_unidade),
+            "id_carteirinha": id_carteirinha,
+            "carteirinha": carteirinha_num or "",
+            "Nome_Paciente": item.get("Nome_Paciente"),
+            "id_convenio": int(id_convenio) if id_convenio is not None else None,
+            "nome_convenio": nome_conv,
+            "data": data_val,
+            "hora_inicio": hora_val,
+            "sala": item.get("sala"),
+            "Id_profissional": str(item.get("Id_profissional")),
+            "Nome_profissional": item.get("Nome_profissional"),
+            "Tipo_atendimento": item.get("Tipo_atendimento"),
+            "cod_procedimento_aut": item.get("cod_procedimento_aut"),
+            "cod_procedimento_fat": item.get("cod_procedimento_fat"),
+            "valor_procedimento": 0.0,
+            "Status": item.get("Status", "A Confirmar"),
+            "user_id": job.user_id
+        })
+
+    if ag_dicts_to_upsert:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from sqlalchemy import func
+
+        # Deduplicate ag_dicts_to_upsert by id_agendamento in python first
+        unique_ag_map = {d["id_agendamento"]: d for d in ag_dicts_to_upsert}
+        ag_list_unique = list(unique_ag_map.values())
+
+        stmt = pg_insert(Agendamento).values(ag_list_unique)
+        update_set = {
+            "id_paciente": stmt.excluded.id_paciente,
+            "id_unidade": stmt.excluded.id_unidade,
+            "Nome_Paciente": stmt.excluded.Nome_Paciente,
+            "id_convenio": stmt.excluded.id_convenio,
+            "nome_convenio": stmt.excluded.nome_convenio,
+            "data": stmt.excluded.data,
+            "hora_inicio": stmt.excluded.hora_inicio,
+            "sala": stmt.excluded.sala,
+            "Id_profissional": stmt.excluded.Id_profissional,
+            "Nome_profissional": stmt.excluded.Nome_profissional,
+            "Tipo_atendimento": stmt.excluded.Tipo_atendimento,
+            "cod_procedimento_aut": stmt.excluded.cod_procedimento_aut,
+            "cod_procedimento_fat": stmt.excluded.cod_procedimento_fat,
+            "Status": stmt.excluded.Status,
+            "user_id": stmt.excluded.user_id,
+            "data_update": func.now()
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['id_agendamento'],
+            set_=update_set
+        )
+        db.execute(stmt)
+        synced_counts["updated"] += len(ag_list_unique)
+
+    # Queue new OP2 jobs for missing carteirinhas in bulk
+    for pid, ag_items in op2_new_payloads.items():
+        op2_params = json.dumps({
+            "id_paciente": pid,
+            "agendamentos_pendentes": ag_items
+        })
+        new_op2_job = JobModel(
+            status="pending",
+            id_convenio=101,
+            user_id=job.user_id,
+            rotina="op2_consultar_carteirinha",
+            params=op2_params,
+            priority=0
+        )
+        db.add(new_op2_job)
+    # Processa atendimentos excluídos retornados pelo portal no job de importação
+    excluidos_ids = []
+    if isinstance(job.result_data, dict):
+        excluidos_ids = job.result_data.get("atendimentos_excluidos") or []
+        if not excluidos_ids and isinstance(job.result_data.get("data"), dict):
+            excluidos_ids = job.result_data["data"].get("atendimentos_excluidos") or []
+    elif isinstance(agendamentos_data, dict):
+        excluidos_ids = agendamentos_data.get("atendimentos_excluidos") or []
+
+    if excluidos_ids:
+        excl_int_ids = []
+        for x in excluidos_ids:
+            try:
+                excl_int_ids.append(int(x))
+            except (ValueError, TypeError): pass
+
+        if excl_int_ids:
+            excl_ags = db.query(Agendamento).filter(
+                Agendamento.id_agendamento.in_(excl_int_ids),
+                Agendamento.user_id == job.user_id
+            ).all()
+
+            for ag in excl_ags:
+                ag.Status = "Excluído"
+                _unlink_guia_if_eligible(db, ag)
+
+    db.commit()
+
+
+def _sync_aba_clmf_op2(db: Session, job, results_list: list, synced_counts: dict):
+    """
+    Processa resultados da OP2 (Consultar Carteirinha) do ABA_clmf.
+    Mapeia e cria carteirinhas vinculadas ao convenio de saude REAL (nunca 101) e atualiza agendamentos.
+    """
+    from models import Carteirinha, Convenio, Agendamento
+    import json
+
+    for res in results_list:
+        if not isinstance(res, dict):
+            continue
+
+        id_paciente = str(res.get("id_paciente", "")).strip()
+        carteirinhas_found = res.get("carteirinhas") or []
+        agendamentos_pendentes = res.get("agendamentos_pendentes") or []
+
+        if not id_paciente:
+            continue
+
+        # 1. Processar cada carteirinha encontrada no portal HTML
+        for cart_item in carteirinhas_found:
+            cart_num = str(cart_item.get("carteirinha", "")).strip()
+            conv_texto = str(cart_item.get("convenio_texto", "")).strip()
+            status_cart = str(cart_item.get("status", "Ativa")).strip()
+
+            if not cart_num or not conv_texto:
+                continue
+
+            id_convenio, nome_conv = _normalize_and_resolve_convenio_id(db, conv_text_or_id=conv_texto, pagamento_id=None, is_carteirinha=True)
+
+            # Garantir que nunca usamos id_convenio = 101 para carteirinhas
+            if id_convenio == 101:
+                id_convenio = 6
+                nome_conv = "IPASGO"
+
+            existing_cart = db.query(Carteirinha).filter(
+                Carteirinha.carteirinha == cart_num,
+                Carteirinha.user_id == job.user_id
+            ).first()
+
+            if not existing_cart:
+                existing_cart = db.query(Carteirinha).filter(
+                    Carteirinha.id_paciente == id_paciente,
+                    Carteirinha.id_convenio == id_convenio,
+                    Carteirinha.user_id == job.user_id
+                ).first()
+
+            patient_name = agendamentos_pendentes[0].get("Nome_Paciente") if agendamentos_pendentes else f"Paciente {id_paciente}"
+
+            if not existing_cart:
+                existing_cart = Carteirinha(
+                    carteirinha=cart_num,
+                    paciente=patient_name,
+                    id_paciente=id_paciente,
+                    id_convenio=id_convenio,
+                    user_id=job.user_id,
+                    status=status_cart.lower() if status_cart else "ativo"
+                )
+                try:
+                    with db.begin_nested():
+                        db.add(existing_cart)
+                        db.flush()
+                except Exception:
+                    existing_cart = db.query(Carteirinha).filter(
+                        Carteirinha.user_id == job.user_id,
+                        (Carteirinha.id_paciente == id_paciente) | (Carteirinha.carteirinha == cart_num)
+                    ).first()
+            else:
+                existing_cart.id_paciente = id_paciente
+                existing_cart.id_convenio = id_convenio
+                if cart_num:
+                    existing_cart.carteirinha = cart_num
+
+        # 2. Garantir que agendamentos pendentes recebam os updates necessários
+        for ag in agendamentos_pendentes:
+            if not isinstance(ag, dict):
+                continue
+            ag_conv_nome = ag.get("convenio_nome") or ag.get("nome_convenio")
+            ag_pag_id = _parse_int(ag.get("schedule_pagamento_id"), default=0)
+            ag_conv_id, _ = _normalize_and_resolve_convenio_id(db, ag_conv_nome, pagamento_id=ag_pag_id)
+
+            matching_cart = db.query(Carteirinha).filter(
+                Carteirinha.id_paciente == id_paciente,
+                Carteirinha.id_convenio == ag_conv_id,
+                Carteirinha.user_id == job.user_id
+            ).first()
+
+            cart_id = matching_cart.id if matching_cart else None
+            cart_num = matching_cart.carteirinha if matching_cart else ""
+
+            _upsert_agendamento(db, ag, cart_id, cart_num, ag_conv_id, job.user_id, synced_counts)
+
+
+def _upsert_agendamento(db: Session, item: dict, id_carteirinha: int | None, carteirinha_num: str | None, id_convenio: int | str, user_id: int, synced_counts: dict, nome_conv_override: str | None = None):
+    """
+    Auxiliar para realizar UPSERT atomico na tabela agendamentos via pg_insert ON CONFLICT DO UPDATE.
+    """
+    from models import Agendamento, Convenio
+    from datetime import datetime, date, time
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy import func
+
+    id_ag = int(item["id_agendamento"])
+    if nome_conv_override:
+        nome_conv = nome_conv_override
+        id_convenio = int(id_convenio)
+    elif isinstance(id_convenio, int) or (isinstance(id_convenio, str) and id_convenio.isdigit()):
+        conv = db.query(Convenio).filter(Convenio.id_convenio == int(id_convenio)).first()
+        nome_conv = conv.nome if conv else ""
+        id_convenio = int(id_convenio)
+    else:
+        id_convenio, nome_conv = _normalize_and_resolve_convenio_id(db, conv_text_or_id=id_convenio)
+
+    data_val = item.get("data")
+    if isinstance(data_val, str) and data_val:
+        try:
+            data_val = datetime.strptime(data_val[:10], "%Y-%m-%d").date()
+        except ValueError:
+            data_val = None
+
+    hora_val = item.get("hora_inicio")
+    if isinstance(hora_val, str) and hora_val:
+        try:
+            hora_val = datetime.strptime(hora_val[:8], "%H:%M:%S").time()
+        except ValueError:
+            try:
+                hora_val = datetime.strptime(hora_val[:5], "%H:%M").time()
+            except ValueError:
+                hora_val = None
+
+    ag_dict = {
+        "id_agendamento": id_ag,
+        "id_paciente": str(item.get("id_paciente")),
+        "id_unidade": int(item.get("id_unidade", 0)),
+        "id_carteirinha": id_carteirinha,
+        "carteirinha": carteirinha_num or "",
+        "Nome_Paciente": item.get("Nome_Paciente"),
+        "id_convenio": id_convenio,
+        "nome_convenio": nome_conv,
+        "data": data_val,
+        "hora_inicio": hora_val,
+        "sala": item.get("sala"),
+        "Id_profissional": str(item.get("Id_profissional")),
+        "Nome_profissional": item.get("Nome_profissional"),
+        "Tipo_atendimento": item.get("Tipo_atendimento"),
+        "cod_procedimento_aut": item.get("cod_procedimento_aut"),
+        "cod_procedimento_fat": item.get("cod_procedimento_fat"),
+        "valor_procedimento": 0.0,
+        "Status": item.get("Status", "A Confirmar"),
+        "user_id": user_id
+    }
+
+    stmt = pg_insert(Agendamento).values(ag_dict)
+
+    update_set = {
+        "id_paciente": stmt.excluded.id_paciente,
+        "id_unidade": stmt.excluded.id_unidade,
+        "Nome_Paciente": stmt.excluded.Nome_Paciente,
+        "id_convenio": stmt.excluded.id_convenio,
+        "nome_convenio": stmt.excluded.nome_convenio,
+        "data": stmt.excluded.data,
+        "hora_inicio": stmt.excluded.hora_inicio,
+        "sala": stmt.excluded.sala,
+        "Id_profissional": stmt.excluded.Id_profissional,
+        "Nome_profissional": stmt.excluded.Nome_profissional,
+        "Tipo_atendimento": stmt.excluded.Tipo_atendimento,
+        "cod_procedimento_aut": stmt.excluded.cod_procedimento_aut,
+        "cod_procedimento_fat": stmt.excluded.cod_procedimento_fat,
+        "Status": stmt.excluded.Status,
+        "user_id": stmt.excluded.user_id,
+        "data_update": func.now()
+    }
+
+    if id_carteirinha is not None:
+        update_set["id_carteirinha"] = stmt.excluded.id_carteirinha
+    if carteirinha_num:
+        update_set["carteirinha"] = stmt.excluded.carteirinha
+
+    stmt = stmt.on_conflict_do_update(
+        index_elements=['id_agendamento'],
+        set_=update_set
+    )
+    db.execute(stmt)
+    synced_counts["updated"] += 1
+
+
 

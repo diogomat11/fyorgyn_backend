@@ -5,6 +5,7 @@ from database import get_db
 from models import Log, Carteirinha, Job
 from typing import List, Optional
 from dependencies import get_current_user
+from timezone_utils import localize_datetime
 
 router = APIRouter(
     tags=["Logs"]
@@ -51,7 +52,7 @@ def list_logs(
             "id": log.id,
             "level": log.level,
             "message": log.message,
-            "created_at": log.created_at,
+            "created_at": localize_datetime(log.created_at),
             "job_id": log.job_id,
             "carteirinha": log.carteirinha_rel.carteirinha if log.carteirinha_rel else None,
             "paciente": log.carteirinha_rel.paciente if log.carteirinha_rel else None

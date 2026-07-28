@@ -142,39 +142,120 @@ def vincular_guias_manualmente(db: Session = Depends(get_db), current_user = Dep
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erro ao forçar vinculação de guias: {str(e)}")
 
+
+class SincronizarAgendamentosRequest(BaseModel):
+    data_inicio: Optional[date] = None
+    data_fim: Optional[date] = None
+    id_paciente: Optional[str] = "0"
+    id_convenio: Optional[int] = 101
+
+
+@router.post("/sincronizar")
+def sincronizar_agendamentos_portal(
+    req: SincronizarAgendamentosRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    from models import UserConvenio, Job
+    import json
+
+    target_id_convenio = req.id_convenio or 101
+    
+    # Verifica se o usuario tem credenciais cadastradas para o convenio ABA_clmf (ou id_convenio alvo)
+    user_conv = db.query(UserConvenio).filter(
+        UserConvenio.user_id == current_user.id,
+        UserConvenio.id_convenio == target_id_convenio
+    ).first()
+
+    if not user_conv:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Usuário não possui credenciais vinculadas para o convênio ID {target_id_convenio} (ABA_clmf)."
+        )
+
+    params_dict = {
+        "data_inicio": req.data_inicio.strftime("%Y-%m-%d") if req.data_inicio else None,
+        "data_fim": req.data_fim.strftime("%Y-%m-%d") if req.data_fim else None,
+        "id_paciente": req.id_paciente or "0"
+    }
+
+    new_job = Job(
+        id_convenio=target_id_convenio,
+        rotina="op1_importar_agendamentos",
+        status="pending",
+        params=json.dumps(params_dict),
+        user_id=current_user.id
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+
+    return {
+        "status": "success",
+        "message": f"Job #{new_job.id} de sincronização de agendamentos criado com sucesso!",
+        "job_id": new_job.id
+    }
+
 @router.get("/")
 def list_agendamentos(
     paciente: Optional[str] = None,
     id_convenio: Optional[int] = None,
+    id_unidade: Optional[int] = None,
     data_inicio: Optional[date] = None,
     data_fim: Optional[date] = None,
     status: Optional[str] = None,
     procedimento: Optional[str] = None,
+    sem_carteirinha: Optional[bool] = False,
     limit: int = 50,
     skip: int = 0,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    query = db.query(Agendamento)
+    base_query = db.query(Agendamento)
     if not current_user.is_admin:
-        query = query.filter(Agendamento.user_id == current_user.id)
+        base_query = base_query.filter(Agendamento.user_id == current_user.id)
     
     if paciente:
-        query = query.filter(Agendamento.Nome_Paciente.ilike(f"%{paciente}%"))
+        base_query = base_query.filter(Agendamento.Nome_Paciente.ilike(f"%{paciente}%"))
     if id_convenio:
-        query = query.filter(Agendamento.id_convenio == id_convenio)
+        base_query = base_query.filter(Agendamento.id_convenio == id_convenio)
+    if id_unidade:
+        base_query = base_query.filter(Agendamento.id_unidade == id_unidade)
     if data_inicio:
-        query = query.filter(Agendamento.data >= data_inicio)
+        base_query = base_query.filter(Agendamento.data >= data_inicio)
     if data_fim:
-        query = query.filter(Agendamento.data <= data_fim)
-    if status:
-        query = query.filter(Agendamento.Status == status)
+        base_query = base_query.filter(Agendamento.data <= data_fim)
     if procedimento:
-        query = query.filter(Agendamento.nome_procedimento.ilike(f"%{procedimento}%"))
+        base_query = base_query.filter(Agendamento.nome_procedimento.ilike(f"%{procedimento}%"))
+    if sem_carteirinha:
+        base_query = base_query.filter(
+            (Agendamento.carteirinha == None) | (func.trim(Agendamento.carteirinha) == '')
+        )
+
+    # Calculate KPIs from base_query BEFORE status filtering
+    # Pendentes rule: Status == 'Pendente' OR (Status == 'Confirmado' AND (numero_guia IS NULL OR numero_guia = ''))
+    pendentes_condition = (Agendamento.Status == 'Pendente') | (
+        (Agendamento.Status == 'Confirmado') & (
+            (Agendamento.numero_guia == None) | (func.trim(Agendamento.numero_guia) == '')
+        )
+    )
+    
+    confirmados_count = base_query.filter(Agendamento.Status == 'Confirmado').count()
+    a_confirmar_count = base_query.filter(Agendamento.Status == 'A Confirmar').count()
+    faltas_count = base_query.filter(Agendamento.Status == 'Falta').count()
+    faturados_count = base_query.filter(Agendamento.Status.in_(['Faturado', 'Faturamento Solicitado'])).count()
+    pendentes_count = base_query.filter(pendentes_condition).count()
+
+    query = base_query
+    if status:
+        if status.lower() == 'pendentes':
+            query = query.filter(pendentes_condition)
+        elif status.lower() == 'faturado':
+            query = query.filter(Agendamento.Status.in_(['Faturado', 'Faturamento Solicitado']))
+        else:
+            query = query.filter(Agendamento.Status == status)
         
     total = query.count()
-    # Joined loading of gui? We can do a join to return saldo, but since this relies on front-end, let's keep it direct.
-    # We will fetch 'saldo' as an annotation if numero_guia matches.
     
     # Outer join to fetch the Saldo da Guia if numero_guia is populated
     from sqlalchemy.orm import aliased
@@ -204,10 +285,6 @@ def list_agendamentos(
     else:
         total_db_unfiltered = db.query(Agendamento).count()
         
-    confirmados = query.filter(Agendamento.Status == 'Confirmado').count()
-    a_confirmar = query.filter(Agendamento.Status == 'A Confirmar').count()
-    faltas = query.filter(Agendamento.Status == 'Falta').count()
-        
     return {
         "data": data, 
         "total": total, 
@@ -215,9 +292,12 @@ def list_agendamentos(
         "skip": skip, 
         "limit": limit,
         "kpis": {
-            "confirmados": confirmados,
-            "a_confirmar": a_confirmar,
-            "faltas": faltas
+            "confirmados": confirmados_count,
+            "a_confirmar": a_confirmar_count,
+            "faltas": faltas_count,
+            "faturados": faturados_count,
+            "pendentes": pendentes_count,
+            "sem_carteirinha": pendentes_count
         }
     }
 
@@ -228,11 +308,22 @@ def list_procedimentos(id_convenio: int, db: Session = Depends(get_db), current_
     if allowed_ids and id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
 
-    procs = db.query(Procedimento.nome)\
-              .filter(Procedimento.id_convenio == id_convenio)\
-              .distinct().all()
-    # Retorna array flat
-    return [p[0] for p in procs if p[0] is not None]
+    from models import Agendamento
+    procs = db.query(Agendamento.nome_procedimento, Agendamento.cod_procedimento_aut)\
+              .filter(Agendamento.id_convenio == id_convenio)
+    
+    if not current_user.is_admin:
+        procs = procs.filter(Agendamento.user_id == current_user.id)
+        
+    procs = procs.distinct().all()
+    
+    # Monta uma lista flat com nomes e códigos não nulos/vazios
+    result_set = set()
+    for p in procs:
+        if p[0]: result_set.add(p[0])
+        elif p[1]: result_set.add(p[1])
+        
+    return sorted(list(result_set))
 
 class BatchStatusRequest(BaseModel):
     ids: List[int]
@@ -792,6 +883,201 @@ def create_profissional(
         registro=req.registro,
         UF=req.UF,
         CBO=req.CBO,
+)
+    
+    new_job = Job(
+        carteirinha_id=cart.id,
+        id_convenio=agenda.id_convenio,
+        rotina="op2_captura",
+        status="pending",
+        params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
+        user_id=current_user.id
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+    return {"status": "success", "job_id": new_job.id}
+
+@router.post("/executar")
+def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """Cria Job Execução. Para Goiânia/Anápolis, auto-cria Captura antes se necessário."""
+    agenda = db.query(Agendamento).filter(Agendamento.id_agendamento == req.agendamento_id).first()
+    if not agenda:
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
+        
+    if not current_user.is_admin and agenda.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
+
+    cart = db.query(Carteirinha).filter(
+        Carteirinha.carteirinha == agenda.carteirinha, 
+        Carteirinha.id_convenio == agenda.id_convenio,
+        Carteirinha.user_id == agenda.user_id
+    ).first()
+    
+    if not cart:
+        raise HTTPException(status_code=404, detail="Carteirinha vinculada não encontrada")
+        
+    from models import Job
+    import json
+
+    # Params base
+    params_base = {"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}
+
+    # Para Anápolis (id_convenio=2): enriquece params com dados de execução SP/SADT
+    if agenda.id_convenio == 2:
+        prof = db.query(CorpoClinico).filter(CorpoClinico.id_profissional == agenda.Id_profissional).first()
+        data_hora = ""
+        try:
+            if agenda.data and agenda.hora_inicio:
+                # hora_inicio pode ser datetime.time ou string "HH:MM:SS"
+                hora = agenda.hora_inicio
+                if isinstance(hora, str):
+                    hora = datetime.strptime(hora[:5], "%H:%M").time()
+                data_hora = f"{agenda.data.strftime('%d/%m/%Y')} {hora.strftime('%H:%M')}"
+        except Exception:
+            data_hora = ""
+        params_base.update({
+            "nome_profissional": prof.nome if prof else (agenda.Nome_profissional or ""),
+            "conselho":          prof.conselho if prof else "",
+            "data_hora":         data_hora,
+            "cod_procedimento_fat": agenda.cod_procedimento_fat or ""
+        })
+
+    # Para IPASGO (id_convenio=6): enriquece params com carteira, procedimento, sessoes_realizadas
+    if agenda.id_convenio == 6:
+        sessoes_req = req.sessoes_realizadas if getattr(req, "sessoes_realizadas", None) is not None else 1
+        params_base.update({
+            "carteira": cart.carteirinha,
+            "cod_procedimento_fat": agenda.cod_procedimento_fat or "",
+            "sessoes_realizadas": sessoes_req
+        })
+
+    params_json = json.dumps(params_base)
+    cap_job_id = req.depending_id  # fallback se já fornecido
+    
+    # Para Goiânia (3) e Anápolis (2): auto-cria Captura se não existe ainda
+    if agenda.id_convenio in (2, 3) and not req.depending_id:
+        # Verifica se já existe Captura com sucesso → usa como dependência
+        existing_cap = None
+        if agenda.numero_guia:
+            from sqlalchemy import cast, String
+            existing_cap = db.query(Job).filter(
+                Job.id_convenio == agenda.id_convenio,
+                Job.rotina.in_(["Captura", "op2_captura"]),
+                Job.status.in_(["pending", "processing", "success"]),
+                cast(Job.params, String).contains(agenda.numero_guia)
+            ).first()
+        
+        if existing_cap:
+            cap_job_id = existing_cap.id
+        else:
+            # Cria Captura standalone primeiro
+            cap_job = Job(
+                carteirinha_id=cart.id,
+                id_convenio=agenda.id_convenio,
+                rotina="op2_captura",
+                status="pending",
+                params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
+                user_id=current_user.id
+            )
+            db.add(cap_job)
+            db.flush()
+            cap_job_id = cap_job.id
+    
+    
+    # Anti-duplicidade Execução
+    from sqlalchemy import cast, String
+    exec_rotina = "op3_execucao" if agenda.id_convenio == 2 else "op4_confirma_guia" if agenda.id_convenio == 6 else "op3_execucao"
+    
+    existing_exec = db.query(Job).filter(
+        Job.rotina.in_(["Execução", "op3_execucao", "op4_confirma_guia"]),
+        Job.status.in_(["pending", "processing"]),
+        cast(Job.params, String).contains(str(agenda.id_agendamento))
+    ).first()
+
+    if existing_exec:
+        return {"status": "success", "message": "Job de execução já existente", "job_id": existing_exec.id}
+
+    # Para IPASGO (6), set depending_id para None explicitamente se nao tiver id injetado   
+    if agenda.id_convenio == 6:
+        cap_job_id = None
+
+    new_job = Job(
+        carteirinha_id=cart.id,
+        id_convenio=agenda.id_convenio,
+        rotina=exec_rotina,
+        status="pending",
+        depending_id=cap_job_id,
+        params=params_json,
+        user_id=current_user.id
+    )
+    db.add(new_job)
+    
+    agenda.execucao_status = "pendente"
+    
+    db.commit()
+    db.refresh(new_job)
+    return {"status": "success", "job_id": new_job.id, "captura_job_id": cap_job_id}
+
+
+@router.get("/profissionais")
+def list_profissionais(
+    tipo: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Retorna a lista de profissionais ativos do corpo clínico, opcionalmente filtrados por tipo (profissional/medico)."""
+    query = db.query(CorpoClinico).filter(CorpoClinico.status == "ativo")
+    if not current_user.is_admin:
+        query = query.filter((CorpoClinico.user_id == current_user.id) | (CorpoClinico.user_id.is_(None)))
+    
+    if tipo:
+        query = query.filter(CorpoClinico.tipo_profissional == tipo)
+        
+    profissionais = query.order_by(CorpoClinico.nome).all()
+    return [
+        {
+            "id_profissional": p.id_profissional,
+            "nome": p.nome,
+            "cpf": p.cpf or "",
+            "area": p.area or "",
+            "conselho": p.conselho or "",
+            "registro": p.registro or "",
+            "UF": p.UF or "",
+            "CBO": p.CBO or "",
+            "codigo_ipasgo": p.codigo_ipasgo or "",
+            "tipo_profissional": p.tipo_profissional or "profissional"
+        }
+        for p in profissionais
+    ]
+
+
+class ProfissionalCreateSchema(BaseModel):
+    nome: str
+    cpf: Optional[str] = None
+    area: Optional[str] = None
+    conselho: Optional[str] = None
+    registro: Optional[str] = None
+    UF: Optional[str] = None
+    CBO: Optional[str] = None
+    codigo_ipasgo: Optional[str] = None
+    tipo_profissional: Optional[str] = "profissional"
+
+
+@router.post("/profissionais")
+def create_profissional(
+    req: ProfissionalCreateSchema,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    new_prof = CorpoClinico(
+        nome=req.nome,
+        cpf=req.cpf,
+        area=req.area,
+        conselho=req.conselho,
+        registro=req.registro,
+        UF=req.UF,
+        CBO=req.CBO,
         codigo_ipasgo=req.codigo_ipasgo,
         tipo_profissional=req.tipo_profissional,
         status="ativo",
@@ -873,4 +1159,222 @@ def delete_profissional(
     return {"status": "success", "message": "Profissional desativado com sucesso."}
 
 
+# ── Pipeline Workflow Endpoints ──
 
+class ConfirmarPortalRequest(BaseModel):
+    agendamento_ids: List[int]
+    remover: bool = False
+
+@router.post("/confirmar-portal")
+def confirmar_portal(
+    req: ConfirmarPortalRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Cria Job worker OP3 para confirmar/remover confirmação no portal ABA."""
+    from models import Job, UserConvenio
+    import os
+
+    if not req.agendamento_ids:
+        raise HTTPException(status_code=400, detail="Nenhum agendamento selecionado.")
+
+    agendamentos = db.query(Agendamento).filter(
+        Agendamento.id_agendamento.in_(req.agendamento_ids)
+    ).all()
+    if not agendamentos:
+        raise HTTPException(status_code=404, detail="Agendamentos não encontrados.")
+
+    if not current_user.is_admin:
+        for ag in agendamentos:
+            if ag.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
+
+    uconv = db.query(UserConvenio).filter(
+        UserConvenio.user_id == current_user.id,
+        UserConvenio.id_convenio == 101
+    ).first()
+    if not uconv or not uconv.login or not uconv.senha_criptografada:
+        raise HTTPException(status_code=400, detail="Credenciais ABA CLMF não configuradas.")
+
+    portal_ids = [ag.id_agendamento for ag in agendamentos]
+    num_situacao = 0 if req.remover else 1
+
+    params_dict = {
+        "id_agendamento": portal_ids,
+        "num_situacao": num_situacao,
+        "login": uconv.login,
+        "senha_criptografada": uconv.senha_criptografada,
+        "cod_prestador": uconv.cod_prestador,
+        "webhook_url": os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
+    }
+
+    new_job = Job(
+        id_convenio=101,
+        rotina="op3_confirmar_agendamento",
+        status="pending",
+        params=params_dict,
+        user_id=current_user.id
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+
+    # Set execucao_status to processando while preserving current stage for spinner UI
+    db.query(Agendamento).filter(Agendamento.id_agendamento.in_(portal_ids)).update({
+        Agendamento.execucao_status: "processando"
+    }, synchronize_session=False)
+    db.commit()
+
+    action = "remoção de confirmação" if req.remover else "confirmação"
+    return {
+        "status": "success",
+        "message": f"Job #{new_job.id} de {action} criado para {len(portal_ids)} agendamento(s).",
+        "job_id": new_job.id
+    }
+
+
+class RegistrarFaltaPortalRequest(BaseModel):
+    agendamento_ids: List[int]
+    id_paciente: int
+    motivo_falta_id: int
+    doc_justificativa: Optional[str] = None
+
+@router.post("/registrar-falta-portal")
+def registrar_falta_portal(
+    req: RegistrarFaltaPortalRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Cria Job worker OP4 para registrar falta no portal ABA."""
+    from models import Job, UserConvenio, MotivoFalta
+    import json, os
+
+    if not req.agendamento_ids:
+        raise HTTPException(status_code=400, detail="Nenhum agendamento selecionado.")
+
+    motivo = db.query(MotivoFalta).filter(MotivoFalta.id == req.motivo_falta_id).first()
+    if not motivo:
+        raise HTTPException(status_code=404, detail="Motivo de falta não encontrado.")
+
+    agendamentos = db.query(Agendamento).filter(
+        Agendamento.id_agendamento.in_(req.agendamento_ids)
+    ).all()
+    if not current_user.is_admin:
+        for ag in agendamentos:
+            if ag.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
+
+    uconv = db.query(UserConvenio).filter(
+        UserConvenio.user_id == current_user.id,
+        UserConvenio.id_convenio == 101
+    ).first()
+    if not uconv or not uconv.login or not uconv.senha_criptografada:
+        raise HTTPException(status_code=400, detail="Credenciais ABA CLMF não configuradas.")
+
+    portal_ids = [ag.id_agendamento for ag in agendamentos]
+
+    params_dict = {
+        "id_agendamento": portal_ids,
+        "id_paciente": req.id_paciente,
+        "tipo_desagendamento": motivo.id_mapeado,
+        "doc_justificativa": req.doc_justificativa or "",
+        "login": uconv.login,
+        "senha_criptografada": uconv.senha_criptografada,
+        "cod_prestador": uconv.cod_prestador,
+        "webhook_url": os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
+    }
+
+    new_job = Job(
+        id_convenio=101,
+        rotina="op4_registrar_falta",
+        status="pending",
+        params=params_dict,
+        user_id=current_user.id
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+
+    db.query(Agendamento).filter(Agendamento.id_agendamento.in_(req.agendamento_ids)).update({
+        Agendamento.execucao_status: "processando"
+    }, synchronize_session=False)
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Job #{new_job.id} de registro de falta criado para {len(portal_ids)} agendamento(s).",
+        "job_id": new_job.id,
+        "motivo": motivo.descricao
+    }
+
+
+class RemoverFaltaPortalRequest(BaseModel):
+    agendamento_ids: List[int]
+    id_paciente: int
+    data_inicial: Optional[str] = None
+    data_final: Optional[str] = None
+
+@router.post("/remover-falta-portal")
+def remover_falta_portal(
+    req: RemoverFaltaPortalRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Cria Job worker OP5 para remover falta no portal ABA."""
+    from models import Job, UserConvenio
+    import os
+    from datetime import date as _date
+
+    if not req.agendamento_ids:
+        raise HTTPException(status_code=400, detail="Nenhum agendamento selecionado.")
+
+    agendamentos = db.query(Agendamento).filter(
+        Agendamento.id_agendamento.in_(req.agendamento_ids)
+    ).all()
+    if not current_user.is_admin:
+        for ag in agendamentos:
+            if ag.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
+
+    uconv = db.query(UserConvenio).filter(
+        UserConvenio.user_id == current_user.id,
+        UserConvenio.id_convenio == 101
+    ).first()
+    if not uconv or not uconv.login or not uconv.senha_criptografada:
+        raise HTTPException(status_code=400, detail="Credenciais ABA CLMF não configuradas.")
+
+    portal_ids = [ag.id_agendamento for ag in agendamentos]
+    today_str = _date.today().strftime("%Y-%m-%d")
+
+    params_dict = {
+        "id_agendamento": portal_ids,
+        "id_paciente": req.id_paciente,
+        "data_inicial": req.data_inicial or today_str,
+        "data_final": req.data_final or today_str,
+        "login": uconv.login,
+        "senha_criptografada": uconv.senha_criptografada,
+        "cod_prestador": uconv.cod_prestador,
+        "webhook_url": os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
+    }
+
+    new_job = Job(
+        id_convenio=101,
+        rotina="op5_remover_falta",
+        status="pending",
+        params=params_dict,
+        user_id=current_user.id
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+
+    db.query(Agendamento).filter(Agendamento.id_agendamento.in_(req.agendamento_ids)).update({
+        Agendamento.execucao_status: "processando"
+    }, synchronize_session=False)
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Job #{new_job.id} de remoção de falta criado para {len(portal_ids)} agendamento(s).",
+        "job_id": new_job.id
+    }
