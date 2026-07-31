@@ -9,7 +9,65 @@ from datetime import datetime, timezone, timedelta, date
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import text
-from models import BaseGuia
+from models import BaseGuia, Log
+
+
+def _persist_valida_prestador(db: Session, guia_numero: str, codigo_procedimento: str, valida_json: dict) -> int:
+    """
+    Persiste o JSON `valida_prestador` em public.base_guias para a guia identificada
+    por (guia_numero, codigo_procedimento).
+
+    Casamento: prioriza `guia` (numero principal); fallback para `guia_prestador`.
+    Filtra tambem por `codigo_terapia` quando informado, para ambiguidade entre
+    guias com mesmo numero e terapias diferentes.
+
+    Retorna o numero de linhas atualizadas. Em caso de erro, registra Log WARN
+    e retorna 0 (nunca propaga excecao para nao bloquear o consumo do job).
+
+    Estrutura esperada de valida_json (valida_prestador_replication_prompt.yaml):
+        {"tipo_json": "All Sucess"|"Thered"|"Null", "guias": {...}}
+    ou forma simplificada por guia:
+        {"Vinculo_prestador": "Guia Válida"|"...", "codigo_procedimento": "..."}
+    """
+    if not guia_numero:
+        return 0
+    try:
+        q = db.query(BaseGuia).filter(
+            (BaseGuia.guia == str(guia_numero)) | (BaseGuia.guia_prestador == str(guia_numero))
+        )
+        if codigo_procedimento:
+            q = q.filter(BaseGuia.codigo_terapia == str(codigo_procedimento))
+
+        rows = q.all()
+        updated = 0
+        for row in rows:
+            row.valida_prestador = valida_json
+            updated += 1
+        if updated:
+            db.commit()
+        else:
+            # Nao casou nenhuma guia: registra warning para investigacao manual.
+            try:
+                db.add(Log(
+                    level="WARN",
+                    message=(f"[valida_prestador] Guia {guia_numero} (proc={codigo_procedimento}) "
+                             "nao casou com nenhuma linha de base_guias para persistir validacao.")
+                ))
+                db.commit()
+            except Exception:
+                db.rollback()
+        return updated
+    except Exception as e:
+        try:
+            db.rollback()
+            db.add(Log(
+                level="ERROR",
+                message=f"[valida_prestador] Erro ao persistir para guia {guia_numero}: {e}"
+            ))
+            db.commit()
+        except Exception:
+            pass
+        return 0
 
 
 def _parse_date(date_str):
@@ -644,34 +702,79 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             if results_list:
                 if "op1" in rotina or rotina == "1":
                     import unicodedata
+                    from models import Carteirinha, Job as JobModel, Convenio
+
                     def normalize_name(name):
                         if not name:
                             return ""
                         name = name.upper().strip()
                         name = "".join(c for c in unicodedata.normalize('NFD', name) if unicodedata.category(c) != 'Mn')
                         return " ".join(name.split())
-                    
-                    from models import Carteirinha, Job as JobModel
+
+                    # Cache local por execução para evitar queries repetidas
+                    _conv_cache = {}
+
+                    def _resolve_convenio_id(nome_plano_raw):
+                        """Busca convênio por nome EXATO na tabela convenios.
+                        Se não encontrado, insere novo usando próximo ID da sequência.
+                        Retorna id_convenio."""
+                        if not nome_plano_raw:
+                            return 6  # fallback IPASGO
+                        nome_plano = nome_plano_raw.strip()
+                        if nome_plano in _conv_cache:
+                            return _conv_cache[nome_plano]
+                        conv = db.query(Convenio).filter(
+                            Convenio.nome == nome_plano
+                        ).first()
+                        if conv:
+                            _conv_cache[nome_plano] = conv.id_convenio
+                            return conv.id_convenio
+                        # Não encontrado — inserir novo convênio com próximo ID da sequência
+                        from sqlalchemy import text as sa_text
+                        next_id = db.execute(sa_text("SELECT nextval('convenios_id_convenio_seq')")).scalar()
+                        novo_conv = Convenio(
+                            id_convenio=next_id,
+                            nome=nome_plano,
+                            ativo=True
+                        )
+                        db.add(novo_conv)
+                        db.flush()
+                        _conv_cache[nome_plano] = next_id
+                        return next_id
+
                     for p in results_list:
                         id_pac = str(p.get("id_paciente", "")).strip()
                         raw_nome = p.get("paciente", "")
+                        nome_plano = p.get("plano", "").strip()
                         if not id_pac or not raw_nome:
                             continue
                         
                         nome_norm = normalize_name(raw_nome)
+                        id_conv_item = _resolve_convenio_id(nome_plano)
                         
+                        # Buscar por id_paciente primeiro (escopado ao user_id)
                         existing = db.query(Carteirinha).filter(
-                            Carteirinha.carteirinha == id_pac,
+                            Carteirinha.id_paciente == id_pac,
                             Carteirinha.user_id == job.user_id
                         ).first()
+                        
+                        # Fallback: buscar por paciente + convênio + user_id
+                        if not existing:
+                            existing = db.query(Carteirinha).filter(
+                                Carteirinha.paciente == nome_norm,
+                                Carteirinha.id_convenio == id_conv_item,
+                                Carteirinha.user_id == job.user_id
+                            ).first()
+                            if existing and not existing.id_paciente:
+                                existing.id_paciente = id_pac
                         
                         is_new = False
                         if not existing:
                             existing = Carteirinha(
-                                carteirinha=id_pac,
+                                carteirinha=None,  # Será preenchido pelo op2 com o número real do cartão de convênio
                                 paciente=nome_norm,
                                 id_paciente=id_pac,
-                                id_convenio=6, # IPASGO
+                                id_convenio=id_conv_item,
                                 user_id=job.user_id,
                                 status="ativo"
                             )
@@ -679,11 +782,21 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                             db.flush()
                             is_new = True
                         else:
+                            # Atualizar nome e convênio se necessário
                             if existing.paciente != nome_norm:
                                 existing.paciente = nome_norm
+                            if not existing.id_paciente:
+                                existing.id_paciente = id_pac
+                            if nome_plano and existing.id_convenio != id_conv_item:
+                                existing.id_convenio = id_conv_item
                         
                         if is_new:
-                            op2_params = json.dumps({"id_paciente": id_pac})
+                            # Passar id_convenio_pac para o op2 identificar o convênio correto no webhook
+                            op2_params = json.dumps({
+                                "id_paciente": id_pac,
+                                "id_convenio_pac": id_conv_item,
+                                "nome_plano": nome_plano
+                            })
                             op2_job = JobModel(
                                 status="pending",
                                 id_convenio=100,
@@ -706,12 +819,24 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                             db.add(op3_job)
                             
                 elif "op2" in rotina or rotina == "2":
-                    from models import Carteirinha
+                    from models import Carteirinha, BaseGuia, Job as JobModel
+                    # Recuperar id_convenio_pac dos params do job (injetado pelo op1)
+                    try:
+                        job_params_raw = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                    except Exception:
+                        job_params_raw = {}
+                    id_conv_from_job = job_params_raw.get("id_convenio_pac")
+
                     for item in results_list:
                         id_pac = str(item.get("id_paciente", "")).strip()
-                        cart_num = str(item.get("carteirinha", "")).strip()
+                        raw_cart_num = item.get("carteirinha")
+                        cart_num = str(raw_cart_num).strip() if raw_cart_num is not None else ""
+                        # Ignorar se cart_num for dict cru em formato texto, None ou placeholder
+                        if cart_num.startswith('{') or cart_num.startswith('EVOLUIR_') or cart_num.lower() == 'none':
+                            cart_num = ""
+
                         cid_val = str(item.get("cid") or item.get("patologia") or "").strip()
-                        if not cid_val:
+                        if not cid_val or cid_val.lower() == 'none':
                             cid_val = None
                         
                         if not id_pac:
@@ -723,9 +848,39 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                         ).first()
                         
                         if cart:
+                            # Atualizar id_convenio se o op1 passou via job params
+                            if id_conv_from_job and cart.id_convenio != int(id_conv_from_job):
+                                cart.id_convenio = int(id_conv_from_job)
+
                             if cart_num:
                                 cart.codigo_beneficiario = cart_num
-                            if cid_val:
+                                
+                                # Verificar se já existe outra carteirinha com esse cart_num para este mesmo user_id
+                                other_cart = db.query(Carteirinha).filter(
+                                    Carteirinha.carteirinha == cart_num,
+                                    Carteirinha.user_id == job.user_id,
+                                    Carteirinha.id != cart.id
+                                ).first()
+                                
+                                if other_cart:
+                                    # Consolidar: mesclar id_paciente/cid no registro já existente com carteirinha real
+                                    if not other_cart.id_paciente:
+                                        other_cart.id_paciente = id_pac
+                                    if id_conv_from_job and not other_cart.id_convenio:
+                                        other_cart.id_convenio = int(id_conv_from_job)
+                                    if cid_val and not other_cart.cid:
+                                        other_cart.cid = cid_val
+                                    other_cart.codigo_beneficiario = cart_num
+                                    
+                                    db.query(JobModel).filter(JobModel.carteirinha_id == cart.id).update({JobModel.carteirinha_id: other_cart.id}, synchronize_session=False)
+                                    db.query(BaseGuia).filter(BaseGuia.carteirinha_id == cart.id).update({BaseGuia.carteirinha_id: other_cart.id}, synchronize_session=False)
+                                    
+                                    db.delete(cart)
+                                    cart = None
+                                else:
+                                    cart.carteirinha = cart_num
+                            
+                            if cid_val and cart is not None:
                                 cart.cid = cid_val
                                 
                 elif "op3" in rotina or rotina == "3":
@@ -893,10 +1048,20 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                                 )
                                 db.add(new_prof)
                                 synced_counts["inserted"] += 1
+                elif "op7" in rotina or "consultadocs" in rotina:
+                    # OP_consultaDocs gera arquivo Excel e insere excel_url no result_data do Job.
+                    pass
                                 
             job.result_consumed = True
             synced_counts["jobs_processed"] += 1
             db.commit()
+            
+            # Invalidar cache Redis e local do tenant para que as carteirinhas atualizadas fiquem visíveis imediatamente
+            try:
+                from cache import cache
+                cache.invalidate_tenant(job.user_id)
+            except Exception as _ce:
+                pass
             continue
 
         # Se for convênio ABA_clmf (ID 101)
@@ -964,6 +1129,41 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                         Agendamento.Status: "A Confirmar",
                         Agendamento.execucao_status: "concluido"
                     }, synchronize_session=False)
+
+            elif "op6" in rotina or "atualizar_rc" in rotina or rotina == "6":
+                # OP6 ABA_CLMF (101): Atualizar Relatorio Clinico Mensal + baixar PDF.
+                # Resultado vem em result_data como {status, op, paciente, id_paciente,
+                # data_RC, pdf_caminho, pdf_nome}. O Hub apenas registra evento/log;
+                # persistencia adicional (tabela de RCs) fica para versao futura.
+                try:
+                    rd = job.result_data if isinstance(job.result_data, dict) else {}
+                    pdf_caminho = rd.get("pdf_caminho") or rd.get("pdf_path") or ""
+                    paciente = rd.get("paciente", "")
+                    if str(rd.get("status", "")).lower() == "success":
+                        db.add(Log(
+                            job_id=job.id,
+                            user_id=job.user_id,
+                            level="INFO",
+                            message=f"[ABA_clmf OP6] RC atualizado para paciente='{paciente}'. PDF: {pdf_caminho}"
+                        ))
+                    else:
+                        db.add(Log(
+                            job_id=job.id,
+                            user_id=job.user_id,
+                            level="WARN",
+                            message=f"[ABA_clmf OP6] Falha relatada pelo worker: {rd.get('message', '')} (code={rd.get('code', '')})"
+                        ))
+                except Exception as log_e:
+                    # Log de falha de log nao deve impedir o consumo do job.
+                    try:
+                        db.add(Log(
+                            job_id=job.id,
+                            user_id=job.user_id,
+                            level="ERROR",
+                            message=f"[ABA_clmf OP6] Erro ao registrar log de conclusao: {log_e}"
+                        ))
+                    except Exception:
+                        pass
 
             _trigger_next_workflow_node(db, job)
             job.result_consumed = True
@@ -1295,6 +1495,23 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                 db.commit()
                 continue
 
+            # Unimed Goiania (id_convenio=3), rotina op1_consulta:
+            # o worker devolve result_data.valida_prestador com {tipo_json, guias}.
+            # IMPORTANTE: NAO fazemos `continue` aqui - deixamos o fluxo cair no
+            # fallback generico abaixo, que executa bulk_upsert_guias_from_json e
+            # insere/atualiza as guias em public.base_guias. Apos o upsert, aplicamos
+            # o valida_prestador (no finally do loop). Para sinalizar que este job
+            # tem valida_prestador para aplicar, marcamos um flag no synced_counts.
+            if job.id_convenio == 3 and rotina in ["1", "op1_consulta", "consulta_guias"] and res_data:
+                valida = res_data.get("valida_prestador") if isinstance(res_data, dict) else None
+                if isinstance(valida, dict) and valida.get("guias"):
+                    # Flag: apos o bulk_upsert, aplicar valida_prestador para as guias deste job.
+                    synced_counts.setdefault("_pending_valida_prestador", [])
+                    synced_counts["_pending_valida_prestador"].append({
+                        "job_id": job.id,
+                        "valida": valida,
+                    })
+
         results_list = []
         if isinstance(job.result_data, dict):
             # Se for dicionário, pode ter a chave 'data' ou 'op11_data' que contém a lista
@@ -1325,7 +1542,25 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             synced_counts["inserted"] += res.get("inserted", 0)
             synced_counts["updated"] += res.get("updated", 0)
             synced_counts["skipped"] += res.get("skipped", 0)
-            
+
+            # Apos o bulk_upsert, as guias deste job ja existem em base_guias.
+            # Se houver valida_prestador pendente para este job, aplica-lo agora.
+            pending = synced_counts.get("_pending_valida_prestador") or []
+            pending_for_job = [p for p in pending if p.get("job_id") == job.id]
+            if pending_for_job:
+                persisted = 0
+                for entry in pending_for_job:
+                    valida = entry.get("valida") or {}
+                    for guia_num, attr in (valida.get("guias") or {}).items():
+                        codigo_proc = (attr or {}).get("codigo_procedimento") or (attr or {}).get("codigo_terapia")
+                        persisted += _persist_valida_prestador(db, guia_num, codigo_proc, attr or {})
+                synced_counts.setdefault("valida_prestador_persisted", 0)
+                synced_counts["valida_prestador_persisted"] += persisted
+                # Remove da lista de pendentes
+                synced_counts["_pending_valida_prestador"] = [
+                    p for p in pending if p.get("job_id") != job.id
+                ]
+
         job.result_consumed = True
         synced_counts["jobs_processed"] += 1
         

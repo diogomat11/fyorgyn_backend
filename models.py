@@ -50,7 +50,7 @@ class Carteirinha(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    carteirinha = Column(Text, nullable=False)
+    carteirinha = Column(Text, nullable=True)
     paciente = Column(Text, index=True)
     id_paciente = Column(Text, index=True)
     codigo_beneficiario = Column(Text, nullable=True) # ID of user in external system (e.g., IPASGO)
@@ -120,6 +120,9 @@ class BaseGuia(Base):
     sessoes_realizadas = Column(Integer)
     saldo = Column(Integer, default=0, nullable=False)
     timestamp_captura = Column(DateTime(timezone=True), nullable=True)
+    # JSON {tipo_json, guias} resultado da validacao de vinculo do prestador
+    # (Unimed Goiania via getErrosSapia). NULL quando nao validado.
+    valida_prestador = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -433,13 +436,17 @@ class Conselho(Base):
 
 class CorpoClinico(Base):
     __tablename__ = "corpo_clinico"
-    __table_args__ = {'extend_existing': True}
+    __table_args__ = (
+        UniqueConstraint("id_profissional", "area", name="corpo_clinico_id_prof_area_key"),
+        {'extend_existing': True},
+    )
+    id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
 
-    id_profissional = Column(Text, primary_key=True, index=True)
+    id_profissional = Column(Text, index=True)  # medicos importados via CRM ficam NULL
     nome = Column(Text, nullable=False)
     cpf = Column(Text)
-    area = Column(Text, primary_key=True, default='')
+    area = Column(Text, default='')
     conselho = Column(Text)
     registro = Column(Text)
     UF = Column(Text)
@@ -447,6 +454,9 @@ class CorpoClinico(Base):
     codigo_ipasgo = Column(Text)
     status = Column(Text, default="ativo")
     tipo_profissional = Column(Text, default="profissional")
+    # CRM-specific (v3 API Consulta CRM Medico)
+    situacao = Column(Text)  # situacao no conselho (ativo/inativo/cancelado) em lowercase
+    atualizado_crm = Column(DateTime(timezone=True))  # timestamp da ultima consulta CFM
 
 class Agendamento(Base):
     __tablename__ = "agendamentos"

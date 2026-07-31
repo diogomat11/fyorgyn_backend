@@ -1028,13 +1028,20 @@ def list_profissionais(
 ):
     """Retorna a lista de profissionais ativos do corpo clínico, opcionalmente filtrados por tipo (profissional/medico)."""
     query = db.query(CorpoClinico).filter(CorpoClinico.status == "ativo")
-    if not current_user.is_admin:
-        query = query.filter((CorpoClinico.user_id == current_user.id) | (CorpoClinico.user_id.is_(None)))
-    
     if tipo:
         query = query.filter(CorpoClinico.tipo_profissional == tipo)
-        
+
+    # Não-admin vê seus próprios profissionais OU registros globais (user_id IS NULL)
+    # Médicos (tipo_profissional == 'medico') são sempre livres para todos os usuários
+    if not current_user.is_admin:
+        query = query.filter(
+            (CorpoClinico.tipo_profissional == "medico") |
+            (CorpoClinico.user_id == current_user.id) |
+            (CorpoClinico.user_id.is_(None))
+        )
+    
     profissionais = query.order_by(CorpoClinico.nome).all()
+
     return [
         {
             "id_profissional": p.id_profissional,

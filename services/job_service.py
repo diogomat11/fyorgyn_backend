@@ -5,11 +5,45 @@ import random
 from typing import List, Optional
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
-from models import Carteirinha, Convenio, UserConvenio, Job
+from models import Carteirinha, Convenio, UserConvenio, Job, Procedimento
 
 BACKEND_WORKER_URL = os.getenv("BACKEND_WORKER_URL", "http://localhost:8001")
 BPO_API_KEY = os.getenv("BPO_API_KEY", "bpo_secret_api_key_2026")
 MY_WEBHOOK_URL = os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
+
+
+def _get_procedimentos_habilitados(db: Session, id_convenio: int) -> List[str]:
+    """
+    Retorna a lista de codigos_procedimento ativos para o convenio informado.
+
+    Usado para injetar `procedimentos_habilitados` nos params do job quando o
+    convenio requer validacao de prestador (ex.: Unimed Goiania, id_convenio=3).
+    O worker usa essa lista para marcar guias cujo procedimento esta habilitado.
+
+    Retorna lista vazia se nada for encontrado (compativel com worker que trata
+    ausencia da lista como "nao filtrar").
+    """
+    try:
+        rows = db.query(Procedimento.codigo_procedimento).filter(
+            Procedimento.id_convenio == id_convenio,
+            Procedimento.status == "ativo"
+        ).all()
+        return [r[0] for r in rows if r[0]]
+    except Exception:
+        return []
+
+
+def _enrich_params_with_procedimentos(db: Session, id_convenio: Optional[int], p_dict: dict) -> dict:
+    """
+    Enriquece p_dict com `procedimentos_habilitados` para o convenio 3 (Unimed Goiania),
+    conforme especificacao valida_prestador_replication_prompt.yaml.
+    Idempotente: nao sobrescreve se ja presente no payload.
+    """
+    if id_convenio == 3 and "procedimentos_habilitados" not in p_dict:
+        procs = _get_procedimentos_habilitados(db, 3)
+        if procs:
+            p_dict["procedimentos_habilitados"] = procs
+    return p_dict
 
 def _send_jobs_to_worker(jobs_payload: List[dict]) -> int:
     if not jobs_payload:
@@ -68,7 +102,10 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
                 
         # Injetar webhook_url
         p_dict["webhook_url"] = MY_WEBHOOK_URL
-        
+
+        # Enriquecer com procedimentos_habilitados (Unimed Goiania, id_convenio=3)
+        p_dict = _enrich_params_with_procedimentos(db, target_conv_id, p_dict)
+
         job_data = {
             "carteirinha_id": cart.id,
             "id_convenio": target_conv_id,
@@ -79,7 +116,7 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
             "max_attempts": 3
         }
         jobs_payload.append(job_data)
-        
+
     return _send_jobs_to_worker(jobs_payload)
 
 def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None, user_id: Optional[int] = None) -> int:
@@ -118,7 +155,10 @@ def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Opti
                 p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
                 
         p_dict["webhook_url"] = MY_WEBHOOK_URL
-        
+
+        # Enriquecer com procedimentos_habilitados (Unimed Goiania, id_convenio=3)
+        p_dict = _enrich_params_with_procedimentos(db, target_conv_id, p_dict)
+
         job_data = {
             "carteirinha_id": cart.id,
             "id_convenio": target_conv_id,
@@ -129,7 +169,7 @@ def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Opti
             "max_attempts": 3
         }
         jobs_payload.append(job_data)
-        
+
     return _send_jobs_to_worker(jobs_payload)
 
 def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: Optional[int] = None, rotina: Optional[str] = None, params: Optional[str] = None, user_id: Optional[int] = None) -> int:
@@ -181,7 +221,10 @@ def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: O
             p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
             
     p_dict["webhook_url"] = MY_WEBHOOK_URL
-    
+
+    # Enriquecer com procedimentos_habilitados (Unimed Goiania, id_convenio=3)
+    p_dict = _enrich_params_with_procedimentos(db, id_convenio, p_dict)
+
     job_data = {
         "carteirinha_id": cart_id,
         "id_convenio": id_convenio,
@@ -191,7 +234,7 @@ def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: O
         "params": p_dict,
         "max_attempts": 3
     }
-    
+
     _send_jobs_to_worker([job_data])
     return 1
 

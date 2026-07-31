@@ -130,6 +130,12 @@ def list_guias(
 
 
 
+    # Rotinas internas de sistema que NÃO devem aparecer no modal de Solicitações
+    _ROTINAS_SISTEMA_EVOLUIR = [
+        "op2_obterDetalhes", "op3_ListarPTS", "op5_ImportCorpoClinico",
+        "op1_importPacientes", "op6_baixarFaturados", "op4_atualizarDataPTS",
+    ]
+
     # Fetch active/failed jobs when looking at solicitacoes
     jobs_data = []
     if aba == "solicitacoes":
@@ -139,6 +145,8 @@ def list_guias(
             job_query = job_query.filter(Job.user_id == current_user.id)
         if id_convenio:
             job_query = job_query.filter(Job.id_convenio == id_convenio)
+        # Excluir jobs de rotinas internas de sistema
+        job_query = job_query.filter(~Job.rotina.in_(_ROTINAS_SISTEMA_EVOLUIR))
         if status:
             status_lower = status.lower()
             if "pendente" in status_lower:

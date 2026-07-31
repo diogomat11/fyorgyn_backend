@@ -433,17 +433,18 @@ def create_jobs(
             '14', 'op14_cancelar_lote'
         ]) or (target_convenio == 100 and request.rotina in [
             '1', 'op1', 'op1_importPacientes', 'op5_ImportCorpoClinico',
-            'op6_baixarFaturados', 'op4_atualizarDataPTS'
+            'op6_baixarFaturados', 'op4_atualizarDataPTS',
+            '7', 'op7', 'op7_consultaDocs', 'OP_consultaDocs'
         ]) or (target_convenio == 101 and request.rotina in [
-            'op1_importar_agendamentos'
+            'op1_importar_agendamentos', 'op6_atualizar_rc'
         ])
-        
+
         if not request.carteirinha_ids:
             if is_standalone and request.type == 'single':
                 # Forward standalone job to backend_worker
                 p_dict = json.loads(request.params) if request.params else {}
                 p_dict["webhook_url"] = os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
-                
+
                 # Enrich with user credentials if convenio is set
                 if target_convenio and current_user.id:
                     uconv = db.query(UserConvenio).filter(
@@ -456,7 +457,11 @@ def create_jobs(
                         p_dict["cod_prestador"] = p_dict.get("cod_prestador") or uconv.cod_prestador
                         p_dict["login_fat"] = p_dict.get("login_fat") or uconv.login_fat
                         p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
-                
+
+                # Enriquecer com procedimentos_habilitados (Unimed Goiania, id_convenio=3)
+                from services.job_service import _enrich_params_with_procedimentos
+                p_dict = _enrich_params_with_procedimentos(db, target_convenio, p_dict)
+
                 job_payload = {
                     "carteirinha_id": None,
                     "id_convenio": target_convenio,
@@ -466,7 +471,7 @@ def create_jobs(
                     "params": p_dict,
                     "max_attempts": 3
                 }
-                
+
                 from services.job_service import _send_jobs_to_worker
                 _send_jobs_to_worker([job_payload])
                 created_count = 1
@@ -900,7 +905,13 @@ def list_jobs(
             "timeout": j.timeout,
             "created_at": localize_datetime(j.created_at),
             "updated_at": localize_datetime(j.updated_at),
-            "error_message": None
+            "error_message": None,
+            # valida_prestador: extrai do result_data (que esta com defer) apenas o
+            # bloco de validacao de prestador, para alimentar o modal/tooltip do frontend
+            # sem expor o result_data completo (que pode ser grande).
+            "valida_prestador": (j.result_data or {}).get("valida_prestador") if isinstance(j.result_data, dict) else None,
+            "excel_url": (j.result_data or {}).get("excel_url") if isinstance(j.result_data, dict) else None,
+            "total_documentos": (j.result_data or {}).get("total_documentos") if isinstance(j.result_data, dict) else None,
         }
         if j.status == 'error':
             last_err_msg = error_logs_map.get(j.id)
@@ -915,6 +926,30 @@ def list_jobs(
     res_payload = {"data": results, "total": total, "skip": skip, "limit": limit}
     cache.set(current_user.id, "jobs", cache_params, res_payload, ttl=15)
     return res_payload
+
+@router.get("/{id}")
+def get_job_detail(id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """Retorna detalhes completos de um job incluindo result_data e link para download de relatórios Excel."""
+    job = db.query(Job).filter(Job.id == id).first()
+    if not job:
+        raise HTTPException(404, "Job não encontrado")
+    if not current_user.is_admin and job.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para visualizar este job.")
+
+    job_data = {
+        "id": job.id,
+        "id_convenio": job.id_convenio,
+        "rotina": job.rotina,
+        "params": job.params,
+        "status": job.status,
+        "attempts": job.attempts,
+        "priority": job.priority,
+        "result_data": job.result_data,
+        "excel_url": (job.result_data or {}).get("excel_url") if isinstance(job.result_data, dict) else None,
+        "created_at": localize_datetime(job.created_at),
+        "updated_at": localize_datetime(job.updated_at)
+    }
+    return job_data
 
 @router.delete("/{id}")
 def delete_job(id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
