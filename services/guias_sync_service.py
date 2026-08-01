@@ -1176,7 +1176,7 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             rotina = str(job.rotina).lower()
             res_data = job.result_data
             
-            if rotina == "6" and res_data:
+            if (rotina in ["6", "op6", "op6_check_baixados"]) and res_data:
                 import json
 
                 p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
@@ -1322,7 +1322,7 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                 db.commit()
                 continue
                 
-            elif rotina == "7" and isinstance(res_data, dict):
+            elif (rotina in ["7", "op7", "op7_fat_facplan"]) and isinstance(res_data, dict):
                 itens_sucesso = res_data.get("itens_sucesso", [])
                 p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
                 status_env = p_params.get("status")
@@ -1347,7 +1347,7 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                 db.commit()
                 continue
                 
-            elif rotina == "13" and isinstance(res_data, dict):
+            elif (rotina in ["13", "op13", "op13_criar_lote"]) and isinstance(res_data, dict):
                 id_lote_interno = res_data.get("id_lote_interno")
                 cod_prestador = res_data.get("cod_prestador")
                 data_fim = res_data.get("data_fim")
@@ -1385,7 +1385,7 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                 db.commit()
                 continue
                 
-            elif rotina == "13_poll" and isinstance(res_data, dict):
+            elif (rotina in ["13_poll", "op13_poll"]) and isinstance(res_data, dict):
                 status_lote = res_data.get("status")
                 id_lote_interno = res_data.get("id_lote_interno")
                 lote_id_api = res_data.get("lote_id_api")
@@ -1441,7 +1441,7 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                 db.commit()
                 continue
                 
-            elif rotina == "14":
+            elif rotina in ["14", "op14", "op14_cancelar_lote"]:
                 import json
                 p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
                 id_lote_interno = p_params.get("id_lote_interno")
