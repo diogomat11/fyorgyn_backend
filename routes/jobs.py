@@ -446,6 +446,8 @@ def create_jobs(
             '7', 'op7', 'op7_consultaDocs', 'OP_consultaDocs'
         ]) or (target_convenio == 101 and request.rotina in [
             'op1_importar_agendamentos', 'op6_atualizar_rc'
+        ]) or (target_convenio == 3 and request.rotina in [
+            '4', 'op4_finalizados', 'finalizados', 'exames_finalizados',
         ])
 
         if not request.carteirinha_ids:
@@ -1158,3 +1160,256 @@ def receive_worker_webhook(
         background_tasks.add_task(sync_completed_worker_jobs_bg)
             
     return {"status": "success", "message": f"Webhook processado com sucesso para o Job {payload.job_id}"}
+
+
+# ──────────────────────────────────────────────────────────────────
+#  OP4 – Unimed Goiânia: Exames Finalizados
+# ──────────────────────────────────────────────────────────────────
+
+class CreateGoianiaOp4Request(BaseModel):
+    data_ini: str               # "DD/MM/YYYY"
+    data_fim: str               # "DD/MM/YYYY"
+    guia: Optional[str] = ""   # Nº guia (filtro opcional)
+    id_lote: Optional[int] = None  # id_lote interno para vínculo (opcional)
+
+
+@router.post("/goiania/op4", status_code=202)
+def create_goiania_op4_job(
+    request: CreateGoianiaOp4Request,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """
+    Cria um job OP4 (Exames Finalizados) para a Unimed Goiânia (id_convenio=3).
+
+    - Enriquece os params com credenciais do usuário (login, senha_criptografada, cod_prestador).
+    - Injeta webhook_url para callback ao Backend Hub.
+    - Envia o job ao backend_worker via POST /api/v1/jobs/batch.
+    - O backend_worker grava no schema worker para consumo pelo Local_worker.
+    - O resultado retorna via POST /api/jobs/webhook/goiania/op4.
+    """
+    from dependencies import get_allowed_convenio_ids
+    from services.job_service import _send_jobs_to_worker
+
+    ID_CONVENIO = 3
+
+    allowed_ids = get_allowed_convenio_ids(current_user)
+    if allowed_ids and ID_CONVENIO not in allowed_ids:
+        raise HTTPException(status_code=403, detail="Sem permissão para a Unimed Goiânia.")
+
+    # Buscar credenciais do usuário para Unimed Goiânia
+    uconv = db.query(UserConvenio).filter(
+        UserConvenio.user_id == current_user.id,
+        UserConvenio.id_convenio == ID_CONVENIO
+    ).first()
+    if not uconv or not uconv.login or not uconv.senha_criptografada:
+        raise HTTPException(
+            status_code=400,
+            detail="Credenciais da Unimed Goiânia não configuradas para este usuário."
+        )
+
+    webhook_url = os.getenv(
+        "MY_WEBHOOK_URL",
+        "http://localhost:8000/api/jobs/webhook"
+    ).rstrip("/webhook").rstrip("/jobs/webhook")
+    webhook_url = f"{webhook_url}/api/jobs/webhook/goiania/op4"
+
+    params = {
+        "data_ini": request.data_ini,
+        "data_fim": request.data_fim,
+        "guia": request.guia or "",
+        "login": uconv.login,
+        "senha_criptografada": uconv.senha_criptografada,
+        "cod_prestador": uconv.cod_prestador or "",
+        "codigoPrestador": uconv.cod_prestador or "",
+        "id_lote": request.id_lote,
+        "webhook_url": webhook_url,
+    }
+
+    job_payload = {
+        "carteirinha_id": None,
+        "id_convenio": ID_CONVENIO,
+        "user_id": current_user.id,
+        "rotina": "4",
+        "priority": 0,
+        "params": params,
+        "max_attempts": 3,
+    }
+
+    _send_jobs_to_worker([job_payload])
+
+    return {
+        "message": "Job OP4 – Exames Finalizados enviado ao worker.",
+        "convenio": "Unimed Goiânia",
+        "params": {k: v for k, v in params.items() if k not in ("login", "senha_criptografada")},
+    }
+
+
+@router.post("/webhook/goiania/op4")
+def receive_goiania_op4_webhook(
+    payload: dict = Body(...),
+    background_tasks: BackgroundTasks = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Webhook recebido do backend_worker após conclusão do job OP4 Unimed Goiânia.
+
+    Payload esperado (enviado pelo Local_worker via backend_worker):
+    {
+      "job_id": 123,
+      "status": "success" | "error",
+      "rotina": "4",
+      "id_convenio": 3,
+      "user_id": 1,
+      "params": { "id_lote": 42, ... },
+      "result_data": {
+        "data": [
+          {
+            "cd_guia": "68864313",
+            "guia": "70138883",
+            "carteirinha": "0064.8000.048579.00-2",
+            "paciente": "FULANO DE TAL",
+            "data_atendimento": "08/08/2026",
+            "data_nascimento": "03/01/2012",
+            "cid": "F84",
+            "cod_procedimento": "2250005103",
+            "status_biometria": "sucesso",
+            "series": [
+              {"seq": 1, "data": "08/08/2026", "hora": "09:56"},
+              {"seq": 2, "data": "08/08/2026", "hora": "10:10"}
+            ]
+          },
+          ...
+        ]
+      }
+    }
+
+    Gera detalhe_id = int(cd_guia + str(seq)) por série.
+    Insere em faturamento_lotes com idempotência (detalheId único).
+    """
+    from models import FaturamentoLote, LoteConvenio
+
+    job_id = payload.get("job_id")
+    status_job = payload.get("status", "success")
+    result_data = payload.get("result_data") or {}
+    params_job = payload.get("params") or {}
+    user_id = payload.get("user_id") or 1
+    id_convenio = payload.get("id_convenio", 3)
+
+    print(f"[OP4 Webhook] Job {job_id} — status={status_job}")
+
+    # Atualizar (ou criar) o registro do job no schema public
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        job = Job(
+            id=job_id,
+            status=status_job,
+            id_convenio=id_convenio,
+            rotina="4",
+            params=params_job,
+            result_data=result_data,
+            result_consumed=False,
+            user_id=user_id,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        db.add(job)
+    else:
+        job.status = status_job
+        job.result_data = result_data
+        job.result_consumed = False
+        job.updated_at = datetime.now(timezone.utc)
+    db.flush()
+
+    if status_job != "success":
+        db.commit()
+        return {"status": "registered", "message": f"Job {job_id} marcado como {status_job}."}
+
+    # ── Parse e insert em faturamento_lotes ──
+    guias = []
+    if isinstance(result_data, dict):
+        guias = result_data.get("data", [])
+    elif isinstance(result_data, list):
+        guias = result_data
+
+    id_lote = params_job.get("id_lote") or None
+
+    inserted = 0
+    skipped = 0
+
+    for guia in guias:
+        if not isinstance(guia, dict):
+            continue
+
+        cd_guia = str(guia.get("cd_guia") or "").strip()
+        nr_guia = str(guia.get("guia") or "").strip()
+        carteirinha = str(guia.get("carteirinha") or "").strip()
+        cod_proc = str(guia.get("cod_procedimento") or "").strip()
+        series = guia.get("series") or []
+
+        # Data do atendimento (data da listagem) — fallback para a série
+        data_atendimento_str = str(guia.get("data_atendimento") or "").strip()
+
+        for serie in series:
+            if not isinstance(serie, dict):
+                continue
+            seq = serie.get("seq")
+            if seq is None:
+                continue
+
+            # detalhe_id = cd_guia concatenado com seq (sem separador)
+            try:
+                detalhe_id = int(f"{cd_guia}{int(seq)}")
+            except (ValueError, TypeError):
+                print(f"[OP4 Webhook] detalhe_id inválido: cd_guia={cd_guia} seq={seq}")
+                continue
+
+            # Idempotência: pular se já existe
+            existing = db.query(FaturamentoLote).filter(
+                FaturamentoLote.detalheId == detalhe_id
+            ).first()
+            if existing:
+                skipped += 1
+                continue
+
+            # Data de realização = data da série
+            data_serie_str = str(serie.get("data") or "").strip()
+            hora_serie_str = str(serie.get("hora") or "").strip()
+            data_realizacao = None
+            try:
+                from datetime import datetime as _dt, date as _date
+                if data_serie_str:
+                    data_realizacao = _dt.strptime(data_serie_str, "%d/%m/%Y").date()
+                elif data_atendimento_str:
+                    # Atendimento pode ter hora: "08/08/2026 10:51"
+                    data_realizacao = _dt.strptime(
+                        data_atendimento_str.split()[0], "%d/%m/%Y"
+                    ).date()
+            except Exception:
+                pass
+
+            fat = FaturamentoLote(
+                detalheId=detalhe_id,
+                id_lote=id_lote,
+                user_id=user_id,
+                CodigoBeneficiario=carteirinha or None,
+                Guia=nr_guia or None,
+                dataRealizacao=data_realizacao,
+                cod_procedimento_fat=cod_proc or None,
+                StatusConciliacao="Não Conciliado",
+                StatusConferencia=0,
+            )
+            db.add(fat)
+            inserted += 1
+
+    job.result_consumed = True
+    db.commit()
+
+    print(f"[OP4 Webhook] Job {job_id}: {inserted} itens inseridos, {skipped} ignorados (duplicados).")
+    return {
+        "status": "success",
+        "job_id": job_id,
+        "inserted": inserted,
+        "skipped": skipped,
+    }
+
