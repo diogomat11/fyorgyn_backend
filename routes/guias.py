@@ -350,13 +350,8 @@ def export_guias(
         wb = Workbook(write_only=True)
         ws = wb.create_sheet("Guias")
         
-        is_ipasgo = (id_convenio == 6)
-        if is_ipasgo:
-            headers = ["Carteirinha", "Paciente", "Guia", "Senha", "Status", "Data Solicitacao", 
-                       "Data Autorizacao", "Codigo", "Qtde Solicit", "Qtde Aut", "Validade", "Data Importacao"]
-        else:
-            headers = ["Carteirinha", "Paciente", "Guia", "Data_Autorização", "Senha", 
-                       "Validade", "Código_Terapia", "Qtde_Solicitada", "Sessões Autorizadas", "Importado_Em"]
+        headers = ["Carteirinha", "Paciente", "Guia", "Senha", "Status", "Data Solicitacao", 
+                   "Data Autorizacao", "Codigo", "Qtde Solicit", "Qtde Aut", "Validade", "Data Importacao"]
         ws.append(headers)
         
         # Helper to format date
@@ -421,34 +416,20 @@ def export_guias(
         count = 0
         for row in results:
             count += 1
-            if is_ipasgo:
-                ws.append([
-                    row.carteirinha or row.codigo_beneficiario or "",
-                    row.paciente or "",
-                    row.guia,
-                    row.senha,
-                    row.status_guia,
-                    fmt_date(row.data_solicitacao),
-                    fmt_date(row.data_autorizacao),
-                    row.codigo_terapia,
-                    row.qtde_solicitada,
-                    row.sessoes_autorizadas,
-                    fmt_date(row.validade),
-                    row.created_at.strftime("%d/%m/%Y %H:%M:%S") if row.created_at else ""
-                ])
-            else:
-                ws.append([
-                    row.carteirinha or row.codigo_beneficiario or "",
-                    row.paciente or "",
-                    row.guia,
-                    fmt_date(row.data_autorizacao),
-                    row.senha,
-                    fmt_date(row.validade),
-                    row.codigo_terapia,
-                    row.qtde_solicitada,
-                    row.sessoes_autorizadas,
-                    row.created_at.strftime("%d/%m/%Y %H:%M:%S") if row.created_at else ""
-                ])
+            ws.append([
+                row.carteirinha or row.codigo_beneficiario or "",
+                row.paciente or "",
+                row.guia,
+                row.senha,
+                row.status_guia,
+                fmt_date(row.data_solicitacao),
+                fmt_date(row.data_autorizacao),
+                row.codigo_terapia,
+                row.qtde_solicitada,
+                row.sessoes_autorizadas,
+                fmt_date(row.validade),
+                row.created_at.strftime("%d/%m/%Y %H:%M:%S") if row.created_at else ""
+            ])
 
         print(f"DEBUG: Processed {count} rows. Saving Workbook...")
         output = io.BytesIO()

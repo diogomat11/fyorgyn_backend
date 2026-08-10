@@ -4,6 +4,7 @@ Consome JSON retornado pelo worker e insere/atualiza em base_guias via INSERT ON
 
 Substitui o loop row-by-row do dispatcher por uma única query batch.
 """
+import json
 from datetime import datetime, timezone, timedelta, date
 
 from sqlalchemy.orm import Session
@@ -102,7 +103,6 @@ def _trigger_next_workflow_node(db: Session, job):
         return
 
     from models import UserConvenioWorkflow, Job as JobModel
-    import json
 
     wf = db.query(UserConvenioWorkflow).filter(
         UserConvenioWorkflow.user_id == job.user_id,
@@ -695,7 +695,6 @@ def sync_completed_worker_jobs(db: Session) -> dict:
 
         # Se for convênio Evoluir (ID 100)
         if job.id_convenio == 100:
-            import json
             rotina = str(job.rotina).lower()
             results_list = _extract_results_list(job.result_data)
             
@@ -1066,7 +1065,6 @@ def sync_completed_worker_jobs(db: Session) -> dict:
 
         # Se for convênio ABA_clmf (ID 101)
         if job.id_convenio == 101:
-            import json
             rotina = str(job.rotina).lower()
             results_list = _extract_results_list(job.result_data)
 
@@ -1177,8 +1175,6 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             res_data = job.result_data
             
             if (rotina in ["6", "op6", "op6_check_baixados"]) and res_data:
-                import json
-
                 p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
                 numero_lote = p_params.get("numero_lote", p_params.get("loteId"))
                 codigo_prestador = p_params.get("codigoPrestador", "")
@@ -1442,7 +1438,6 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                 continue
                 
             elif rotina in ["14", "op14", "op14_cancelar_lote"]:
-                import json
                 p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
                 id_lote_interno = p_params.get("id_lote_interno")
                 numero_lote = p_params.get("numero_lote")
@@ -1680,7 +1675,6 @@ def _sync_aba_clmf_op1(db: Session, job, agendamentos_data: list, synced_counts:
     Garante que 100% dos agendamentos do JSON sejam salvos imediatamente na tabela agendamentos em alta velocidade.
     """
     from models import Agendamento, Carteirinha, Convenio, Job as JobModel
-    import json
 
     if not agendamentos_data:
         return
@@ -1911,7 +1905,6 @@ def _sync_aba_clmf_op2(db: Session, job, results_list: list, synced_counts: dict
     Mapeia e cria carteirinhas vinculadas ao convenio de saude REAL (nunca 101) e atualiza agendamentos.
     """
     from models import Carteirinha, Convenio, Agendamento
-    import json
 
     for res in results_list:
         if not isinstance(res, dict):

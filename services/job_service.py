@@ -96,7 +96,16 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
             if uconv:
                 p_dict["login"] = p_dict.get("login") or uconv.login
                 p_dict["senha_criptografada"] = p_dict.get("senha_criptografada") or uconv.senha_criptografada
-                p_dict["cod_prestador"] = p_dict.get("cod_prestador") or uconv.cod_prestador
+                
+                req_prestador = (
+                    (p_dict.get("cod_prestador") if isinstance(p_dict.get("cod_prestador"), str) and p_dict.get("cod_prestador").strip() else None) or
+                    (p_dict.get("codigoPrestador") if isinstance(p_dict.get("codigoPrestador"), str) and p_dict.get("codigoPrestador").strip() else None) or
+                    (p_dict.get("prestador") if isinstance(p_dict.get("prestador"), str) and p_dict.get("prestador").strip() else None)
+                )
+                final_prestador = req_prestador or uconv.cod_prestador or ""
+                p_dict["cod_prestador"] = final_prestador
+                p_dict["codigoPrestador"] = final_prestador
+
                 p_dict["login_fat"] = p_dict.get("login_fat") or uconv.login_fat
                 p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
                 
@@ -150,7 +159,16 @@ def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Opti
             if uconv:
                 p_dict["login"] = p_dict.get("login") or uconv.login
                 p_dict["senha_criptografada"] = p_dict.get("senha_criptografada") or uconv.senha_criptografada
-                p_dict["cod_prestador"] = p_dict.get("cod_prestador") or uconv.cod_prestador
+                
+                req_prestador = (
+                    (p_dict.get("cod_prestador") if isinstance(p_dict.get("cod_prestador"), str) and p_dict.get("cod_prestador").strip() else None) or
+                    (p_dict.get("codigoPrestador") if isinstance(p_dict.get("codigoPrestador"), str) and p_dict.get("codigoPrestador").strip() else None) or
+                    (p_dict.get("prestador") if isinstance(p_dict.get("prestador"), str) and p_dict.get("prestador").strip() else None)
+                )
+                final_prestador = req_prestador or uconv.cod_prestador or ""
+                p_dict["cod_prestador"] = final_prestador
+                p_dict["codigoPrestador"] = final_prestador
+
                 p_dict["login_fat"] = p_dict.get("login_fat") or uconv.login_fat
                 p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
                 
@@ -216,7 +234,16 @@ def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: O
         if uconv:
             p_dict["login"] = p_dict.get("login") or uconv.login
             p_dict["senha_criptografada"] = p_dict.get("senha_criptografada") or uconv.senha_criptografada
-            p_dict["cod_prestador"] = p_dict.get("cod_prestador") or uconv.cod_prestador
+            
+            req_prestador = (
+                (p_dict.get("cod_prestador") if isinstance(p_dict.get("cod_prestador"), str) and p_dict.get("cod_prestador").strip() else None) or
+                (p_dict.get("codigoPrestador") if isinstance(p_dict.get("codigoPrestador"), str) and p_dict.get("codigoPrestador").strip() else None) or
+                (p_dict.get("prestador") if isinstance(p_dict.get("prestador"), str) and p_dict.get("prestador").strip() else None)
+            )
+            final_prestador = req_prestador or uconv.cod_prestador or ""
+            p_dict["cod_prestador"] = final_prestador
+            p_dict["codigoPrestador"] = final_prestador
+
             p_dict["login_fat"] = p_dict.get("login_fat") or uconv.login_fat
             p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
             

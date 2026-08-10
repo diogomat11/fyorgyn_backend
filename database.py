@@ -13,26 +13,35 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 DB_USER = os.getenv("SUPABASE_DB_USER", "postgres")
 DB_PASSWORD = os.getenv("SUPABASE_PASSWORD", "")
-DB_HOST = os.getenv("SUPABASE_DB_HOST", "")
+DB_HOST = os.getenv("SUPABASE_DB_HOST", "db.ourddwzetcbdjnbvamgj.supabase.co")
 DB_PORT = os.getenv("SUPABASE_DB_PORT", "5432")
 DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
 
-# Construct URL
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
-if not SQLALCHEMY_DATABASE_URL:
-    SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# Prefer direct Supabase PostgreSQL connection via SUPABASE_DB_HOST to bypass PgBouncer limits
+if DB_HOST and "supabase.co" in DB_HOST and DB_PASSWORD:
+    SQLALCHEMY_DATABASE_URL = f"postgresql://postgres:{DB_PASSWORD}@{DB_HOST}:5432/{DB_NAME}"
+else:
+    SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
+    if not SQLALCHEMY_DATABASE_URL:
+        SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    if SQLALCHEMY_DATABASE_URL and ":6543" in SQLALCHEMY_DATABASE_URL:
+        SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(":6543", ":5432")
 
-# If variables are missing, fallback or error (but we'll assume they are there as per user context)
-# Note: For Supabase transaction pooler (port 6543), we might need to disable statement cache working with sqlalchemy
-# engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True)
-from sqlalchemy.pool import NullPool
-
-# Disable prepared statements for Supabase Transaction Pooler (port 6543) support
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, 
-    poolclass=NullPool,
+    use_native_hstore=False,
+    pool_size=10,
+    max_overflow=20,
+    pool_timeout=30,
+    pool_recycle=300,
     pool_pre_ping=True,
-    connect_args={"prepare_threshold": None} 
+    connect_args={
+        "prepare_threshold": None,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5
+    } 
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

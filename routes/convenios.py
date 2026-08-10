@@ -14,6 +14,7 @@ router = APIRouter(
 
 class ConvenioBase(BaseModel):
     nome: str
+    digitos_carteirinha: Optional[int] = None
 
 class ConvenioCreate(ConvenioBase):
     pass
@@ -21,6 +22,7 @@ class ConvenioCreate(ConvenioBase):
 class ConvenioUpdate(BaseModel):
     nome: Optional[str] = None
     registro_ans: Optional[str] = None
+    digitos_carteirinha: Optional[int] = None
 
 from pydantic import Field
 
@@ -35,6 +37,7 @@ class ConvenioOperacaoResponse(BaseModel):
 class ConvenioResponse(ConvenioBase):
     id_convenio: int
     registro_ans: Optional[str] = None
+    digitos_carteirinha: Optional[int] = None
     operacoes: List[ConvenioOperacaoResponse] = Field(default=[], validation_alias="operacoes_rel")
     
     class Config:
@@ -107,6 +110,7 @@ def update_convenio(id_convenio: int, conv: ConvenioUpdate, db: Session = Depend
     
     if conv.nome: db_conv.nome = conv.nome
     if conv.registro_ans is not None: db_conv.registro_ans = conv.registro_ans
+    if conv.digitos_carteirinha is not None: db_conv.digitos_carteirinha = conv.digitos_carteirinha
     
     db.commit()
     db.refresh(db_conv)

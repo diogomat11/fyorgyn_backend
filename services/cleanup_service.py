@@ -110,6 +110,8 @@ def cleanup_expired_attachments(db: Session):
             logger.info(f"Cleanup: Total de {removed_count} arquivos de anexos expirados removidos.")
     except Exception as e:
         logger.error(f"Cleanup: Erro ao limpar anexos de jobs finalizados: {e}")
+        try: db.rollback()
+        except Exception: pass
         
     # 2. Limpar arquivos órfãos com mais de 48 horas (ex: uploads não submetidos)
     try:

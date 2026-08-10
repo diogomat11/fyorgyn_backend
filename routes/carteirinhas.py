@@ -184,7 +184,11 @@ async def upload_carteirinhas(
                 req_len = convenio_digits_map.get(target_convenio)
                 if req_len:
                     digits_only = ''.join(filter(str.isdigit, cart))
-                    if len(digits_only) != req_len:
+                    if req_len == 21:
+                        if len(cart) != 21 and len(digits_only) not in (17, 21):
+                            errors.append(f"Linha {index+2}: Carteirinha {cart} inválida para este convênio. Esperado 21 caracteres.")
+                            continue
+                    elif len(digits_only) != req_len and len(cart) != req_len:
                          errors.append(f"Linha {index+2}: Carteirinha {cart} inválida para este convênio. Esperado {req_len} dígitos, recebeu {len(digits_only)}.")
                          continue
                 

@@ -682,10 +682,12 @@ def editar_item(
 @router.get("/candidatos/{id_faturamento_lote}")
 def listar_candidatos(
     id_faturamento_lote: int,
+    id_lote_convenio: Optional[int] = None,
+    id_lote_agendamento: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """Lista agendamentos candidatos para conciliação manual baseado na guia do item."""
+    """Lista agendamentos candidatos para conciliação manual baseado na guia do item e restrito ao convênio e lote selecionado."""
     fat = db.query(FaturamentoLote).filter(FaturamentoLote.id == id_faturamento_lote).first()
     if not fat:
         raise HTTPException(status_code=404, detail="Item de faturamento não encontrado.")
@@ -695,11 +697,22 @@ def listar_candidatos(
     if not fat.Guia:
         return {"data": [], "message": "Item sem guia vinculada."}
     
-    # Buscar agendamentos que tenham a mesma guia
+    # Se id_lote_convenio for passado e o item de faturamento pertencer a outro lote, retorna vazio
+    if id_lote_convenio and fat.id_lote and fat.id_lote != id_lote_convenio:
+        return {"data": [], "message": "Item não pertence ao lote de convênio selecionado."}
+
+    # Buscar agendamentos que tenham a mesma guia e pertençam ao mesmo convênio do item/lote
     query_ag = db.query(Agendamento).filter(
         Agendamento.numero_guia == fat.Guia,
         Agendamento.Status == "Confirmado"
     )
+    if fat.id_convenio:
+        query_ag = query_ag.filter(Agendamento.id_convenio == fat.id_convenio)
+
+    if id_lote_agendamento:
+        subq_lote_ag = db.query(LoteAgendamentoItem.id_agendamento).filter(LoteAgendamentoItem.id_lote_ag == id_lote_agendamento).subquery()
+        query_ag = query_ag.filter(Agendamento.id_agendamento.in_(subq_lote_ag))
+
     if not current_user.is_admin:
         query_ag = query_ag.filter(Agendamento.user_id == current_user.id)
     agendamentos = query_ag.all()
@@ -728,18 +741,28 @@ def listar_candidatos(
 def listar_candidatos_fat_por_guia(
     numero_guia: str,
     id_lote_convenio: Optional[int] = None,
+    id_agendamento: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """Lista itens de faturamento candidatos a partir de uma guia (busca do lado agendamento)."""
+    """Lista itens de faturamento candidatos a partir de uma guia (busca do lado agendamento), restritos ao lote selecionado."""
     query = db.query(FaturamentoLote).filter(
         FaturamentoLote.Guia == numero_guia,
         FaturamentoLote.agendamento_id.is_(None)
     )
     if not current_user.is_admin:
         query = query.filter(FaturamentoLote.user_id == current_user.id)
+    
+    target_convenio_id = None
+    if id_agendamento:
+        ag = db.query(Agendamento).filter(Agendamento.id_agendamento == id_agendamento).first()
+        if ag and ag.id_convenio:
+            target_convenio_id = ag.id_convenio
+
     if id_lote_convenio:
         query = query.filter(FaturamentoLote.id_lote == id_lote_convenio)
+    elif target_convenio_id:
+        query = query.filter(FaturamentoLote.id_convenio == target_convenio_id)
     
     fats = query.all()
     data = []
