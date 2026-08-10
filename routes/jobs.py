@@ -1208,6 +1208,30 @@ def create_goiania_op4_job(
             detail="Credenciais da Unimed Goiânia não configuradas para este usuário."
         )
 
+    # ── Criar ou reutilizar LoteConvenio ──
+    id_lote = request.id_lote
+    if not id_lote:
+        from models import LoteConvenio
+        from datetime import datetime as _dt
+        dt_ini = dt_fim = None
+        try:
+            if request.data_ini: dt_ini = _dt.strptime(request.data_ini, "%d/%m/%Y").date()
+            if request.data_fim: dt_fim = _dt.strptime(request.data_fim, "%d/%m/%Y").date()
+        except Exception:
+            pass
+
+        novo_lote = LoteConvenio(
+            id_convenio=ID_CONVENIO,
+            user_id=current_user.id,
+            cod_prestador=uconv.cod_prestador or "",
+            status="Aberto",
+            data_inicio=dt_ini,
+            data_fim=dt_fim,
+        )
+        db.add(novo_lote)
+        db.flush()
+        id_lote = novo_lote.id_lote
+
     webhook_url = os.getenv(
         "MY_WEBHOOK_URL",
         "http://localhost:8000/api/jobs/webhook"
@@ -1222,7 +1246,7 @@ def create_goiania_op4_job(
         "senha_criptografada": uconv.senha_criptografada,
         "cod_prestador": uconv.cod_prestador or "",
         "codigoPrestador": uconv.cod_prestador or "",
-        "id_lote": request.id_lote,
+        "id_lote": id_lote,
         "webhook_url": webhook_url,
     }
 

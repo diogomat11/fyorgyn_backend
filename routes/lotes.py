@@ -60,40 +60,56 @@ def create_lote(
     if allowed_ids and request.id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
         
-    # Create the job for OP13
-    import json
-    params = json.dumps({
-        "cod_prestador": request.cod_prestador,
-        "data_fim": request.data_fim.strftime("%d/%m/%Y")
-    })
-    
-    # We create a placeholder Lote in DB so UI can show it's pending
+    rotina_target = "4" if request.id_convenio == 3 else "13"
+    status_inicial = "Aberto" if request.id_convenio == 3 else "Processando"
+
+    # We create a placeholder Lote in DB so UI can show it's pending/aberto
     novo_lote = LoteConvenio(
         id_convenio=request.id_convenio,
         cod_prestador=request.cod_prestador,
         data_fim=request.data_fim,
-        status="Processando",
-        numero_lote=None, # Will be updated by Worker
+        status=status_inicial,
+        numero_lote=None, # Will be updated by Worker if applicable
         user_id=current_user.id
     )
     db.add(novo_lote)
     db.flush() # get id_lote
     
-    new_job = Job(
-        id_convenio=request.id_convenio,
-        rotina="13", # OP13_criar_lote
-        status="pending",
-        params=json.dumps({
-            "cod_prestador": request.cod_prestador,
-            "data_fim": request.data_fim.strftime("%d/%m/%Y"),
-            "id_lote_interno": novo_lote.id_lote # Worker can update this row
-        }),
-        user_id=current_user.id
-    )
-    db.add(new_job)
-    db.commit()
+    if request.id_convenio == 3:
+        # Para Unimed Goiânia, envia o job OP4 via _send_jobs_to_worker
+        from routes.jobs import create_goiania_op4_job, CreateGoianiaOp4Request
+        from models import UserConvenio
+        uconv = db.query(UserConvenio).filter(
+            UserConvenio.user_id == current_user.id,
+            UserConvenio.id_convenio == 3
+        ).first()
+
+        data_ini_str = "01/01/2026"
+        data_fim_str = request.data_fim.strftime("%d/%m/%Y")
+        
+        op4_req = CreateGoianiaOp4Request(
+            data_ini=data_ini_str,
+            data_fim=data_fim_str,
+            guia="",
+            id_lote=novo_lote.id_lote
+        )
+        create_goiania_op4_job(op4_req, db=db, current_user=current_user)
+    else:
+        new_job = Job(
+            id_convenio=request.id_convenio,
+            rotina="13", # OP13_criar_lote
+            status="pending",
+            params=json.dumps({
+                "cod_prestador": request.cod_prestador,
+                "data_fim": request.data_fim.strftime("%d/%m/%Y"),
+                "id_lote_interno": novo_lote.id_lote # Worker can update this row
+            }),
+            user_id=current_user.id
+        )
+        db.add(new_job)
+        db.commit()
     
-    return {"message": "Lote em processamento. Job criado.", "id_lote": novo_lote.id_lote}
+    return {"message": "Lote criado. Job enviado ao worker.", "id_lote": novo_lote.id_lote}
 
 @router.post("/{id_lote}/cancelar")
 def cancelar_lote(

@@ -693,6 +693,13 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             job.result_consumed = True
             continue
 
+        # Se for Unimed Goiânia (ID 3) ou rotina OP4 (Exames Finalizados)
+        if job.id_convenio == 3 or str(job.rotina).lower() in ("4", "op4_finalizados", "finalizados", "exames_finalizados"):
+            _sync_goiania_op4(db, job, synced_counts)
+            job.result_consumed = True
+            synced_counts["jobs_processed"] += 1
+            continue
+
         # Se for convênio Evoluir (ID 100)
         if job.id_convenio == 100:
             rotina = str(job.rotina).lower()
@@ -2082,6 +2089,123 @@ def _upsert_agendamento(db: Session, item: dict, id_carteirinha: int | None, car
     )
     db.execute(stmt)
     synced_counts["updated"] += 1
+
+
+def _sync_goiania_op4(db: Session, job, synced_counts: dict):
+    """
+    Processa os resultados do job OP4 da Unimed Goiânia (Exames Finalizados):
+    1. Garante a existência do LoteConvenio correspondente (cria um se não houver id_lote no job).
+    2. Extrai cada guia e série do JSON de resposta.
+    3. Normaliza carteirinha e paciente.
+    4. Insere em faturamento_lotes com detalheId = int(cd_guia + str(seq)) (idempotente).
+    """
+    from models import LoteConvenio, FaturamentoLote
+
+    params = job.params or {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except Exception:
+            params = {}
+
+    result_data = job.result_data or {}
+    guias_list = []
+    if isinstance(result_data, dict):
+        guias_list = result_data.get("data", [])
+    elif isinstance(result_data, list):
+        guias_list = result_data
+
+    if not guias_list:
+        return
+
+    # 1. Obter ou criar LoteConvenio
+    id_lote = params.get("id_lote") or params.get("id_lote_interno")
+    if not id_lote:
+        cod_prestador = str(params.get("cod_prestador") or params.get("codigoPrestador") or "2209525").strip()
+        data_ini_str = str(params.get("data_ini") or "").strip()
+        data_fim_str = str(params.get("data_fim") or "").strip()
+
+        dt_ini = _parse_date(data_ini_str)
+        dt_fim = _parse_date(data_fim_str)
+
+        lote = db.query(LoteConvenio).filter(
+            LoteConvenio.id_convenio == (job.id_convenio or 3),
+            LoteConvenio.user_id == job.user_id,
+            LoteConvenio.cod_prestador == cod_prestador,
+            LoteConvenio.data_fim == dt_fim
+        ).first()
+
+        if not lote:
+            lote = LoteConvenio(
+                id_convenio=job.id_convenio or 3,
+                user_id=job.user_id,
+                cod_prestador=cod_prestador,
+                status="Aberto",
+                data_inicio=dt_ini,
+                data_fim=dt_fim,
+            )
+            db.add(lote)
+            db.flush()
+
+        id_lote = lote.id_lote
+        params["id_lote"] = id_lote
+        job.params = params
+
+    # 2. Inserir itens em faturamento_lotes
+    for guia in guias_list:
+        if not isinstance(guia, dict):
+            continue
+
+        cd_guia = str(guia.get("cd_guia") or "").strip()
+        nr_guia = str(guia.get("guia") or "").strip()
+        if not cd_guia:
+            continue
+
+        cart_raw = str(guia.get("carteirinha") or "").strip()
+        if " - " in cart_raw:
+            cart_raw = cart_raw.split(" - ")[0].strip()
+
+        cod_proc = str(guia.get("cod_procedimento") or "").strip()
+        series = guia.get("series") or []
+
+        if not series:
+            series = [{"seq": 1, "data": guia.get("data_atendimento"), "hora": ""}]
+
+        for serie in series:
+            if not isinstance(serie, dict):
+                continue
+            seq = serie.get("seq", 1)
+            try:
+                detalhe_id = int(f"{cd_guia}{int(seq)}")
+            except (ValueError, TypeError):
+                continue
+
+            existing = db.query(FaturamentoLote).filter(
+                FaturamentoLote.detalheId == detalhe_id
+            ).first()
+            if existing:
+                synced_counts["skipped"] += 1
+                continue
+
+            data_serie_str = str(serie.get("data") or "").strip()
+            data_realizacao = _parse_date(data_serie_str) if data_serie_str else None
+
+            fat = FaturamentoLote(
+                detalheId=detalhe_id,
+                id_lote=id_lote,
+                user_id=job.user_id,
+                CodigoBeneficiario=cart_raw or None,
+                Guia=nr_guia or None,
+                dataRealizacao=data_realizacao,
+                cod_procedimento_fat=cod_proc or None,
+                StatusConciliacao="Não Conciliado",
+                StatusConferencia=0,
+            )
+            db.add(fat)
+            synced_counts["inserted"] += 1
+
+    db.commit()
+
 
 
 
