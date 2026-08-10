@@ -1345,95 +1345,17 @@ def receive_goiania_op4_webhook(
         job.updated_at = datetime.now(timezone.utc)
     db.flush()
 
-    if status_job != "success":
+    if status_job == "success":
+        from services.guias_sync_service import _sync_goiania_op4
+        inserted, skipped = _sync_goiania_op4(db, job)
+        print(f"[OP4 Webhook] Job {job_id}: {inserted} itens inseridos, {skipped} ignorados (duplicados).")
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "inserted": inserted,
+            "skipped": skipped,
+        }
+    else:
         db.commit()
         return {"status": "registered", "message": f"Job {job_id} marcado como {status_job}."}
-
-    # ── Parse e insert em faturamento_lotes ──
-    guias = []
-    if isinstance(result_data, dict):
-        guias = result_data.get("data", [])
-    elif isinstance(result_data, list):
-        guias = result_data
-
-    id_lote = params_job.get("id_lote") or None
-
-    inserted = 0
-    skipped = 0
-
-    for guia in guias:
-        if not isinstance(guia, dict):
-            continue
-
-        cd_guia = str(guia.get("cd_guia") or "").strip()
-        nr_guia = str(guia.get("guia") or "").strip()
-        carteirinha = str(guia.get("carteirinha") or "").strip()
-        cod_proc = str(guia.get("cod_procedimento") or "").strip()
-        series = guia.get("series") or []
-
-        # Data do atendimento (data da listagem) — fallback para a série
-        data_atendimento_str = str(guia.get("data_atendimento") or "").strip()
-
-        for serie in series:
-            if not isinstance(serie, dict):
-                continue
-            seq = serie.get("seq")
-            if seq is None:
-                continue
-
-            # detalhe_id = cd_guia concatenado com seq (sem separador)
-            try:
-                detalhe_id = int(f"{cd_guia}{int(seq)}")
-            except (ValueError, TypeError):
-                print(f"[OP4 Webhook] detalhe_id inválido: cd_guia={cd_guia} seq={seq}")
-                continue
-
-            # Idempotência: pular se já existe
-            existing = db.query(FaturamentoLote).filter(
-                FaturamentoLote.detalheId == detalhe_id
-            ).first()
-            if existing:
-                skipped += 1
-                continue
-
-            # Data de realização = data da série
-            data_serie_str = str(serie.get("data") or "").strip()
-            hora_serie_str = str(serie.get("hora") or "").strip()
-            data_realizacao = None
-            try:
-                from datetime import datetime as _dt, date as _date
-                if data_serie_str:
-                    data_realizacao = _dt.strptime(data_serie_str, "%d/%m/%Y").date()
-                elif data_atendimento_str:
-                    # Atendimento pode ter hora: "08/08/2026 10:51"
-                    data_realizacao = _dt.strptime(
-                        data_atendimento_str.split()[0], "%d/%m/%Y"
-                    ).date()
-            except Exception:
-                pass
-
-            fat = FaturamentoLote(
-                detalheId=detalhe_id,
-                id_lote=id_lote,
-                user_id=user_id,
-                CodigoBeneficiario=carteirinha or None,
-                Guia=nr_guia or None,
-                dataRealizacao=data_realizacao,
-                cod_procedimento_fat=cod_proc or None,
-                StatusConciliacao="Não Conciliado",
-                StatusConferencia=0,
-            )
-            db.add(fat)
-            inserted += 1
-
-    job.result_consumed = True
-    db.commit()
-
-    print(f"[OP4 Webhook] Job {job_id}: {inserted} itens inseridos, {skipped} ignorados (duplicados).")
-    return {
-        "status": "success",
-        "job_id": job_id,
-        "inserted": inserted,
-        "skipped": skipped,
-    }
 

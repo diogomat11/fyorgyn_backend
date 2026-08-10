@@ -2091,15 +2091,19 @@ def _upsert_agendamento(db: Session, item: dict, id_carteirinha: int | None, car
     synced_counts["updated"] += 1
 
 
-def _sync_goiania_op4(db: Session, job, synced_counts: dict):
+def _sync_goiania_op4(db: Session, job, synced_counts: dict = None) -> tuple:
     """
     Processa os resultados do job OP4 da Unimed Goiânia (Exames Finalizados):
     1. Garante a existência do LoteConvenio correspondente (cria um se não houver id_lote no job).
     2. Extrai cada guia e série do JSON de resposta.
-    3. Normaliza carteirinha e paciente.
-    4. Insere em faturamento_lotes com detalheId = int(cd_guia + str(seq)) (idempotente).
+    3. Normaliza carteirinha (remove partes com nome do beneficiário).
+    4. Insere em faturamento_lotes com detalheId = int(cd_guia + str(seq)) (idempotente/sem duplicatas).
     """
     from models import LoteConvenio, FaturamentoLote
+    from sqlalchemy.exc import IntegrityError
+
+    if synced_counts is None:
+        synced_counts = {"jobs_processed": 0, "inserted": 0, "updated": 0, "skipped": 0}
 
     params = job.params or {}
     if isinstance(params, str):
@@ -2116,7 +2120,7 @@ def _sync_goiania_op4(db: Session, job, synced_counts: dict):
         guias_list = result_data
 
     if not guias_list:
-        return
+        return (0, 0)
 
     # 1. Obter ou criar LoteConvenio
     id_lote = params.get("id_lote") or params.get("id_lote_interno")
@@ -2151,7 +2155,9 @@ def _sync_goiania_op4(db: Session, job, synced_counts: dict):
         params["id_lote"] = id_lote
         job.params = params
 
-    # 2. Inserir itens em faturamento_lotes
+    # 2. Inserir itens em faturamento_lotes com deduplicação rigorosa
+    seen_in_payload = set()
+
     for guia in guias_list:
         if not isinstance(guia, dict):
             continue
@@ -2180,7 +2186,14 @@ def _sync_goiania_op4(db: Session, job, synced_counts: dict):
             except (ValueError, TypeError):
                 continue
 
-            existing = db.query(FaturamentoLote).filter(
+            # Deduplicação 1: Pular se já visto no mesmo payload/execução
+            if detalhe_id in seen_in_payload:
+                synced_counts["skipped"] += 1
+                continue
+            seen_in_payload.add(detalhe_id)
+
+            # Deduplicação 2: Pular se já existe no banco de dados
+            existing = db.query(FaturamentoLote.id).filter(
                 FaturamentoLote.detalheId == detalhe_id
             ).first()
             if existing:
@@ -2204,7 +2217,45 @@ def _sync_goiania_op4(db: Session, job, synced_counts: dict):
             db.add(fat)
             synced_counts["inserted"] += 1
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Fallback defensivo contra condição de corrida: rollback e insere item a item
+        db.rollback()
+        for detalhe_id in seen_in_payload:
+            existing = db.query(FaturamentoLote.id).filter(FaturamentoLote.detalheId == detalhe_id).first()
+            if existing:
+                continue
+            # Se não existe, podemos inserir individualmente
+            try:
+                # encontrar dados do item
+                for guia in guias_list:
+                    cdg = str(guia.get("cd_guia") or "").strip()
+                    srs = guia.get("series") or [{"seq": 1, "data": guia.get("data_atendimento")}]
+                    for s in srs:
+                        try:
+                            if int(f"{cdg}{int(s.get('seq', 1))}") == detalhe_id:
+                                c_raw = str(guia.get("carteirinha") or "").split(" - ")[0].strip()
+                                dt_s = str(s.get("data") or "").strip()
+                                fat_indiv = FaturamentoLote(
+                                    detalheId=detalhe_id,
+                                    id_lote=id_lote,
+                                    user_id=job.user_id,
+                                    CodigoBeneficiario=c_raw or None,
+                                    Guia=str(guia.get("guia") or "").strip() or None,
+                                    dataRealizacao=_parse_date(dt_s) if dt_s else None,
+                                    cod_procedimento_fat=str(guia.get("cod_procedimento") or "").strip() or None,
+                                    StatusConciliacao="Não Conciliado",
+                                    StatusConferencia=0,
+                                )
+                                db.add(fat_indiv)
+                                db.commit()
+                        except Exception:
+                            db.rollback()
+            except Exception:
+                db.rollback()
+
+    return (synced_counts["inserted"], synced_counts["skipped"])
 
 
 
