@@ -42,6 +42,11 @@ app.add_middleware(
 def read_root():
     return {"message": "FyorGyn API is running"}
 
+@app.get("/health")
+def health_check():
+    # Endpoint dedicado para o health check do Render (a raiz "/" ja responde tambem).
+    return {"status": "ok"}
+
 async def run_cleanup_loop():
     while True:
         db = None
