@@ -31,10 +31,13 @@ else:
     SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, 
+    SQLALCHEMY_DATABASE_URL,
     use_native_hstore=False,
-    pool_size=10,
-    max_overflow=20,
+    # Supabase session pooler (porta 5432) limita a 15 clientes no total
+    # (EMAXCONNSESSION). Pool pequeno + max_overflow=0 evita esgotar e ficar
+    # esperando vaga (causa da lentidao de 5-7s). Deixa folga p/ worker/dev.
+    pool_size=5,
+    max_overflow=0,
     pool_timeout=30,
     pool_recycle=300,
     pool_pre_ping=True,
@@ -44,7 +47,7 @@ engine = create_engine(
         "keepalives_idle": 30,
         "keepalives_interval": 10,
         "keepalives_count": 5
-    } 
+    }
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

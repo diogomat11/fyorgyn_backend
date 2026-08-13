@@ -57,14 +57,10 @@ def list_guias(
     if cached_res:
         return cached_res
 
-    # Auto-sincronizar guias extraídas pelo worker em background para evitar travamento
-    if background_tasks:
-        try:
-            from services.guias_sync_service import sync_completed_worker_jobs_bg
-            background_tasks.add_task(sync_completed_worker_jobs_bg)
-        except Exception as e:
-            print(f"Error scheduling completed jobs during list_guias: {e}")
-    
+    # NOTA: a sincronizacao das guias do worker roda no loop periodico do main.py
+    # (run_guias_sync_loop, a cada 5s). Antes era disparada tambem a cada request
+    # aqui, o que saturava conexoes do pool do Supabase e causava lentidao.
+
     subq_query = db.query(
         Agendamento.numero_guia,
         func.sum(case((Agendamento.Status == 'Confirmado', 1), else_=0)).label('q_realizadas'),
