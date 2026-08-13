@@ -19,20 +19,29 @@ os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Configure CORS
-origins = [
+# Origins padrao (dev local + dominios Vercel de producao) + o que vier de
+# CORS_ORIGINS (CSV) — permite configurar novos dominios em producao (Render)
+# sem mudar codigo. CORS_ORIGIN_REGEX (opcional) cobre previews do Vercel
+# (ex.: https://tiss-service-fyorgyn.*\.vercel\.app).
+_default_origins = [
     "http://localhost:3000",
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
     "http://localhost:5174",
     "http://127.0.0.1:5174",
+    "https://tiss-service-fyorgyn.vercel.app",
     "https://clmf-gestor.vercel.app",
-    "https://clmf-hub-unimed-frontend.vercel.app"
+    "https://clmf-hub-unimed-frontend.vercel.app",
 ]
+_extra_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+origins = _default_origins + [o for o in _extra_origins if o not in _default_origins]
+_origin_regex = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
