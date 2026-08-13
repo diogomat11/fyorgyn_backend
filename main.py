@@ -79,8 +79,43 @@ from routes import (
     auth, carteirinhas, jobs, guias, logs, dashboard, debug_optimization,
     workers, pei, convenios, prio_rules, metrics, agendamentos, server_configs,
     lotes, conciliacao, protocolo, relatorios_rm, motivos_faltas, workflows,
-    unidades, crm
+    unidades, crm, integradores, comprovante, workflow_trigger
 )
+
+# ── Rate Limiter Middleware ──
+import time
+from collections import defaultdict
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+_rate_limit_records = defaultdict(list)
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    now = time.time()
+    path = request.url.path
+
+    # Define rate limits
+    if path == "/api/auth/login":
+        limit, window = 10, 60  # 10 req/min for login
+    elif path.startswith("/api/jobs") and request.method == "POST":
+        limit, window = 60, 60  # 60 req/min for job creation
+    else:
+        limit, window = 300, 60 # 300 req/min general
+
+    key = f"{client_ip}:{path if path == '/api/auth/login' else 'general'}"
+    timestamps = [t for t in _rate_limit_records[key] if now - t < window]
+    _rate_limit_records[key] = timestamps
+
+    if len(timestamps) >= limit:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Limite de requisições excedido (Rate Limit). Aguarde um instante."}
+        )
+
+    _rate_limit_records[key].append(now)
+    return await call_next(request)
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(carteirinhas.router, prefix="/api")
@@ -104,6 +139,9 @@ app.include_router(motivos_faltas.router, prefix="/api")
 app.include_router(workflows.router, prefix="/api")
 app.include_router(unidades.router, prefix="/api")
 app.include_router(crm.router, prefix="/api")
+app.include_router(integradores.router, prefix="/api")
+app.include_router(comprovante.router, prefix="/api")
+app.include_router(workflow_trigger.router, prefix="/api")
 
 @app.post("/api/webhook")
 @app.post("/webhook")

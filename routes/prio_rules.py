@@ -5,7 +5,10 @@ from models import PriorityRule
 from pydantic import BaseModel
 from typing import List, Optional
 
-router = APIRouter()
+router = APIRouter(
+    prefix="/priority-rules",
+    tags=["priority-rules"]
+)
 
 class PriorityRuleBase(BaseModel):
     id_convenio: int

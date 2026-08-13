@@ -14,12 +14,30 @@ from models import (
     ProcedimentoFaturamento,
     BaseGuia
 )
+from dependencies import get_current_user, get_current_worker_key, get_effective_user_id
 from sqlalchemy import func, String, cast
 
 router = APIRouter(
     prefix="/agendamentos",
     tags=["Agendamentos"]
 )
+
+@router.get("/procedimentos")
+def list_procedimentos_agendamentos(id_convenio: Optional[int] = None, db: Session = Depends(get_db)):
+    """Retorna procedimentos ativos do convênio especificado ou todos se id_convenio não fornecido."""
+    query = db.query(Procedimento).filter(Procedimento.status == "ativo")
+    if id_convenio:
+        query = query.filter(Procedimento.id_convenio == id_convenio)
+    procs = query.order_by(Procedimento.nome).all()
+    return [
+        {
+            "id": p.id_procedimento,
+            "codigo": p.codigo_procedimento,
+            "nome": p.nome,
+            "faturamento": p.faturamento
+        }
+        for p in procs
+    ]
 
 class CreateAgendamentoRequest(BaseModel):
     carteirinha: str
@@ -43,14 +61,14 @@ def create_agendamento(req: CreateAgendamentoRequest, db: Session = Depends(get_
         Carteirinha.id_convenio == req.id_convenio
     )
     if not current_user.is_admin:
-        query = query.filter(Carteirinha.user_id == current_user.id)
+        query = query.filter(Carteirinha.user_id == get_effective_user_id(current_user))
     cart = query.first()
     
     if not cart:
         # Tenta buscar ignorando o convenio, caso seja cart universal ou errada
         query2 = db.query(Carteirinha).filter(Carteirinha.carteirinha == req.carteirinha)
         if not current_user.is_admin:
-            query2 = query2.filter(Carteirinha.user_id == current_user.id)
+            query2 = query2.filter(Carteirinha.user_id == get_effective_user_id(current_user))
         cart = query2.first()
         if not cart:
             raise HTTPException(status_code=404, detail="Carteirinha não encontrada.")
@@ -106,7 +124,7 @@ def create_agendamento(req: CreateAgendamentoRequest, db: Session = Depends(get_
         valor_procedimento=valor,
         cod_procedimento_aut=proc.autorizacao,
         Status=req.Status,
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
 
     try:
@@ -131,7 +149,7 @@ def vincular_guias_manualmente(db: Session = Depends(get_db), current_user = Dep
             BaseGuia.status_guia.notin_(['Cancelada', 'Negada'])
         )
         if not current_user.is_admin:
-            query = query.filter(BaseGuia.user_id == current_user.id)
+            query = query.filter(BaseGuia.user_id == get_effective_user_id(current_user))
             
         updated = query.update({
             BaseGuia.updated_at: func.now()
@@ -184,7 +202,7 @@ def sincronizar_agendamentos_portal(
         rotina="op1_importar_agendamentos",
         status="pending",
         params=json.dumps(params_dict),
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_job)
     db.commit()
@@ -213,7 +231,7 @@ def list_agendamentos(
 ):
     base_query = db.query(Agendamento)
     if not current_user.is_admin:
-        base_query = base_query.filter(Agendamento.user_id == current_user.id)
+        base_query = base_query.filter(Agendamento.user_id == get_effective_user_id(current_user))
     
     if paciente:
         base_query = base_query.filter(Agendamento.Nome_Paciente.ilike(f"%{paciente}%"))
@@ -226,7 +244,11 @@ def list_agendamentos(
     if data_fim:
         base_query = base_query.filter(Agendamento.data <= data_fim)
     if procedimento:
-        base_query = base_query.filter(Agendamento.nome_procedimento.ilike(f"%{procedimento}%"))
+        base_query = base_query.filter(
+            (Agendamento.nome_procedimento.ilike(f"%{procedimento}%")) |
+            (Agendamento.cod_procedimento_fat.ilike(f"%{procedimento}%")) |
+            (Agendamento.cod_procedimento_aut.ilike(f"%{procedimento}%"))
+        )
     if sem_carteirinha:
         base_query = base_query.filter(
             (Agendamento.carteirinha == None) | (func.trim(Agendamento.carteirinha) == '')
@@ -259,8 +281,11 @@ def list_agendamentos(
     
     # Outer join to fetch the Saldo da Guia if numero_guia is populated
     from sqlalchemy.orm import aliased
-    from models import BaseGuia
+    from models import BaseGuia, Unidade
     bg = aliased(BaseGuia)
+    
+    # Pre-fetch unidades for name mapping
+    unidades_map = {u.id_unidade: u.nome for u in db.query(Unidade).all()}
     
     agendamentos = (
         db.query(Agendamento, bg.saldo.label("saldo_guia"), bg.timestamp_captura.label("timestamp_captura"))
@@ -278,10 +303,11 @@ def list_agendamentos(
         dic = {c.name: getattr(ag, c.name) for c in ag.__table__.columns}
         dic["saldo_guia"] = saldo
         dic["timestamp_captura"] = ts_cap
+        dic["nome_unidade"] = unidades_map.get(ag.id_unidade) if ag.id_unidade else None
         data.append(dic)
         
     if not current_user.is_admin:
-        total_db_unfiltered = db.query(Agendamento).filter(Agendamento.user_id == current_user.id).count()
+        total_db_unfiltered = db.query(Agendamento).filter(Agendamento.user_id == get_effective_user_id(current_user)).count()
     else:
         total_db_unfiltered = db.query(Agendamento).count()
         
@@ -313,7 +339,7 @@ def list_procedimentos(id_convenio: int, db: Session = Depends(get_db), current_
               .filter(Agendamento.id_convenio == id_convenio)
     
     if not current_user.is_admin:
-        procs = procs.filter(Agendamento.user_id == current_user.id)
+        procs = procs.filter(Agendamento.user_id == get_effective_user_id(current_user))
         
     procs = procs.distinct().all()
     
@@ -339,7 +365,7 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
     if not current_user.is_admin:
         count_agendamentos = db.query(Agendamento).filter(
             Agendamento.id_agendamento.in_(req.ids),
-            Agendamento.user_id == current_user.id
+            Agendamento.user_id == get_effective_user_id(current_user)
         ).count()
         if count_agendamentos != len(req.ids):
             raise HTTPException(status_code=403, detail="Um ou mais agendamentos não pertencem ao seu usuário.")
@@ -406,7 +432,7 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                                 rotina="op2_captura",
                                 status="pending",
                                 params=json.dumps({"agendamento_id": ag.id_agendamento, "numero_guia": ag.numero_guia or ""}),
-                                user_id=current_user.id
+                                user_id=get_effective_user_id(current_user)
                             )
                             db.add(cap_job)
                             db.flush()
@@ -450,7 +476,7 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                                     status="pending",
                                     depending_id=cap_job.id,
                                     params=json.dumps(exec_params),
-                                    user_id=current_user.id
+                                    user_id=get_effective_user_id(current_user)
                                 )
                                 db.add(exec_job)
                                 ag.execucao_status = "pendente"
@@ -489,7 +515,7 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                                 status="pending",
                                 depending_id=None,
                                 params=json.dumps(exec_params),
-                                user_id=current_user.id
+                                user_id=get_effective_user_id(current_user)
                             )
                             db.add(exec_job)
                             ag.execucao_status = "pendente"
@@ -509,7 +535,7 @@ def batch_delete(req: BatchDeleteRequest, db: Session = Depends(get_db), current
     if not current_user.is_admin:
         count_ag = db.query(Agendamento).filter(
             Agendamento.id_agendamento.in_(req.ids),
-            Agendamento.user_id == current_user.id
+            Agendamento.user_id == get_effective_user_id(current_user)
         ).count()
         if count_ag != len(req.ids):
             raise HTTPException(status_code=403, detail="Um ou mais agendamentos não pertencem ao seu usuário.")
@@ -535,7 +561,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
     if not current_user.is_admin:
         count_ag = db.query(Agendamento).filter(
             Agendamento.id_agendamento.in_(req.agendamento_ids),
-            Agendamento.user_id == current_user.id
+            Agendamento.user_id == get_effective_user_id(current_user)
         ).count()
         if count_ag != len(req.agendamento_ids):
             raise HTTPException(status_code=403, detail="Um ou mais agendamentos não pertencem ao seu usuário.")
@@ -576,7 +602,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
                         rotina="op2_captura",
                         status="pending",
                         params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
-                        user_id=current_user.id
+                        user_id=get_effective_user_id(current_user)
                     )
                     db.add(cap_job)
                     db.flush()
@@ -618,7 +644,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
                         status="pending",
                         depending_id=cap_job.id,
                         params=json.dumps(exec_params),
-                        user_id=current_user.id
+                        user_id=get_effective_user_id(current_user)
                     )
                     db.add(exec_job)
                     db.flush()
@@ -634,7 +660,7 @@ def trigger_faturamento(req: FaturarRequest, db: Session = Depends(get_db), curr
                     rotina="Faturamento",
                     status="pending",
                     params=json.dumps({"origem": "batch_agendamentos", "agendamento_id": agenda.id_agendamento}),
-                    user_id=current_user.id
+                    user_id=get_effective_user_id(current_user)
                 )
                 db.add(new_job)
                 db.flush()
@@ -696,7 +722,7 @@ def create_job_captura(req: AgendamentoJobRequest, db: Session = Depends(get_db)
         rotina="op2_captura",
         status="pending",
         params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_job)
     db.commit()
@@ -783,7 +809,7 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
                 rotina="op2_captura",
                 status="pending",
                 params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
-                user_id=current_user.id
+                user_id=get_effective_user_id(current_user)
             )
             db.add(cap_job)
             db.flush()
@@ -814,7 +840,7 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
         status="pending",
         depending_id=cap_job_id,
         params=params_json,
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_job)
     
@@ -891,7 +917,7 @@ def create_profissional(
         rotina="op2_captura",
         status="pending",
         params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_job)
     db.commit()
@@ -978,7 +1004,7 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
                 rotina="op2_captura",
                 status="pending",
                 params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
-                user_id=current_user.id
+                user_id=get_effective_user_id(current_user)
             )
             db.add(cap_job)
             db.flush()
@@ -1009,7 +1035,7 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
         status="pending",
         depending_id=cap_job_id,
         params=params_json,
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_job)
     
@@ -1088,7 +1114,7 @@ def create_profissional(
         codigo_ipasgo=req.codigo_ipasgo,
         tipo_profissional=req.tipo_profissional,
         status="ativo",
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_prof)
     db.commit()
@@ -1220,7 +1246,7 @@ def confirmar_portal(
         rotina="op3_confirmar_agendamento",
         status="pending",
         params=params_dict,
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_job)
     db.commit()
@@ -1296,7 +1322,7 @@ def registrar_falta_portal(
         rotina="op4_registrar_falta",
         status="pending",
         params=params_dict,
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_job)
     db.commit()
@@ -1369,7 +1395,7 @@ def remover_falta_portal(
         rotina="op5_remover_falta",
         status="pending",
         params=params_dict,
-        user_id=current_user.id
+        user_id=get_effective_user_id(current_user)
     )
     db.add(new_job)
     db.commit()
@@ -1380,8 +1406,37 @@ def remover_falta_portal(
     }, synchronize_session=False)
     db.commit()
 
-    return {
-        "status": "success",
-        "message": f"Job #{new_job.id} de remoção de falta criado para {len(portal_ids)} agendamento(s).",
-        "job_id": new_job.id
-    }
+class ImprimirIpasgoRequest(BaseModel):
+    agendamento_id: int
+
+@router.post("/imprimir-ipasgo")
+def gerar_op_impressao_ipasgo(
+    req: ImprimirIpasgoRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+    worker_key: Optional[str] = Depends(get_current_worker_key)
+):
+    ag = db.query(Agendamento).filter(Agendamento.id_agendamento == req.agendamento_id).first()
+    if not ag:
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado.")
+    if not current_user.is_admin and ag.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+
+    new_job = Job(
+        id_convenio=ag.id_convenio or 6,
+        rotina="12", # OP12 Worker Impressão
+        status="pending",
+        user_id=get_effective_user_id(current_user),
+        worker_key=worker_key,
+        params={
+            "guia": ag.numero_guia or "",
+            "GuiaPrestador": ag.numero_guia or "",
+            "id_agendamento": ag.id_agendamento,
+            "numero_copias": 1
+        }
+    )
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+    return {"status": "success", "message": f"Job OP12 de impressão IPASGO #{new_job.id} enfileirado com sucesso!", "job_id": new_job.id}
+

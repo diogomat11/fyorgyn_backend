@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from database import get_db
-from dependencies import get_current_user
+from dependencies import get_current_user, get_effective_user_id
 from models import PatientPei, PeiTemp, BaseGuia, Carteirinha
 from services.pei_service import update_patient_pei
 from pydantic import BaseModel
@@ -70,8 +70,9 @@ def get_dashboard_stats(
     
     # Isolation
     query_base = db.query(func.count(PatientPei.id)).join(Carteirinha)
+    target_id = get_effective_user_id(current_user)
     if not current_user.is_admin:
-        query_base = query_base.filter(PatientPei.user_id == current_user.id)
+        query_base = query_base.filter(PatientPei.user_id == target_id)
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)
     
@@ -138,14 +139,17 @@ def list_pei(
         PatientPei.base_guia_id,
         BaseGuia.guia.label("guia_vinculada"),
         BaseGuia.sessoes_autorizadas,
+        BaseGuia.qtde_solicitada,
+        BaseGuia.data_autorizacao,
         PatientPei.updated_at,
         Carteirinha.id_paciente # For export matching if needed
     ).join(Carteirinha, PatientPei.carteirinha_id == Carteirinha.id)\
      .outerjoin(BaseGuia, PatientPei.base_guia_id == BaseGuia.id)
     
     # Isolation
+    target_id = get_effective_user_id(current_user)
     if not current_user.is_admin:
-        query = query.filter(PatientPei.user_id == current_user.id)
+        query = query.filter(PatientPei.user_id == target_id)
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)
     
@@ -178,6 +182,8 @@ def list_pei(
             "base_guia_id": row.base_guia_id,
             "guia_vinculada": row.guia_vinculada or "-",
             "sessoes_autorizadas": row.sessoes_autorizadas or 0,
+            "qtde_solicitada": row.qtde_solicitada or 0,
+            "data_autorizacao": row.data_autorizacao,
             "updated_at": row.updated_at
         })
 
@@ -331,8 +337,9 @@ def export_pei(
          .outerjoin(BaseGuia, PatientPei.base_guia_id == BaseGuia.id)
         
         # Isolation
+        target_id = get_effective_user_id(current_user)
         if not current_user.is_admin:
-            query = query.filter(PatientPei.user_id == current_user.id)
+            query = query.filter(PatientPei.user_id == target_id)
         from dependencies import get_allowed_convenio_ids
         allowed_ids = get_allowed_convenio_ids(current_user)
         
@@ -401,8 +408,9 @@ def override_pei(
 ):
     # Validation: check if the guia belongs to the user's convenio
     guia = db.query(BaseGuia).join(Carteirinha).filter(BaseGuia.id == req.guia_id)
+    target_id = get_effective_user_id(current_user)
     if not current_user.is_admin:
-        guia = guia.filter(BaseGuia.user_id == current_user.id)
+        guia = guia.filter(BaseGuia.user_id == target_id)
     from dependencies import get_allowed_convenio_ids
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids:

@@ -181,7 +181,31 @@ def create_jobs(
     current_user = Depends(get_current_user)
 ):
     import json
-    
+    from dependencies import get_effective_user_id
+
+    # Mandatory Credential Validation for the selected Convenio
+    target_convenio_id = request.id_convenio
+    if not target_convenio_id and request.carteirinha_ids and len(request.carteirinha_ids) > 0:
+        cart_temp = db.query(Carteirinha).filter(Carteirinha.id == request.carteirinha_ids[0]).first()
+        if cart_temp:
+            target_convenio_id = cart_temp.id_convenio
+
+    if target_convenio_id:
+        target_uid = get_effective_user_id(current_user)
+        uconv = db.query(UserConvenio).filter(
+            UserConvenio.user_id == target_uid,
+            UserConvenio.id_convenio == target_convenio_id,
+            UserConvenio.login.isnot(None),
+            UserConvenio.senha_criptografada.isnot(None)
+        ).first()
+        if not uconv or not uconv.login or not uconv.senha_criptografada:
+            conv_obj = db.query(Convenio).filter(Convenio.id_convenio == target_convenio_id).first()
+            conv_name = conv_obj.nome if conv_obj else f"ID {target_convenio_id}"
+            raise HTTPException(
+                status_code=400,
+                detail=f"Credenciais não cadastradas para o convênio '{conv_name}'. Cadastre as credenciais em Credenciais Portais antes de criar o Job."
+            )
+
     # Interceptar e baixar URLs do Evoluir
     if request.params:
         try:

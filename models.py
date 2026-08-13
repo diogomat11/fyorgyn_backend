@@ -23,6 +23,13 @@ class UserConvenio(Base):
     auto_confirmar = Column(Boolean, default=False)
     auto_executar = Column(Boolean, default=False)
     auto_faturar = Column(Boolean, default=False)
+    # Profissional executante + CNES
+    cnes = Column(Text, nullable=True)
+    nome_profissional_exec = Column(Text, nullable=True)
+    conselho_exec = Column(Text, nullable=True)
+    numero_conselho_exec = Column(Text, nullable=True)
+    uf_exec = Column(Text, nullable=True)
+    cbo_exec = Column(Text, nullable=True)
 
 class User(Base):
     __tablename__ = "users"
@@ -36,10 +43,16 @@ class User(Base):
     is_admin = Column(Boolean, default=False)  # Admins see all data
     permitir_protocolo = Column(Boolean, default=False)
     id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True) # Legacy default
+    login = Column(Text, unique=True, nullable=True)
+    senha_hash = Column(Text, nullable=True)
+    perfil = Column(Text, nullable=False, default="gestor") # admin, gestor, supervisor, faturamento, agendamento
+    parent_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    prefixo_identificacao = Column(Text, nullable=True)
+    permissoes = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    convenio_rel = relationship("Convenio", secondary="user_convenios")
+    convenio_rel = relationship(lambda: Convenio, secondary="user_convenios")
     user_convenios_rel = relationship("UserConvenio", foreign_keys=[UserConvenio.user_id], cascade="all, delete-orphan", overlaps="convenio_rel")
 
 class Carteirinha(Base):
@@ -67,7 +80,7 @@ class Carteirinha(Base):
     jobs = relationship("Job", primaryjoin="Carteirinha.id == Job.carteirinha_id", back_populates="carteirinha_rel", cascade="all, delete-orphan")
     guias = relationship("BaseGuia", back_populates="carteirinha_rel", cascade="all, delete-orphan")
     logs = relationship("Log", primaryjoin="Carteirinha.id == Log.carteirinha_id", back_populates="carteirinha_rel", cascade="all, delete-orphan")
-    convenio_rel = relationship("Convenio")
+    convenio_rel = relationship(lambda: Convenio)
 
 class Job(Base):
     __tablename__ = "jobs"
@@ -88,12 +101,14 @@ class Job(Base):
     depending_id = Column(Integer, ForeignKey("worker.jobs.id", ondelete="SET NULL"), nullable=True)
     locked_by = Column(Text) # Server URL
     error_message = Column(Text, nullable=True) # Última mensagem de erro
+    worker_key = Column(Text, nullable=True)
     timeout = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     carteirinha_rel = relationship("Carteirinha", primaryjoin="Job.carteirinha_id == Carteirinha.id", back_populates="jobs")
-    convenio_rel = relationship("Convenio")
+    convenio_rel = relationship(lambda: Convenio)
+    logs = relationship("Log", back_populates="job_rel", cascade="all, delete-orphan")
     logs = relationship("Log", back_populates="job_rel", cascade="all, delete-orphan")
 
 class BaseGuia(Base):
@@ -127,7 +142,7 @@ class BaseGuia(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     carteirinha_rel = relationship("Carteirinha", back_populates="guias")
-    convenio_rel = relationship("Convenio")
+    convenio_rel = relationship(lambda: Convenio)
 
 class Solicitacao(Base):
     __tablename__ = "solicitacoes"
@@ -695,32 +710,117 @@ class RelatorioClinico(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class WorkerConvenio(Base):
-    __tablename__ = "convenios"
-    __table_args__ = {'schema': 'worker', 'extend_existing': True}
+class Integrador(Base):
+    __tablename__ = "integradores"
+    __table_args__ = {'schema': 'public', 'extend_existing': True}
 
-    id_convenio = Column(Integer, primary_key=True, index=True)
+    id_integrador = Column(Integer, primary_key=True, index=True)
+    id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="CASCADE"), unique=True, nullable=False)
     nome = Column(Text, nullable=False)
     sigla = Column(Text, nullable=True)
+    tipo_operacao = Column(Text, nullable=False, default="convenio")  # 'convenio' ou 'agendamento'
+    ativo = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    convenio_rel = relationship(Convenio)
+    operacoes_rel = relationship("IntegradorOperacao", back_populates="integrador_rel", cascade="all, delete-orphan")
+
+
+class IntegradorOperacao(Base):
+    __tablename__ = "integrador_operacoes"
+    __table_args__ = {'schema': 'public', 'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_integrador = Column(Integer, ForeignKey("public.integradores.id_integrador", ondelete="CASCADE"), nullable=False)
+    id_integrador_worker = Column(Integer, nullable=True) # Referência lógica ao worker schema sem FK cruzada
+    id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="CASCADE"), nullable=False)
+    rotina = Column(Text, nullable=False)
+    descricao = Column(Text, nullable=True)
+    tipo_processamento = Column(Text, nullable=False, default="local")  # 'local', 'server', 'remoto'
+    ativo = Column(Boolean, default=True)
+    ordem = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    integrador_rel = relationship(Integrador, back_populates="operacoes_rel")
+
+
+class UserIntegrador(Base):
+    """Integradores habilitados pelo Admin para um Client (User Gestor)."""
+    __tablename__ = "user_integradores"
+    __table_args__ = (
+        UniqueConstraint('user_id', 'id_integrador', name='uq_user_integrador'),
+        {'schema': 'public', 'extend_existing': True}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    id_integrador = Column(Integer, ForeignKey("public.integradores.id_integrador", ondelete="CASCADE"), nullable=False)
+    ativo = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user_rel = relationship("User")
+    integrador_rel = relationship("Integrador")
+
+
+
+class WorkerIntegrador(Base):
+    __tablename__ = "integradores"
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
+
+    id_integrador = Column(Integer, primary_key=True, index=True)
+    nome = Column(Text, nullable=False)
+    sigla = Column(Text, nullable=True)
+    tipo_operacao = Column(Text, default="convenio")
     ativo = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class WorkerConvenioOperacao(Base):
-    __tablename__ = "convenio_operacoes"
+class WorkerIntegradorOperacao(Base):
+    __tablename__ = "integrador_operacoes"
     __table_args__ = {'schema': 'worker', 'extend_existing': True}
 
     id = Column(Integer, primary_key=True, index=True)
-    id_convenio = Column(Integer, ForeignKey("worker.convenios.id_convenio", ondelete="CASCADE"), nullable=False)
+    id_integrador = Column(Integer, ForeignKey("worker.integradores.id_integrador", ondelete="CASCADE"), nullable=False)
     rotina = Column(Text, nullable=False)
     descricao = Column(Text, nullable=True)
+    tipo_processamento = Column(Text, default="local")
     ativo = Column(Boolean, default=True)
     modo_execucao = Column(Text, default="automatico") # 'automatico' ou 'manual'
     params_schema = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    convenio_rel = relationship("WorkerConvenio", primaryjoin="WorkerConvenioOperacao.id_convenio == WorkerConvenio.id_convenio")
+    integrador_rel = relationship(WorkerIntegrador, primaryjoin="WorkerIntegradorOperacao.id_integrador == WorkerIntegrador.id_integrador")
+
+
+# Aliases para retrocompatibilidade
+WorkerConvenio = WorkerIntegrador
+WorkerConvenioOperacao = WorkerIntegradorOperacao
+
+
+class WorkerConfig(Base):
+    __tablename__ = "worker_config"
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    chave = Column(Text, unique=True, nullable=False)
+    valor = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class WorkerApiKey(Base):
+    __tablename__ = "worker_api_keys"
+    __table_args__ = {'schema': 'worker', 'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    api_key = Column(Text, unique=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    tipo_processamento = Column(Text, nullable=False, default="local")
+    descricao = Column(Text, nullable=True)
+    ativo = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 class MotivoFalta(Base):
     __tablename__ = "motivos_faltas"
@@ -761,9 +861,74 @@ class Unidade(Base):
     id_unidade = Column(Integer, nullable=False)
     nome = Column(String(255), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    status = Column(String(50), default="ativo")
+    status = Column(String(20), default="Ativo")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UserUserConvenio(Base):
+    __tablename__ = "user_user_convenios"
+    __table_args__ = (
+        UniqueConstraint('user_id', 'user_convenio_id', name='uq_user_user_convenio'),
+        {'extend_existing': True}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    user_convenio_id = Column(Integer, ForeignKey("user_convenios.id", ondelete="CASCADE"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UnidadePrestador(Base):
+    __tablename__ = "unidade_prestador"
+    __table_args__ = (
+        UniqueConstraint('user_convenio_id', 'id_unidade', name='uq_unidade_prestador'),
+        {'extend_existing': True}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_convenio_id = Column(Integer, ForeignKey("user_convenios.id", ondelete="CASCADE"), nullable=False)
+    id_unidade = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserWorker(Base):
+    __tablename__ = "user_workers"
+    __table_args__ = {'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    worker_key = Column(Text, unique=True, nullable=False)
+    descricao = Column(Text, nullable=True)
+    ativo = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class GuiaPrestadorSeq(Base):
+    __tablename__ = "guia_prestador_seq"
+    __table_args__ = (
+        UniqueConstraint('user_convenio_id', 'cod_prestador', name='uq_guia_prestador_seq'),
+        {'extend_existing': True}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_convenio_id = Column(Integer, ForeignKey("user_convenios.id", ondelete="CASCADE"), nullable=False)
+    cod_prestador = Column(Text, nullable=False)
+    ultimo_numero = Column(Integer, default=0, nullable=False)
+
+
+class GuiaLock(Base):
+    __tablename__ = "guia_locks"
+    __table_args__ = (
+        UniqueConstraint('numero_guia', 'user_id', name='uq_guia_lock_active'),
+        {'schema': 'worker', 'extend_existing': True}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    numero_guia = Column(Text, nullable=False)
+    user_id = Column(Integer, nullable=False)
+    job_id = Column(Integer, ForeignKey("worker.jobs.id", ondelete="SET NULL"), nullable=True)
+    locked_at = Column(DateTime(timezone=True), server_default=func.now())
+    released_at = Column(DateTime(timezone=True), nullable=True)
+
 
 

@@ -52,3 +52,51 @@ def restart_worker(worker_id: int, db: Session = Depends(get_db), current_user =
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")
     return {"message": "Restart command queued", "worker": worker.hostname}
+
+
+class RegisterWorkerSchema(BaseModel):
+    api_key: str
+    hostname: Optional[str] = None
+    descricao: Optional[str] = None
+
+@router.post("/register")
+def register_worker_by_api_key(data: RegisterWorkerSchema, db: Session = Depends(get_db)):
+    """
+    Chamado pela interface GUI do Worker local ao conectar ou ao inserir a chave API.
+    Gera dinamicamente uma nova worker_key única a cada conexão para garantir que a chave nunca seja estática.
+    """
+    import secrets
+    from models import WorkerApiKey, UserWorker
+
+    # 1. Check WorkerApiKey in DB
+    wak = db.query(WorkerApiKey).filter(WorkerApiKey.api_key == data.api_key.strip()).first()
+    user_id = wak.user_id if wak else 1
+
+    # 2. Always generate a NEW dynamic worker_key for this session
+    new_dynamic_key = f"WRK-{secrets.token_hex(3).upper()}"
+
+    uw = db.query(UserWorker).filter(UserWorker.user_id == user_id, UserWorker.ativo == True).first()
+    if not uw:
+        uw = UserWorker(
+            user_id=user_id,
+            worker_key=new_dynamic_key,
+            descricao=data.descricao or f"Worker GUI ({data.hostname or 'Local'})",
+            ativo=True
+        )
+        db.add(uw)
+    else:
+        uw.worker_key = new_dynamic_key
+        if data.descricao:
+            uw.descricao = data.descricao
+
+    db.commit()
+    db.refresh(uw)
+
+    return {
+        "status": "success",
+        "worker_key": uw.worker_key,
+        "api_key": data.api_key,
+        "message": f"Worker registrado com sucesso! Novo código dinâmico: {uw.worker_key}"
+    }
+
+

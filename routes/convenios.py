@@ -80,6 +80,133 @@ def list_convenios_active_in_range(
         return [{"id_convenio": c.id_convenio, "nome": c.nome} for c in all_c]
     return convs
 
+class CredentialCreateRequest(BaseModel):
+    user_id: int
+    id_convenio: int
+    login: Optional[str] = None
+    senha: Optional[str] = None
+    cod_prestador: Optional[str] = None
+    login_fat: Optional[str] = None
+    senha_fat: Optional[str] = None
+    url_portal_fat: Optional[str] = None
+
+class CredentialUpdateRequest(BaseModel):
+    login: Optional[str] = None
+    senha: Optional[str] = None
+    cod_prestador: Optional[str] = None
+    login_fat: Optional[str] = None
+    senha_fat: Optional[str] = None
+    url_portal_fat: Optional[str] = None
+
+@router.get("/credentials")
+def list_credentials(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    from dependencies import get_effective_user_id
+    if current_user.is_admin:
+        uconvs = db.query(UserConvenio).all()
+    else:
+        target_uid = get_effective_user_id(current_user)
+        uconvs = db.query(UserConvenio).filter(UserConvenio.user_id == target_uid).all()
+    
+    # Resolve usernames and convenio names
+    users = {u.id: u.username for u in db.query(User).all()}
+    convs = {c.id_convenio: c.nome for c in db.query(Convenio).all()}
+    
+    res = []
+    for uc in uconvs:
+        res.append({
+            "id": uc.id,
+            "user_id": uc.user_id,
+            "username": users.get(uc.user_id, "Desconhecido"),
+            "id_convenio": uc.id_convenio,
+            "nome_convenio": convs.get(uc.id_convenio, "Desconhecido"),
+            "login": uc.login,
+            "has_senha": bool(uc.senha_criptografada),
+            "cod_prestador": uc.cod_prestador,
+            "login_fat": uc.login_fat,
+            "has_senha_fat": bool(uc.senha_fat_criptografada),
+            "url_portal_fat": uc.url_portal_fat
+        })
+    return res
+
+@router.post("/credentials")
+def create_credential(request: CredentialCreateRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    user_perfil = getattr(current_user, "perfil", "gestor") or "gestor"
+    if not current_user.is_admin and user_perfil != "gestor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acesso negado. Apenas gestores podem gerenciar credenciais."
+        )
+    
+    target_uid = current_user.id if not current_user.is_admin else request.user_id
+
+    # Encrypt passwords if provided
+    senha_enc = encrypt_password(request.senha) if request.senha else None
+    senha_fat_enc = encrypt_password(request.senha_fat) if request.senha_fat else None
+    
+    new_uc = UserConvenio(
+        user_id=target_uid,
+        id_convenio=request.id_convenio,
+        login=request.login,
+        senha_criptografada=senha_enc,
+        cod_prestador=request.cod_prestador,
+        login_fat=request.login_fat,
+        senha_fat_criptografada=senha_fat_enc,
+        url_portal_fat=request.url_portal_fat
+    )
+    db.add(new_uc)
+    db.commit()
+    db.refresh(new_uc)
+    return {"message": "Credenciais criadas com sucesso.", "id": new_uc.id}
+
+@router.put("/credentials/{id}")
+def update_credential(id: int, request: CredentialUpdateRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    user_perfil = getattr(current_user, "perfil", "gestor") or "gestor"
+    if not current_user.is_admin and user_perfil != "gestor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acesso negado. Apenas gestores podem gerenciar credenciais."
+        )
+    
+    uc = db.query(UserConvenio).filter(UserConvenio.id == id).first()
+    if not uc:
+        raise HTTPException(status_code=404, detail="Credenciais não encontradas.")
+    
+    if not current_user.is_admin and uc.user_id != current_user.id and uc.user_id != current_user.parent_user_id:
+        raise HTTPException(status_code=403, detail="Você não tem permissão para editar estas credenciais.")
+
+    if request.login is not None:
+        uc.login = request.login
+    if request.senha: # Only update if not empty
+        uc.senha_criptografada = encrypt_password(request.senha)
+    if request.cod_prestador is not None:
+        uc.cod_prestador = request.cod_prestador
+    if request.login_fat is not None:
+        uc.login_fat = request.login_fat
+    if request.senha_fat: # Only update if not empty
+        uc.senha_fat_criptografada = encrypt_password(request.senha_fat)
+    if request.url_portal_fat is not None:
+        uc.url_portal_fat = request.url_portal_fat
+        
+    db.commit()
+    return {"message": "Credenciais atualizadas com sucesso."}
+
+@router.delete("/credentials/{id}")
+def delete_credential(id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acesso negado. Apenas administradores podem gerenciar credenciais."
+        )
+    
+    uc = db.query(UserConvenio).filter(UserConvenio.id == id).first()
+    if not uc:
+        raise HTTPException(status_code=404, detail="Credenciais não encontradas.")
+        
+    db.delete(uc)
+    db.commit()
+    return {"message": "Credenciais removidas com sucesso."}
+
+
 @router.get("", response_model=List[ConvenioResponse])
 @router.get("/", response_model=List[ConvenioResponse])
 def list_convenios(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
@@ -136,125 +263,7 @@ def list_procedimentos_by_convenio(id_convenio: int, db: Session = Depends(get_d
     ]
 
 
-class CredentialCreateRequest(BaseModel):
-    user_id: int
-    id_convenio: int
-    login: Optional[str] = None
-    senha: Optional[str] = None
-    cod_prestador: Optional[str] = None
-    login_fat: Optional[str] = None
-    senha_fat: Optional[str] = None
-    url_portal_fat: Optional[str] = None
 
-class CredentialUpdateRequest(BaseModel):
-    login: Optional[str] = None
-    senha: Optional[str] = None
-    cod_prestador: Optional[str] = None
-    login_fat: Optional[str] = None
-    senha_fat: Optional[str] = None
-    url_portal_fat: Optional[str] = None
-
-@router.get("/credentials")
-def list_credentials(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acesso negado. Apenas administradores podem acessar credenciais de convênios."
-        )
-    
-    uconvs = db.query(UserConvenio).all()
-    
-    # Resolve usernames and convenio names
-    users = {u.id: u.username for u in db.query(User).all()}
-    convs = {c.id_convenio: c.nome for c in db.query(Convenio).all()}
-    
-    res = []
-    for uc in uconvs:
-        res.append({
-            "id": uc.id,
-            "user_id": uc.user_id,
-            "username": users.get(uc.user_id, "Desconhecido"),
-            "id_convenio": uc.id_convenio,
-            "nome_convenio": convs.get(uc.id_convenio, "Desconhecido"),
-            "login": uc.login,
-            "has_senha": bool(uc.senha_criptografada),
-            "cod_prestador": uc.cod_prestador,
-            "login_fat": uc.login_fat,
-            "has_senha_fat": bool(uc.senha_fat_criptografada),
-            "url_portal_fat": uc.url_portal_fat
-        })
-    return res
-
-@router.post("/credentials")
-def create_credential(request: CredentialCreateRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acesso negado. Apenas administradores podem gerenciar credenciais."
-        )
-    
-    # Encrypt passwords if provided
-    senha_enc = encrypt_password(request.senha) if request.senha else None
-    senha_fat_enc = encrypt_password(request.senha_fat) if request.senha_fat else None
-    
-    new_uc = UserConvenio(
-        user_id=request.user_id,
-        id_convenio=request.id_convenio,
-        login=request.login,
-        senha_criptografada=senha_enc,
-        cod_prestador=request.cod_prestador,
-        login_fat=request.login_fat,
-        senha_fat_criptografada=senha_fat_enc,
-        url_portal_fat=request.url_portal_fat
-    )
-    db.add(new_uc)
-    db.commit()
-    db.refresh(new_uc)
-    return {"message": "Credenciais criadas com sucesso.", "id": new_uc.id}
-
-@router.put("/credentials/{id}")
-def update_credential(id: int, request: CredentialUpdateRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acesso negado. Apenas administradores podem gerenciar credenciais."
-        )
-    
-    uc = db.query(UserConvenio).filter(UserConvenio.id == id).first()
-    if not uc:
-        raise HTTPException(status_code=404, detail="Credenciais não encontradas.")
-    
-    if request.login is not None:
-        uc.login = request.login
-    if request.senha: # Only update if not empty
-        uc.senha_criptografada = encrypt_password(request.senha)
-    if request.cod_prestador is not None:
-        uc.cod_prestador = request.cod_prestador
-    if request.login_fat is not None:
-        uc.login_fat = request.login_fat
-    if request.senha_fat: # Only update if not empty
-        uc.senha_fat_criptografada = encrypt_password(request.senha_fat)
-    if request.url_portal_fat is not None:
-        uc.url_portal_fat = request.url_portal_fat
-        
-    db.commit()
-    return {"message": "Credenciais atualizadas com sucesso."}
-
-@router.delete("/credentials/{id}")
-def delete_credential(id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    if not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Acesso negado. Apenas administradores podem gerenciar credenciais."
-        )
-    
-    uc = db.query(UserConvenio).filter(UserConvenio.id == id).first()
-    if not uc:
-        raise HTTPException(status_code=404, detail="Credenciais não encontradas.")
-        
-    db.delete(uc)
-    db.commit()
-    return {"message": "Credenciais removidas com sucesso."}
 
 
 @router.get("/all", response_model=List[ConvenioResponse])

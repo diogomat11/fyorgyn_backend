@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from database import get_db
-from dependencies import get_current_user
+from dependencies import get_current_user, get_effective_user_id
 from models import BaseGuia, Carteirinha, Job
 from typing import Optional
 from datetime import date, datetime, timedelta
@@ -71,7 +71,7 @@ def list_guias(
         func.sum(case((Agendamento.Status == 'A Confirmar', 1), else_=0)).label('q_a_confirmar')
     )
     if not current_user.is_admin:
-        subq_query = subq_query.filter(Agendamento.user_id == current_user.id)
+        subq_query = subq_query.filter(Agendamento.user_id == get_effective_user_id(current_user))
     subq = subq_query.group_by(Agendamento.numero_guia).subquery()
 
     query = db.query(
@@ -96,7 +96,7 @@ def list_guias(
     allowed_ids = get_allowed_convenio_ids(current_user)
     
     if not current_user.is_admin:
-        query = query.filter(BaseGuia.user_id == current_user.id)
+        query = query.filter(BaseGuia.user_id == get_effective_user_id(current_user))
     
     if id_convenio:
         if allowed_ids and id_convenio not in allowed_ids:
@@ -142,7 +142,7 @@ def list_guias(
         job_query = db.query(Job, Carteirinha.paciente.label('nome_paciente'), Carteirinha.carteirinha.label('carteirinha_numero'))\
             .outerjoin(Carteirinha, Job.carteirinha_id == Carteirinha.id)
         if not current_user.is_admin:
-            job_query = job_query.filter(Job.user_id == current_user.id)
+            job_query = job_query.filter(Job.user_id == get_effective_user_id(current_user))
         if id_convenio:
             job_query = job_query.filter(Job.id_convenio == id_convenio)
         # Excluir jobs de rotinas internas de sistema
@@ -227,7 +227,7 @@ def list_guias(
          ))
          
         if not current_user.is_admin:
-            sol_query = sol_query.filter(Solicitacao.user_id == current_user.id)
+            sol_query = sol_query.filter(Solicitacao.user_id == get_effective_user_id(current_user))
             
         # Excluir guias autorizadas/liberadas e solicitações que já possuem guias correspondentes na base_guias para evitar duplicação
         from sqlalchemy import exists
@@ -382,7 +382,7 @@ def export_guias(
         allowed_ids = get_allowed_convenio_ids(current_user)
         
         if not current_user.is_admin:
-            query = query.filter(BaseGuia.user_id == current_user.id)
+            query = query.filter(BaseGuia.user_id == get_effective_user_id(current_user))
         
         if id_convenio:
             if allowed_ids and id_convenio not in allowed_ids:
