@@ -11,20 +11,17 @@ import pandas as pd
 import json
 from io import BytesIO
 import os
-import shutil
-import uuid
 import requests
 import re
 import urllib.parse
 from security_utils import decrypt_password
 from timezone_utils import localize_datetime
+from services import storage_service
 
 router = APIRouter(
     prefix="/jobs",
     tags=["Jobs"]
 )
-
-UPLOAD_DIR = os.path.join("uploads", "anexos")
 
 def get_evoluir_session(db: Session, user_id: int) -> requests.Session:
     uconv = db.query(UserConvenio).filter(
@@ -106,15 +103,12 @@ def download_evoluir_pdf_auth(db: Session, user_id: int, evoluir_url: str, base_
     if r_pdf.status_code != 200:
         raise ConnectionError(f"Erro ao baixar PDF do Evoluir ({r_pdf.status_code}): {r_pdf.text[:200]}")
         
-    # Save the file locally
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    
-    # Extract original filename and add suffix based on the URL type
+    # Define o nome do arquivo (com sufixo conforme o tipo de URL do Evoluir)
     original_basename = os.path.basename(parsed_url.path)
     base_name, ext = os.path.splitext(original_basename)
     if not ext:
         ext = ".pdf"
-        
+
     if "/pdf/ii/" in evoluir_url:
         filename = f"{base_name}-ANEXOII{ext}"
     elif "/pdf/" in evoluir_url:
@@ -124,18 +118,13 @@ def download_evoluir_pdf_auth(db: Session, user_id: int, evoluir_url: str, base_
             filename = f"{original_basename}.pdf"
         else:
             filename = original_basename
-    
-    # Clean spaces/bad chars
-    clean_name = filename.replace(" ", "")
-    clean_name = re.sub(r'[\\/*?:"<>|]', '_', clean_name)
-    
-    unique_filename = f"{uuid.uuid4().hex}_{clean_name}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
-    
-    with open(file_path, "wb") as f:
-        f.write(r_pdf.content)
-        
-    return f"{base_url}/uploads/anexos/{unique_filename}"
+
+    # Persiste no Supabase Storage (bucket 'anexos') com fallback local.
+    anexo_url = storage_service.save_anexo(filename, r_pdf.content, content_type="application/pdf")
+    # Garante URL absoluta (o worker consome o anexo por essa URL).
+    if anexo_url.startswith("/"):
+        anexo_url = f"{base_url.rstrip('/')}{anexo_url}"
+    return anexo_url
 
 
 @router.post("/upload-anexo")
@@ -143,23 +132,18 @@ def upload_anexo(
     file: UploadFile = File(...),
     current_user = Depends(get_current_user)
 ):
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    
-    # Remove apenas espaços e caracteres inválidos do SO, mantendo acentos, parênteses e hífens originais
-    clean_name = file.filename.replace(" ", "")
-    import re
-    clean_name = re.sub(r'[\\/*?:"<>|]', '_', clean_name)
-    unique_filename = f"{uuid.uuid4().hex}_{clean_name}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
-    
-    # Salva o arquivo localmente no disco
+    # Salva o anexo no Supabase Storage (bucket 'anexos') com fallback local.
     try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        conteudo = file.file.read()
+        url = storage_service.save_anexo(
+            file.filename or "anexo",
+            conteudo,
+            content_type=file.content_type or "application/octet-stream",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao salvar anexo: {str(e)}")
-        
-    return {"url": f"/uploads/anexos/{unique_filename}"}
+
+    return {"url": url}
 
 class TemporaryPatientData(BaseModel):
     carteirinha: str

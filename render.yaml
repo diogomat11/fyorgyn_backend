@@ -1,0 +1,56 @@
+# Blueprint Render - backend (Hub FyorGyn API) - CONTA A.
+# Deploy: New -> Blueprint -> selecione o repo do backend.
+# Env vars com `sync: false` devem ser preenchidas no dashboard (segredos).
+# Servico native Python (sem Docker). Versao default do Render (3.11.x) atende as deps.
+services:
+  - type: web
+    name: agendahub-backend
+    runtime: python
+    region: ohio            # ajuste para a regiao mais proxima dos usuarios (BR -> us-east/ohio)
+    plan: free              # migrar para "starter" (always-on) ao entrar cliente
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      # Banco (Postgres/Supabase)
+      - key: SUPABASE_DB_HOST
+        sync: false
+      - key: SUPABASE_DB_PORT
+        value: "5432"
+      - key: SUPABASE_DB_USER
+        sync: false
+      - key: SUPABASE_DB_NAME
+        sync: false
+      - key: SUPABASE_PASSWORD
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Cache (Upstash rediss://)
+      - key: REDIS_URL
+        sync: false
+      # Storage (Supabase) - manter "0" ate criar os buckets; virar "1" apos (DEPLOY.md 3.1)
+      - key: USE_SUPABASE_STORAGE
+        value: "0"
+      # Auth
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRATION_HOURS
+        value: "12"
+      - key: FERNET_SECRET
+        sync: false
+      # API
+      - key: API_TOKEN
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      # Service URLs
+      - key: BACKEND_WORKER_URL   # URL publica do backend_worker (conta B)
+        sync: false
+      - key: MY_WEBHOOK_URL       # URL publica deste proprio hub + /api/jobs/webhook
+        sync: false
+      # IA
+      - key: GEMINI_API_KEYS
+        sync: false

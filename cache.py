@@ -18,36 +18,58 @@ class TenantCache:
             cls._instance._init_connection()
         return cls._instance
         
+    def _build_client(self, redis_url, redis_host, redis_port, redis_password, redis_db, ssl_cert_reqs=None):
+        """Constroi o cliente redis. Para rediss:// (ex.: Upstash) aplica TLS."""
+        common = dict(socket_timeout=2.0, socket_connect_timeout=2.0, retry_on_timeout=True)
+        if redis_url:
+            kwargs = dict(common)
+            # So repassa ssl_cert_reqs para URLs TLS (rediss://); evita afetar redis:// comum.
+            if redis_url.lower().startswith("rediss://") and ssl_cert_reqs is not None:
+                kwargs["ssl_cert_reqs"] = ssl_cert_reqs
+            return redis.Redis.from_url(redis_url, **kwargs)
+        return redis.Redis(
+            host=redis_host,
+            port=redis_port,
+            password=redis_password,
+            db=redis_db,
+            **common,
+        )
+
     def _init_connection(self):
         self.lock = threading.Lock()
         self.in_memory_db = {}  # key -> (expiry_timestamp, value_json_str)
-        
+
         REDIS_URL = os.getenv("REDIS_URL")
         REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
         REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
         REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
         REDIS_DB = int(os.getenv("REDIS_DB", 0))
-        
+
+        is_tls = bool(REDIS_URL) and REDIS_URL.lower().startswith("rediss://")
+
         try:
-            if REDIS_URL:
-                self.redis_client = redis.Redis.from_url(
-                    REDIS_URL,
-                    socket_timeout=2.0,
-                    socket_connect_timeout=2.0,
-                    retry_on_timeout=True
+            if is_tls:
+                # Upstash/Redis sobre TLS: tentar com validacao de certificado (CA publica valida).
+                self.redis_client = self._build_client(
+                    REDIS_URL, REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB, ssl_cert_reqs="required"
                 )
+                try:
+                    self.redis_client.ping()
+                except Exception:
+                    # CA nao disponivel no ambiente -> tentar sem verificacao de certificado.
+                    self.redis_client = self._build_client(
+                        REDIS_URL, REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB, ssl_cert_reqs=None
+                    )
+                    self.redis_client.ping()
+                    logger.warning(
+                        "Redis TLS conectado SEM verificacao de certificado "
+                        "(CA nao disponivel no ambiente)."
+                    )
             else:
-                self.redis_client = redis.Redis(
-                    host=REDIS_HOST,
-                    port=REDIS_PORT,
-                    password=REDIS_PASSWORD,
-                    db=REDIS_DB,
-                    socket_timeout=2.0,
-                    socket_connect_timeout=2.0,
-                    retry_on_timeout=True
+                self.redis_client = self._build_client(
+                    REDIS_URL, REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB
                 )
-            # Test connection
-            self.redis_client.ping()
+                self.redis_client.ping()
             self.redis_enabled = True
             self.enabled = True
             logger.info("Conexão com Redis estabelecida com sucesso.")
