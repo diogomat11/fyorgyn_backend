@@ -17,15 +17,18 @@ DB_HOST = os.getenv("SUPABASE_DB_HOST", "db.ourddwzetcbdjnbvamgj.supabase.co")
 DB_PORT = os.getenv("SUPABASE_DB_PORT", "5432")
 DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
 
-# Prefer direct Supabase PostgreSQL connection via SUPABASE_DB_HOST to bypass PgBouncer limits
-if DB_HOST and "supabase.co" in DB_HOST and DB_PASSWORD:
+# Prefer DATABASE_URL when explicitly set: enables the Supabase POOLER (IPv4),
+# needed in clouds like Render where the direct host db.*.supabase.co is
+# IPv6-only ("Network is unreachable"). Force port 5432 (session mode), safer
+# for SQLAlchemy ORM. connect_args already handles pooler compatibility
+# (prepare_threshold=None). Falls back to direct SUPABASE_DB_* construction.
+_DATABASE_URL_ENV = os.getenv("DATABASE_URL", "").strip()
+if _DATABASE_URL_ENV:
+    SQLALCHEMY_DATABASE_URL = _DATABASE_URL_ENV.replace(":6543", ":5432")
+elif DB_HOST and "supabase.co" in DB_HOST and DB_PASSWORD:
     SQLALCHEMY_DATABASE_URL = f"postgresql://postgres:{DB_PASSWORD}@{DB_HOST}:5432/{DB_NAME}"
 else:
-    SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
-    if not SQLALCHEMY_DATABASE_URL:
-        SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    if SQLALCHEMY_DATABASE_URL and ":6543" in SQLALCHEMY_DATABASE_URL:
-        SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(":6543", ":5432")
+    SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, 
