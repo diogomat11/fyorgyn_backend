@@ -33,12 +33,10 @@ else:
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     use_native_hstore=False,
-    # Supabase session pooler (porta 5432) limita a 15 clientes no total
-    # (EMAXCONNSESSION). Pool pequeno + max_overflow=0 evita esgotar e ficar
-    # esperando vaga (causa da lentidao de 5-7s). Deixa folga p/ worker/dev.
-    pool_size=5,
-    max_overflow=0,
-    pool_timeout=30,
+    # Pool otimizado para concorrência multi-tenant sem bloqueio de threads
+    pool_size=10,
+    max_overflow=10,
+    pool_timeout=15,
     pool_recycle=300,
     pool_pre_ping=True,
     connect_args={

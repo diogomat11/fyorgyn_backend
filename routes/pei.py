@@ -63,14 +63,27 @@ def get_dashboard_stats(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    today = date.today()
-    
-    # Base query for active patients? Or just all?
-    # Stats: Vencidos, Vence D+7, Vence D+30
-    
-    # Isolation
-    query_base = db.query(func.count(PatientPei.id)).join(Carteirinha)
     target_id = get_effective_user_id(current_user)
+    cache_params = {"id_convenio": id_convenio}
+    from cache import cache
+    cached_res = cache.get(target_id, "pei_dashboard", cache_params)
+    if cached_res:
+        return cached_res
+
+    today = date.today()
+    d7_end = today + timedelta(days=7)
+    d30_end = today + timedelta(days=30)
+    
+    from sqlalchemy import case
+    query_base = db.query(
+        func.count(PatientPei.id).label("total"),
+        func.count(case(((PatientPei.validade < today), 1))).label("vencidos"),
+        func.count(case(((PatientPei.validade >= today) & (PatientPei.validade <= d7_end), 1))).label("vence_d7"),
+        func.count(case(((PatientPei.validade >= today) & (PatientPei.validade <= d30_end), 1))).label("vence_d30"),
+        func.count(case(((PatientPei.status == 'Pendente'), 1))).label("pendentes"),
+        func.count(case(((PatientPei.status == 'Validado'), 1))).label("validados")
+    ).join(Carteirinha, PatientPei.carteirinha_id == Carteirinha.id)
+    
     if not current_user.is_admin:
         query_base = query_base.filter(PatientPei.user_id == target_id)
     from dependencies import get_allowed_convenio_ids
@@ -83,35 +96,23 @@ def get_dashboard_stats(
     elif allowed_ids:
         query_base = query_base.filter(Carteirinha.id_convenio.in_(allowed_ids))
     
-    # Vencidos
-    vencidos = query_base.filter(PatientPei.validade < today).scalar()
+    stats_row = query_base.first()
     
-    # Vence D+7
-    d7_end = today + timedelta(days=7)
-    vence_d7 = query_base.filter(
-        PatientPei.validade >= today, 
-        PatientPei.validade <= d7_end
-    ).scalar()
-    
-    # Vence D+30
-    d30_end = today + timedelta(days=30)
-    vence_d30 = query_base.filter(
-        PatientPei.validade >= today, 
-        PatientPei.validade <= d30_end
-    ).scalar()
-    
-    total = query_base.scalar()
-    pendentes = query_base.filter(PatientPei.status == 'Pendente').scalar()
-    validados = query_base.filter(PatientPei.status == 'Validado').scalar()
-
-    return {
-        "total": total,
-        "vencidos": vencidos or 0,
-        "vence_d7": vence_d7 or 0,
-        "vence_d30": vence_d30 or 0,
-        "pendentes": pendentes or 0,
-        "validados": validados or 0
+    res = {
+        "total": stats_row.total if stats_row else 0,
+        "vencidos": stats_row.vencidos if stats_row else 0,
+        "vence_d7": stats_row.vence_d7 if stats_row else 0,
+        "vence_d30": stats_row.vence_d30 if stats_row else 0,
+        "pendentes": stats_row.pendentes if stats_row else 0,
+        "validados": stats_row.validados if stats_row else 0
     }
+    
+    try:
+        cache.set(target_id, "pei_dashboard", cache_params, res, ttl=30)
+    except Exception:
+        pass
+        
+    return res
 
 @router.get("/")
 def list_pei(
@@ -126,6 +127,22 @@ def list_pei(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    target_id = get_effective_user_id(current_user)
+    cache_params = {
+        "page": page,
+        "pageSize": pageSize,
+        "search": search,
+        "status": status,
+        "validade_start": str(validade_start) if validade_start else None,
+        "validade_end": str(validade_end) if validade_end else None,
+        "vencimento_filter": vencimento_filter,
+        "id_convenio": id_convenio
+    }
+    from cache import cache
+    cached_res = cache.get(target_id, "pei_list", cache_params)
+    if cached_res:
+        return cached_res
+
     # Optimized query selecting only necessary columns
     query = db.query(
         PatientPei.id,
@@ -147,7 +164,6 @@ def list_pei(
      .outerjoin(BaseGuia, PatientPei.base_guia_id == BaseGuia.id)
     
     # Isolation
-    target_id = get_effective_user_id(current_user)
     if not current_user.is_admin:
         query = query.filter(PatientPei.user_id == target_id)
     from dependencies import get_allowed_convenio_ids
@@ -187,12 +203,19 @@ def list_pei(
             "updated_at": row.updated_at
         })
 
-    return {
+    payload = {
         "data": data,
         "total": total_items,
         "page": page,
         "pageSize": pageSize
     }
+    
+    try:
+        cache.set(target_id, "pei_list", cache_params, payload, ttl=30)
+    except Exception:
+        pass
+        
+    return payload
 
 @router.get("/export")
 def export_pei(
@@ -441,7 +464,12 @@ def override_pei(
     # Just in case we want to return the updated status immediately:
     # update_patient_pei(db, guia.carteirinha_id, guia.codigo_terapia)
     
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
+    
     return {"status": "success"}
 
 # Note: update_patient_pei_backend removed as it is now in services/pei_service.py
-

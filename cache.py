@@ -90,16 +90,7 @@ class TenantCache:
             return None
         key = self._make_key(tenant_id, resource, query_params)
         
-        if self.redis_enabled and self.redis_client:
-            try:
-                val = self.redis_client.get(key)
-                if val:
-                    return json.loads(val)
-            except Exception as e:
-                logger.error(f"Erro ao ler do Redis para chave {key}: {e}")
-            return None
-            
-        # In-Memory fallback
+        # 1. Tier 1: Instant In-Memory RAM lookup (sub-millisecond <0.05ms)
         with self.lock:
             cached = self.in_memory_db.get(key)
             if cached:
@@ -108,40 +99,59 @@ class TenantCache:
                     return json.loads(val_str)
                 else:
                     self.in_memory_db.pop(key, None)
+                    
+        # 2. Tier 2: Remote Redis lookup (L2)
+        if self.redis_enabled and self.redis_client:
+            try:
+                val = self.redis_client.get(key)
+                if val:
+                    # Promote back to Tier 1 RAM cache
+                    with self.lock:
+                        self.in_memory_db[key] = (time.time() + 60, val)
+                    return json.loads(val)
+            except Exception as e:
+                logger.error(f"Erro ao ler do Redis para chave {key}: {e}")
+                
         return None
 
     def set(self, tenant_id: int, resource: str, query_params: dict, value: Any, ttl: int = 60) -> bool:
         if not self.enabled:
             return False
         key = self._make_key(tenant_id, resource, query_params)
+        val_str = json.dumps(value, default=str)
         
-        if self.redis_enabled and self.redis_client:
-            try:
-                self.redis_client.setex(
-                    key,
-                    ttl,
-                    json.dumps(value, default=str)
-                )
-                return True
-            except Exception as e:
-                logger.error(f"Erro ao salvar no Redis para chave {key}: {e}")
-                return False
-                
-        # In-Memory fallback
+        # 1. Save to Tier 1 (In-Memory RAM)
         with self.lock:
             try:
                 expiry = time.time() + ttl
-                val_str = json.dumps(value, default=str)
                 self.in_memory_db[key] = (expiry, val_str)
-                return True
             except Exception as e:
-                logger.error(f"Erro ao salvar no cache local para chave {key}: {e}")
-                return False
+                logger.error(f"Erro ao salvar no cache local RAM para chave {key}: {e}")
+
+        # 2. Save to Tier 2 (Redis)
+        if self.redis_enabled and self.redis_client:
+            try:
+                self.redis_client.setex(key, ttl, val_str)
+            except Exception as e:
+                logger.error(f"Erro ao salvar no Redis para chave {key}: {e}")
+
+        return True
 
     def invalidate_tenant(self, tenant_id: int) -> bool:
         if not self.enabled:
             return False
             
+        # 1. Wipe from Tier 1 (In-Memory RAM)
+        prefix = f"tenant:{tenant_id}:"
+        with self.lock:
+            try:
+                keys_to_del = [k for k in self.in_memory_db.keys() if k.startswith(prefix)]
+                for k in keys_to_del:
+                    self.in_memory_db.pop(k, None)
+            except Exception as e:
+                logger.error(f"Erro ao invalidar cache RAM local para tenant {tenant_id}: {e}")
+
+        # 2. Wipe from Tier 2 (Redis)
         if self.redis_enabled and self.redis_client:
             pattern = f"tenant:{tenant_id}:*"
             try:
@@ -155,24 +165,10 @@ class TenantCache:
                 
                 if keys_to_delete:
                     self.redis_client.delete(*keys_to_delete)
-                    logger.info(f"Invalidados {len(keys_to_delete)} itens de cache do tenant {tenant_id}.")
-                return True
             except Exception as e:
-                logger.error(f"Erro ao invalidar cache para o tenant {tenant_id}: {e}")
-                return False
-                
-        # In-Memory fallback
-        prefix = f"tenant:{tenant_id}:"
-        with self.lock:
-            try:
-                keys_to_del = [k for k in self.in_memory_db.keys() if k.startswith(prefix)]
-                for k in keys_to_del:
-                    self.in_memory_db.pop(k, None)
-                logger.info(f"Invalidados {len(keys_to_del)} itens de cache local do tenant {tenant_id}.")
-                return True
-            except Exception as e:
-                logger.error(f"Erro ao invalidar cache local para o tenant {tenant_id}: {e}")
-                return False
+                logger.error(f"Erro ao invalidar cache Redis para tenant {tenant_id}: {e}")
+
+        return True
 
 # Export singleton instance
 cache = TenantCache()

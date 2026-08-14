@@ -15,7 +15,7 @@ from models import (
     BaseGuia
 )
 from dependencies import get_current_user, get_current_worker_key, get_effective_user_id
-from sqlalchemy import func, String, cast
+from sqlalchemy import func, String, cast, or_
 
 router = APIRouter(
     prefix="/agendamentos",
@@ -131,6 +131,11 @@ def create_agendamento(req: CreateAgendamentoRequest, db: Session = Depends(get_
         db.add(new_agendamento)
         db.commit()
         db.refresh(new_agendamento)
+        try:
+            from cache import cache
+            cache.invalidate_tenant(get_effective_user_id(current_user))
+        except Exception:
+            pass
         return {"status": "success", "agendamento": new_agendamento}
     except Exception as e:
         db.rollback()
@@ -146,7 +151,10 @@ def vincular_guias_manualmente(db: Session = Depends(get_db), current_user = Dep
     try:
         query = db.query(BaseGuia).filter(
             BaseGuia.saldo > 0,
-            BaseGuia.status_guia.notin_(['Cancelada', 'Negada'])
+            or_(
+                BaseGuia.status_guia.ilike('%autorizad%'),
+                BaseGuia.status_guia.ilike('%liberad%')
+            )
         )
         if not current_user.is_admin:
             query = query.filter(BaseGuia.user_id == get_effective_user_id(current_user))
@@ -155,6 +163,11 @@ def vincular_guias_manualmente(db: Session = Depends(get_db), current_user = Dep
             BaseGuia.updated_at: func.now()
         }, synchronize_session=False)
         db.commit()
+        try:
+            from cache import cache
+            cache.invalidate_tenant(get_effective_user_id(current_user))
+        except Exception:
+            pass
         return {"status": "success", "message": f"Varredura de Guias ativada. Lotes com saldo positivo reagiram ao pulso."}
     except Exception as e:
         db.rollback()
@@ -229,9 +242,29 @@ def list_agendamentos(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    target_user_id = get_effective_user_id(current_user)
+    
+    # 1. Lookup Redis Cache
+    cache_params = {
+        "paciente": paciente,
+        "id_convenio": id_convenio,
+        "id_unidade": id_unidade,
+        "data_inicio": str(data_inicio) if data_inicio else None,
+        "data_fim": str(data_fim) if data_fim else None,
+        "status": status,
+        "procedimento": procedimento,
+        "sem_carteirinha": sem_carteirinha,
+        "limit": limit,
+        "skip": skip
+    }
+    from cache import cache
+    cached_res = cache.get(target_user_id, "agendamentos", cache_params)
+    if cached_res:
+        return cached_res
+
     base_query = db.query(Agendamento)
     if not current_user.is_admin:
-        base_query = base_query.filter(Agendamento.user_id == get_effective_user_id(current_user))
+        base_query = base_query.filter(Agendamento.user_id == target_user_id)
     
     if paciente:
         base_query = base_query.filter(Agendamento.Nome_Paciente.ilike(f"%{paciente}%"))
@@ -254,19 +287,30 @@ def list_agendamentos(
             (Agendamento.carteirinha == None) | (func.trim(Agendamento.carteirinha) == '')
         )
 
-    # Calculate KPIs from base_query BEFORE status filtering
-    # Pendentes rule: Status == 'Pendente' OR (Status == 'Confirmado' AND (numero_guia IS NULL OR numero_guia = ''))
+    # Calculate KPIs from base_query BEFORE status filtering in ONE single aggregated query
     pendentes_condition = (Agendamento.Status == 'Pendente') | (
         (Agendamento.Status == 'Confirmado') & (
             (Agendamento.numero_guia == None) | (func.trim(Agendamento.numero_guia) == '')
         )
     )
     
-    confirmados_count = base_query.filter(Agendamento.Status == 'Confirmado').count()
-    a_confirmar_count = base_query.filter(Agendamento.Status == 'A Confirmar').count()
-    faltas_count = base_query.filter(Agendamento.Status == 'Falta').count()
-    faturados_count = base_query.filter(Agendamento.Status.in_(['Faturado', 'Faturamento Solicitado'])).count()
-    pendentes_count = base_query.filter(pendentes_condition).count()
+    from sqlalchemy import case
+    base_filters = base_query.whereclause.clauses if hasattr(base_query.whereclause, 'clauses') else [base_query.whereclause] if base_query.whereclause is not None else []
+    
+    kpi_aggregations = db.query(
+        func.count(Agendamento.id_agendamento).label("total_base"),
+        func.count(case((Agendamento.Status == 'Confirmado', 1))).label("confirmados"),
+        func.count(case((Agendamento.Status == 'A Confirmar', 1))).label("a_confirmar"),
+        func.count(case((Agendamento.Status == 'Falta', 1))).label("faltas"),
+        func.count(case((Agendamento.Status.in_(['Faturado', 'Faturamento Solicitado']), 1))).label("faturados"),
+        func.count(case((pendentes_condition, 1))).label("pendentes")
+    ).filter(*base_filters).first()
+
+    confirmados_count = kpi_aggregations.confirmados if kpi_aggregations else 0
+    a_confirmar_count = kpi_aggregations.a_confirmar if kpi_aggregations else 0
+    faltas_count = kpi_aggregations.faltas if kpi_aggregations else 0
+    faturados_count = kpi_aggregations.faturados if kpi_aggregations else 0
+    pendentes_count = kpi_aggregations.pendentes if kpi_aggregations else 0
 
     query = base_query
     if status:
@@ -276,8 +320,9 @@ def list_agendamentos(
             query = query.filter(Agendamento.Status.in_(['Faturado', 'Faturamento Solicitado']))
         else:
             query = query.filter(Agendamento.Status == status)
-        
-    total = query.count()
+        total = query.count()
+    else:
+        total = kpi_aggregations.total_base if kpi_aggregations else 0
     
     # Outer join to fetch the Saldo da Guia if numero_guia is populated
     from sqlalchemy.orm import aliased
@@ -287,10 +332,15 @@ def list_agendamentos(
     # Pre-fetch unidades for name mapping
     unidades_map = {u.id_unidade: u.nome for u in db.query(Unidade).all()}
     
+    join_cond = (Agendamento.numero_guia == bg.guia)
+    if not current_user.is_admin:
+        join_cond = join_cond & (bg.user_id == target_user_id)
+
+    query_filters = query.whereclause.clauses if hasattr(query.whereclause, 'clauses') else [query.whereclause] if query.whereclause is not None else []
     agendamentos = (
         db.query(Agendamento, bg.saldo.label("saldo_guia"), bg.timestamp_captura.label("timestamp_captura"))
-        .outerjoin(bg, Agendamento.numero_guia == bg.guia)
-        .filter(*query.whereclause.clauses if hasattr(query.whereclause, 'clauses') else [query.whereclause] if query.whereclause is not None else [])
+        .outerjoin(bg, join_cond)
+        .filter(*query_filters)
         .order_by(Agendamento.data.desc().nulls_last(), Agendamento.hora_inicio.desc().nulls_last())
         .limit(limit)
         .offset(skip)
@@ -306,15 +356,10 @@ def list_agendamentos(
         dic["nome_unidade"] = unidades_map.get(ag.id_unidade) if ag.id_unidade else None
         data.append(dic)
         
-    if not current_user.is_admin:
-        total_db_unfiltered = db.query(Agendamento).filter(Agendamento.user_id == get_effective_user_id(current_user)).count()
-    else:
-        total_db_unfiltered = db.query(Agendamento).count()
-        
-    return {
+    res_payload = {
         "data": data, 
         "total": total, 
-        "total_geral": total_db_unfiltered, 
+        "total_geral": total, 
         "skip": skip, 
         "limit": limit,
         "kpis": {
@@ -326,6 +371,14 @@ def list_agendamentos(
             "sem_carteirinha": pendentes_count
         }
     }
+    
+    # Cache result for 20 seconds
+    try:
+        cache.set(target_user_id, "agendamentos", cache_params, res_payload, ttl=20)
+    except Exception:
+        pass
+        
+    return res_payload
 
 @router.get("/procedimentos")
 def list_procedimentos(id_convenio: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
@@ -522,6 +575,11 @@ def batch_update_status(req: BatchStatusRequest, db: Session = Depends(get_db), 
                             jobs_created += 1
  
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
     return {"status": "success", "updated": len(req.ids), "jobs_created": jobs_created}
 
 class BatchDeleteRequest(BaseModel):
@@ -550,6 +608,11 @@ def batch_delete(req: BatchDeleteRequest, db: Session = Depends(get_db), current
         
     deleted = db.query(Agendamento).filter(Agendamento.id_agendamento.in_(req.ids)).delete(synchronize_session=False)
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
     return {"status": "success", "deleted": deleted}
 
 class FaturarRequest(BaseModel):
@@ -851,79 +914,6 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
     return {"status": "success", "job_id": new_job.id, "captura_job_id": cap_job_id}
 
 
-@router.get("/profissionais")
-def list_profissionais(
-    tipo: Optional[str] = None,
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
-):
-    """Retorna a lista de profissionais ativos do corpo clínico, opcionalmente filtrados por tipo (profissional/medico)."""
-    query = db.query(CorpoClinico).filter(CorpoClinico.status == "ativo")
-    if not current_user.is_admin:
-        query = query.filter((CorpoClinico.user_id == current_user.id) | (CorpoClinico.user_id.is_(None)))
-    
-    if tipo:
-        query = query.filter(CorpoClinico.tipo_profissional == tipo)
-        
-    profissionais = query.order_by(CorpoClinico.nome).all()
-    return [
-        {
-            "id_profissional": p.id_profissional,
-            "nome": p.nome,
-            "cpf": p.cpf or "",
-            "area": p.area or "",
-            "conselho": p.conselho or "",
-            "registro": p.registro or "",
-            "UF": p.UF or "",
-            "CBO": p.CBO or "",
-            "codigo_ipasgo": p.codigo_ipasgo or "",
-            "tipo_profissional": p.tipo_profissional or "profissional"
-        }
-        for p in profissionais
-    ]
-
-
-class ProfissionalCreateSchema(BaseModel):
-    nome: str
-    cpf: Optional[str] = None
-    area: Optional[str] = None
-    conselho: Optional[str] = None
-    registro: Optional[str] = None
-    UF: Optional[str] = None
-    CBO: Optional[str] = None
-    codigo_ipasgo: Optional[str] = None
-    tipo_profissional: Optional[str] = "profissional"
-
-
-@router.post("/profissionais")
-def create_profissional(
-    req: ProfissionalCreateSchema,
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
-):
-    new_prof = CorpoClinico(
-        nome=req.nome,
-        cpf=req.cpf,
-        area=req.area,
-        conselho=req.conselho,
-        registro=req.registro,
-        UF=req.UF,
-        CBO=req.CBO,
-)
-    
-    new_job = Job(
-        carteirinha_id=cart.id,
-        id_convenio=agenda.id_convenio,
-        rotina="op2_captura",
-        status="pending",
-        params=json.dumps({"agendamento_id": agenda.id_agendamento, "numero_guia": agenda.numero_guia or ""}),
-        user_id=get_effective_user_id(current_user)
-    )
-    db.add(new_job)
-    db.commit()
-    db.refresh(new_job)
-    return {"status": "success", "job_id": new_job.id}
-
 @router.post("/executar")
 def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     """Cria Job Execução. Para Goiânia/Anápolis, auto-cria Captura antes se necessário."""
@@ -1049,13 +1039,47 @@ def create_job_execucao(req: AgendamentoJobRequest, db: Session = Depends(get_db
 @router.get("/profissionais")
 def list_profissionais(
     tipo: Optional[str] = None,
+    search: Optional[str] = None,
+    skip: Optional[int] = None,
+    limit: Optional[int] = None,
+    page: Optional[int] = None,
+    pageSize: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """Retorna a lista de profissionais ativos do corpo clínico, opcionalmente filtrados por tipo (profissional/medico)."""
+    """Retorna a lista de profissionais ativos do corpo clínico com suporte a cache Two-Tier, busca e paginação."""
+    target_id = get_effective_user_id(current_user)
+    
+    # Calcular skip e limit se page/pageSize foram passados
+    actual_limit = limit if limit is not None else (pageSize if pageSize is not None else None)
+    actual_skip = skip if skip is not None else (((page - 1) * actual_limit) if (page is not None and actual_limit is not None) else None)
+    
+    cache_params = {
+        "tipo": tipo,
+        "search": search,
+        "skip": actual_skip,
+        "limit": actual_limit
+    }
+    
+    from cache import cache
+    cached_res = cache.get(target_id, "profissionais", cache_params)
+    if cached_res:
+        return cached_res
+
     query = db.query(CorpoClinico).filter(CorpoClinico.status == "ativo")
     if tipo:
         query = query.filter(CorpoClinico.tipo_profissional == tipo)
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                CorpoClinico.nome.ilike(s),
+                CorpoClinico.cpf.ilike(s),
+                CorpoClinico.area.ilike(s),
+                CorpoClinico.registro.ilike(s),
+                CorpoClinico.codigo_ipasgo.ilike(s)
+            )
+        )
 
     # Não-admin vê seus próprios profissionais OU registros globais (user_id IS NULL)
     # Médicos (tipo_profissional == 'medico') são sempre livres para todos os usuários
@@ -1066,9 +1090,17 @@ def list_profissionais(
             (CorpoClinico.user_id.is_(None))
         )
     
-    profissionais = query.order_by(CorpoClinico.nome).all()
+    total = query.count()
+    
+    order_query = query.order_by(CorpoClinico.nome)
+    if actual_skip is not None:
+        order_query = order_query.offset(actual_skip)
+    if actual_limit is not None:
+        order_query = order_query.limit(actual_limit)
+        
+    profissionais = order_query.all()
 
-    return [
+    items = [
         {
             "id_profissional": p.id_profissional,
             "nome": p.nome,
@@ -1083,6 +1115,24 @@ def list_profissionais(
         }
         for p in profissionais
     ]
+
+    # Se paginação foi solicitada, retorna objeto com data e total. Se não, lista simples compatível
+    if actual_limit is not None or page is not None:
+        result = {
+            "data": items,
+            "total": total,
+            "page": page or (actual_skip // actual_limit + 1 if actual_limit else 1),
+            "pageSize": actual_limit or total
+        }
+    else:
+        result = items
+
+    try:
+        cache.set(target_id, "profissionais", cache_params, result, ttl=120)
+    except Exception:
+        pass
+
+    return result
 
 
 class ProfissionalCreateSchema(BaseModel):
@@ -1119,6 +1169,11 @@ def create_profissional(
     db.add(new_prof)
     db.commit()
     db.refresh(new_prof)
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
     return {
         "status": "success",
         "id_profissional": new_prof.id_profissional,
@@ -1167,6 +1222,11 @@ def update_profissional(
     
     db.commit()
     db.refresh(prof)
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
     return {"status": "success", "id_profissional": prof.id_profissional}
 
 
@@ -1189,6 +1249,11 @@ def delete_profissional(
         
     prof.status = "inativo"
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
     return {"status": "success", "message": "Profissional desativado com sucesso."}
 
 
@@ -1257,6 +1322,11 @@ def confirmar_portal(
         Agendamento.execucao_status: "processando"
     }, synchronize_session=False)
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
 
     action = "remoção de confirmação" if req.remover else "confirmação"
     return {
@@ -1332,6 +1402,11 @@ def registrar_falta_portal(
         Agendamento.execucao_status: "processando"
     }, synchronize_session=False)
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
 
     return {
         "status": "success",
@@ -1405,6 +1480,11 @@ def remover_falta_portal(
         Agendamento.execucao_status: "processando"
     }, synchronize_session=False)
     db.commit()
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
 
 class ImprimirIpasgoRequest(BaseModel):
     agendamento_id: int

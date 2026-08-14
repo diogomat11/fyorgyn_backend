@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 from database import get_db
-from models import User, UserWorker, UserUserConvenio, UserConvenio
+from models import User, UserWorker, UserUserConvenio, UserConvenio, UserIntegrador
 from pydantic import BaseModel
 from typing import Optional, List
 import bcrypt

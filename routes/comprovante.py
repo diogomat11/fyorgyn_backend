@@ -58,19 +58,32 @@ def gerar_comprovante_pdf(
     else:
         all_agendamentos = initial_agendamentos
 
-    # 3. Group by numero_guia (or date/patient fallback)
+    # 3. Group by numero_guia (or single patient fallback)
     guias_map = {}
-    for ag in all_agendamentos:
-        # Validate convenio: Unimed Goiania (3) or Unimed Intercambio (21)
-        if ag.id_convenio not in [3, 21]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Impressão de comprovante presencial disponível apenas para Unimed Goiânia (3) e Unimed Intercâmbio (21). Convênio ID #{ag.id_convenio} não suportado."
-            )
-        guia_key = ag.numero_guia or f"guia_{ag.carteirinha}_{ag.data}"
-        if guia_key not in guias_map:
-            guias_map[guia_key] = []
-        guias_map[guia_key].append(ag)
+    unique_patients = set(ag.carteirinha or ag.id_paciente for ag in initial_agendamentos)
+
+    if len(unique_patients) == 1:
+        # Single patient selected: group all items into 1 guide key to ensure a single PDF is returned
+        primary_guia = next((ag.numero_guia for ag in initial_agendamentos if ag.numero_guia), None)
+        single_key = primary_guia or f"guia_{initial_agendamentos[0].carteirinha}_{initial_agendamentos[0].data}"
+        for ag in all_agendamentos:
+            if ag.id_convenio not in [3, 21]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Impressão de comprovante presencial disponível apenas para Unimed Goiânia (3) e Unimed Intercâmbio (21). Convênio ID #{ag.id_convenio} não suportado."
+                )
+        guias_map[single_key] = all_agendamentos
+    else:
+        for ag in all_agendamentos:
+            if ag.id_convenio not in [3, 21]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Impressão de comprovante presencial disponível apenas para Unimed Goiânia (3) e Unimed Intercâmbio (21). Convênio ID #{ag.id_convenio} não suportado."
+                )
+            guia_key = ag.numero_guia or f"guia_{ag.carteirinha}_{ag.data}"
+            if guia_key not in guias_map:
+                guias_map[guia_key] = []
+            guias_map[guia_key].append(ag)
 
     # 4. Generate PDF per guide
     pdf_results = []

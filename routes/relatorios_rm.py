@@ -100,9 +100,21 @@ def listar_relatorios(
     current_user=Depends(get_current_user),
 ):
     """List all therapy extractions for the current user."""
+    cache_params = {
+        "id_paciente": id_paciente,
+        "area": area,
+        "status": status,
+        "limit": limit,
+        "skip": skip
+    }
+    from cache import cache
+    cached_res = cache.get(current_user.id, "relatorios_rm", cache_params)
+    if cached_res:
+        return cached_res
+
     from services.relatorio_rm_service import list_extractions
 
-    return list_extractions(
+    res = list_extractions(
         db=db,
         user_id=current_user.id,
         id_paciente=id_paciente,
@@ -111,6 +123,13 @@ def listar_relatorios(
         limit=limit,
         skip=skip,
     )
+    
+    try:
+        cache.set(current_user.id, "relatorios_rm", cache_params, res, ttl=60)
+    except Exception:
+        pass
+        
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +182,11 @@ def atualizar_relatorio(
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar")
 
     result = update_extraction(db, extraction_id, updates)
+    try:
+        from cache import cache
+        cache.invalidate_tenant(current_user.id)
+    except Exception:
+        pass
     return result
 
 
@@ -188,4 +212,9 @@ def deletar_relatorio(
         raise HTTPException(status_code=403, detail="Sem permissão para esta extração.")
 
     success = delete_extraction(db, extraction_id)
+    try:
+        from cache import cache
+        cache.invalidate_tenant(current_user.id)
+    except Exception:
+        pass
     return {"message": "Extração removida com sucesso"}

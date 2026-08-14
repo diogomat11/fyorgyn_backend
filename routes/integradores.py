@@ -21,15 +21,17 @@ class IntegradorBase(BaseModel):
     sigla: Optional[str] = None
     tipo_operacao: str = "convenio"  # 'convenio' ou 'agendamento'
     ativo: bool = True
+    timeout_captura: bool = False
 
 class IntegradorCreate(IntegradorBase):
-    id_convenio: int
+    id_convenio: Optional[int] = None
 
 class IntegradorUpdate(BaseModel):
     nome: Optional[str] = None
     sigla: Optional[str] = None
     tipo_operacao: Optional[str] = None
     ativo: Optional[bool] = None
+    timeout_captura: Optional[bool] = None
 
 class IntegradorOperacaoCreate(BaseModel):
     rotina: str
@@ -64,34 +66,36 @@ def list_integradores(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """Lista todos os integradores com suas operações."""
-    query = db.query(Integrador)
+    """Lista todos os integradores com suas operações e configurações."""
+    from models import WorkerIntegrador, WorkerIntegradorOperacao
+    query = db.query(WorkerIntegrador)
     if ativo_only:
-        query = query.filter(Integrador.ativo == True)
+        query = query.filter(WorkerIntegrador.ativo == True)
     if tipo_operacao:
-        query = query.filter(Integrador.tipo_operacao == tipo_operacao)
+        query = query.filter(WorkerIntegrador.tipo_operacao == tipo_operacao)
     
-    integradores = query.order_by(Integrador.id_integrador.asc()).all()
+    integradores = query.order_by(WorkerIntegrador.id_integrador.asc()).all()
     
     result = []
     for ing in integradores:
-        ops = db.query(IntegradorOperacao).filter(IntegradorOperacao.id_integrador == ing.id_integrador).order_by(IntegradorOperacao.ordem.asc()).all()
+        ops = db.query(WorkerIntegradorOperacao).filter(WorkerIntegradorOperacao.id_integrador == ing.id_integrador).all()
         result.append({
             "id_integrador": ing.id_integrador,
-            "id_convenio": ing.id_convenio,
             "nome": ing.nome,
             "sigla": ing.sigla,
             "tipo_operacao": ing.tipo_operacao,
             "ativo": ing.ativo,
+            "timeout_captura": getattr(ing, "timeout_captura", False) or False,
             "created_at": ing.created_at,
             "operacoes": [
                 {
                     "id": op.id,
+                    "id_integrador": op.id_integrador,
                     "rotina": op.rotina,
                     "descricao": op.descricao,
                     "tipo_processamento": op.tipo_processamento,
                     "ativo": op.ativo,
-                    "ordem": op.ordem
+                    "modo_execucao": getattr(op, "modo_execucao", "automatico")
                 } for op in ops
             ]
         })
@@ -104,26 +108,17 @@ def create_integrador(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """Cria um novo integrador (Admin)."""
+    """Cria um novo integrador no schema worker (Admin)."""
+    from models import WorkerIntegrador
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Apenas administradores podem criar integradores")
     
-    # Verifica se convenio existe
-    conv = db.query(Convenio).filter(Convenio.id_convenio == data.id_convenio).first()
-    if not conv:
-        raise HTTPException(status_code=404, detail="Convênio não encontrado")
-    
-    # Verifica se ja existe integrador para este convenio
-    existing = db.query(Integrador).filter(Integrador.id_convenio == data.id_convenio).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Já existe um integrador para este convênio")
-    
-    ing = Integrador(
-        id_convenio=data.id_convenio,
+    ing = WorkerIntegrador(
         nome=data.nome,
         sigla=data.sigla,
         tipo_operacao=data.tipo_operacao,
-        ativo=data.ativo
+        ativo=data.ativo,
+        timeout_captura=data.timeout_captura
     )
     db.add(ing)
     db.commit()
@@ -167,17 +162,17 @@ def update_operacao_integrador(
     current_user = Depends(get_current_user)
 ):
     """Atualiza uma operação de integrador (Admin)."""
+    from models import WorkerIntegradorOperacao
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Apenas administradores podem atualizar operações")
     
-    op = db.query(IntegradorOperacao).filter(IntegradorOperacao.id == op_id).first()
+    op = db.query(WorkerIntegradorOperacao).filter(WorkerIntegradorOperacao.id == op_id).first()
     if not op:
         raise HTTPException(status_code=404, detail="Operação não encontrada")
     
     if data.descricao is not None: op.descricao = data.descricao
     if data.tipo_processamento is not None: op.tipo_processamento = data.tipo_processamento
     if data.ativo is not None: op.ativo = data.ativo
-    if data.ordem is not None: op.ordem = data.ordem
     
     db.commit()
     db.refresh(op)
@@ -191,11 +186,12 @@ def update_integrador(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """Atualiza dados do integrador (Admin)."""
+    """Atualiza dados do integrador e timeout de captura (Admin)."""
+    from models import WorkerIntegrador
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Apenas administradores podem atualizar integradores")
     
-    ing = db.query(Integrador).filter(Integrador.id_integrador == id_integrador).first()
+    ing = db.query(WorkerIntegrador).filter(WorkerIntegrador.id_integrador == id_integrador).first()
     if not ing:
         raise HTTPException(status_code=404, detail="Integrador não encontrado")
     
@@ -203,6 +199,7 @@ def update_integrador(
     if data.sigla is not None: ing.sigla = data.sigla
     if data.tipo_operacao is not None: ing.tipo_operacao = data.tipo_operacao
     if data.ativo is not None: ing.ativo = data.ativo
+    if data.timeout_captura is not None: ing.timeout_captura = data.timeout_captura
     
     db.commit()
     db.refresh(ing)
@@ -216,10 +213,11 @@ def delete_integrador(
     current_user = Depends(get_current_user)
 ):
     """Desativa um integrador (Admin)."""
+    from models import WorkerIntegrador
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Apenas administradores podem desativar integradores")
     
-    ing = db.query(Integrador).filter(Integrador.id_integrador == id_integrador).first()
+    ing = db.query(WorkerIntegrador).filter(WorkerIntegrador.id_integrador == id_integrador).first()
     if not ing:
         raise HTTPException(status_code=404, detail="Integrador não encontrado")
     
@@ -237,7 +235,8 @@ def list_operacoes_integrador(
     current_user = Depends(get_current_user)
 ):
     """Lista operações de um integrador."""
-    ops = db.query(IntegradorOperacao).filter(IntegradorOperacao.id_integrador == id_integrador).order_by(IntegradorOperacao.ordem.asc()).all()
+    from models import WorkerIntegradorOperacao
+    ops = db.query(WorkerIntegradorOperacao).filter(WorkerIntegradorOperacao.id_integrador == id_integrador).all()
     return ops
 
 
@@ -249,21 +248,20 @@ def create_operacao_integrador(
     current_user = Depends(get_current_user)
 ):
     """Cria uma nova operação para um integrador (Admin)."""
+    from models import WorkerIntegrador, WorkerIntegradorOperacao
     if not getattr(current_user, 'is_admin', False):
         raise HTTPException(status_code=403, detail="Apenas administradores podem adicionar operações")
     
-    ing = db.query(Integrador).filter(Integrador.id_integrador == id_integrador).first()
+    ing = db.query(WorkerIntegrador).filter(WorkerIntegrador.id_integrador == id_integrador).first()
     if not ing:
         raise HTTPException(status_code=404, detail="Integrador não encontrado")
     
-    op = IntegradorOperacao(
+    op = WorkerIntegradorOperacao(
         id_integrador=id_integrador,
-        id_convenio=ing.id_convenio,
         rotina=data.rotina,
         descricao=data.descricao,
         tipo_processamento=data.tipo_processamento,
-        ativo=data.ativo,
-        ordem=data.ordem
+        ativo=data.ativo
     )
     db.add(op)
     db.commit()

@@ -15,6 +15,9 @@ router = APIRouter(
 class ConvenioBase(BaseModel):
     nome: str
     digitos_carteirinha: Optional[int] = None
+    id_integrador: Optional[int] = None
+    operacoes_habilitadas: Optional[List[str]] = []
+    timeout_captura: Optional[bool] = False
 
 class ConvenioCreate(ConvenioBase):
     pass
@@ -23,6 +26,9 @@ class ConvenioUpdate(BaseModel):
     nome: Optional[str] = None
     registro_ans: Optional[str] = None
     digitos_carteirinha: Optional[int] = None
+    id_integrador: Optional[int] = None
+    operacoes_habilitadas: Optional[List[str]] = None
+    timeout_captura: Optional[bool] = None
 
 from pydantic import Field
 
@@ -38,11 +44,17 @@ class ConvenioResponse(ConvenioBase):
     id_convenio: int
     registro_ans: Optional[str] = None
     digitos_carteirinha: Optional[int] = None
+    id_integrador: Optional[int] = None
+    operacoes_habilitadas: Optional[List[str]] = []
     operacoes: List[ConvenioOperacaoResponse] = Field(default=[], validation_alias="operacoes_rel")
     
     class Config:
         from_attributes = True
         populate_by_name = True
+
+class ConvenioIntegradorMappingUpdate(BaseModel):
+    id_integrador: Optional[int] = None
+    operacoes_habilitadas: List[str] = []
 
 @router.get("/active-in-range")
 def list_convenios_active_in_range(
@@ -223,13 +235,20 @@ def list_convenios(db: Session = Depends(get_db), current_user = Depends(get_cur
 
 @router.post("/", response_model=ConvenioResponse)
 def create_convenio(conv: ConvenioCreate, db: Session = Depends(get_db)):
-    new_conv = Convenio(nome=conv.nome)
+    new_conv = Convenio(
+        nome=conv.nome,
+        id_integrador=conv.id_integrador,
+        operacoes_habilitadas=conv.operacoes_habilitadas or [],
+        digitos_carteirinha=conv.digitos_carteirinha,
+        timeout_captura=conv.timeout_captura or False
+    )
     db.add(new_conv)
     db.commit()
     db.refresh(new_conv)
     return new_conv
 
 @router.patch("/{id_convenio}", response_model=ConvenioResponse)
+@router.put("/{id_convenio}", response_model=ConvenioResponse)
 def update_convenio(id_convenio: int, conv: ConvenioUpdate, db: Session = Depends(get_db)):
     db_conv = db.query(Convenio).filter(Convenio.id_convenio == id_convenio).first()
     if not db_conv:
@@ -238,10 +257,89 @@ def update_convenio(id_convenio: int, conv: ConvenioUpdate, db: Session = Depend
     if conv.nome: db_conv.nome = conv.nome
     if conv.registro_ans is not None: db_conv.registro_ans = conv.registro_ans
     if conv.digitos_carteirinha is not None: db_conv.digitos_carteirinha = conv.digitos_carteirinha
+    if conv.id_integrador is not None: db_conv.id_integrador = conv.id_integrador
+    if conv.operacoes_habilitadas is not None: db_conv.operacoes_habilitadas = conv.operacoes_habilitadas
+    if conv.timeout_captura is not None: db_conv.timeout_captura = conv.timeout_captura
     
     db.commit()
     db.refresh(db_conv)
     return db_conv
+
+@router.get("/integrador-mapping")
+def list_convenios_integrador_mapping(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """Retorna listagem de todos os convênios com o integrador e operações associadas."""
+    from models import WorkerIntegrador, WorkerIntegradorOperacao
+    
+    convs = db.query(Convenio).order_by(Convenio.nome.asc()).all()
+    integradores = {i.id_integrador: i for i in db.query(WorkerIntegrador).all()}
+    operacoes = db.query(WorkerIntegradorOperacao).all()
+    
+    # Agrupar operações por integrador
+    ops_by_integrador = {}
+    for op in operacoes:
+        ops_by_integrador.setdefault(op.id_integrador, []).append({
+            "id": op.id,
+            "rotina": op.rotina,
+            "descricao": op.descricao,
+            "tipo_processamento": op.tipo_processamento,
+            "ativo": op.ativo
+        })
+        
+    result = []
+    for c in convs:
+        linked_ing = integradores.get(c.id_integrador)
+        available_ops = ops_by_integrador.get(c.id_integrador, []) if c.id_integrador else []
+        result.append({
+            "id_convenio": c.id_convenio,
+            "nome": c.nome,
+            "id_integrador": c.id_integrador,
+            "nome_integrador": linked_ing.nome if linked_ing else None,
+            "integrador_timeout_captura": getattr(linked_ing, 'timeout_captura', False) if linked_ing else False,
+            "operacoes_habilitadas": c.operacoes_habilitadas or [],
+            "operacoes_disponiveis": available_ops
+        })
+        
+    return {
+        "convenios": result,
+        "integradores": [
+            {
+                "id_integrador": i.id_integrador,
+                "nome": i.nome,
+                "sigla": i.sigla,
+                "ativo": i.ativo,
+                "timeout_captura": getattr(i, 'timeout_captura', False) or False,
+                "operacoes": ops_by_integrador.get(i.id_integrador, [])
+            }
+            for i in sorted(integradores.values(), key=lambda x: x.nome)
+        ]
+    }
+
+@router.put("/{id_convenio}/integrador-mapping")
+def update_convenio_integrador_mapping(
+    id_convenio: int,
+    data: ConvenioIntegradorMappingUpdate,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Atualiza a vinculação do convênio com o integrador e as operações ativas."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Apenas administradores podem alterar mapeamentos.")
+        
+    conv = db.query(Convenio).filter(Convenio.id_convenio == id_convenio).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Convênio não encontrado")
+        
+    conv.id_integrador = data.id_integrador
+    conv.operacoes_habilitadas = data.operacoes_habilitadas or []
+    
+    db.commit()
+    db.refresh(conv)
+    return {
+        "status": "success",
+        "id_convenio": conv.id_convenio,
+        "id_integrador": conv.id_integrador,
+        "operacoes_habilitadas": conv.operacoes_habilitadas
+    }
 
 
 @router.get("/{id_convenio}/procedimentos")
@@ -280,7 +378,7 @@ def list_worker_convenios(db: Session = Depends(get_db), current_user = Depends(
     w_convs = db.query(WorkerConvenio).filter(WorkerConvenio.ativo == True).all()
     return [
         {
-            "id_convenio": c.id_convenio,
+            "id_convenio": getattr(c, 'id_convenio', getattr(c, 'id_integrador', None)),
             "nome": c.nome,
             "sigla": c.sigla,
             "ativo": c.ativo
@@ -308,7 +406,7 @@ def list_user_assignments(db: Session = Depends(get_db), current_user = Depends(
     convs = {c.id_convenio: c.nome for c in db.query(Convenio).all()}
     
     from models import WorkerConvenio
-    w_convs = {c.id_convenio: c.nome for c in db.query(WorkerConvenio).all()}
+    w_convs = {getattr(c, 'id_convenio', getattr(c, 'id_integrador', None)): c.nome for c in db.query(WorkerConvenio).all()}
     
     res = []
     for uc in uconvs:
@@ -416,16 +514,18 @@ def list_worker_operacoes(id_convenio: Optional[int] = None, db: Session = Depen
     from models import WorkerConvenioOperacao, WorkerConvenio
     query = db.query(WorkerConvenioOperacao)
     if id_convenio is not None:
-        query = query.filter(WorkerConvenioOperacao.id_convenio == id_convenio)
+        int_id_col = getattr(WorkerConvenioOperacao, 'id_convenio', getattr(WorkerConvenioOperacao, 'id_integrador', None))
+        if int_id_col is not None:
+            query = query.filter(int_id_col == id_convenio)
 
     ops = query.all()
-    convs = {c.id_convenio: c.nome for c in db.query(WorkerConvenio).all()}
+    convs = {getattr(c, 'id_convenio', getattr(c, 'id_integrador', None)): c.nome for c in db.query(WorkerConvenio).all()}
     
     return [
         {
             "id": op.id,
-            "id_convenio": op.id_convenio,
-            "nome_convenio": convs.get(op.id_convenio, f"Convênio {op.id_convenio}"),
+            "id_convenio": getattr(op, 'id_convenio', getattr(op, 'id_integrador', None)),
+            "nome_convenio": convs.get(getattr(op, 'id_convenio', getattr(op, 'id_integrador', None)), f"Convênio {getattr(op, 'id_convenio', getattr(op, 'id_integrador', ''))}"),
             "rotina": op.rotina,
             "descricao": op.descricao,
             "ativo": op.ativo,

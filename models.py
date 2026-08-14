@@ -275,6 +275,8 @@ class Convenio(Base):
 
     id_convenio = Column(Integer, primary_key=True, index=True)
     nome = Column(Text, nullable=False)
+    id_integrador = Column(Integer, nullable=True) # ID do integrador associado no schema worker
+    operacoes_habilitadas = Column(JSONB, default=list, nullable=True) # Lista de rotinas/operações ativas para este convênio
     digitos_carteirinha = Column(Integer, nullable=True)
     biometria = Column(Boolean, default=False)
     timeout_captura = Column(Boolean, default=False)
@@ -773,6 +775,7 @@ class WorkerIntegrador(Base):
     sigla = Column(Text, nullable=True)
     tipo_operacao = Column(Text, default="convenio")
     ativo = Column(Boolean, default=True)
+    timeout_captura = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
