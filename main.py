@@ -6,12 +6,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from database import engine, Base, get_db, SessionLocal
 from services.cleanup_service import delete_expired_patients, cleanup_expired_attachments
 
 # Create tables
 Base.metadata.create_all(bind=engine)
+
+# Ensure schema migrations for WorkerApiKey new columns
+try:
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE worker.worker_api_keys ADD COLUMN IF NOT EXISTS servers JSONB;"))
+        conn.execute(text("ALTER TABLE worker.worker_api_keys ADD COLUMN IF NOT EXISTS priority_rules JSONB;"))
+        conn.commit()
+except Exception as e:
+    print(f"Migration notice: {e}")
 
 app = FastAPI(title="FyorGyn API", version="1.0.0")
 

@@ -92,10 +92,19 @@ def register_worker_by_api_key(data: RegisterWorkerSchema, db: Session = Depends
     db.commit()
     db.refresh(uw)
 
+    servers_config = getattr(wak, "servers", None) or []
+    if not servers_config and wak:
+        servers_config = [{"server_num": i+1, "tipo_operacao": getattr(wak, "tipo_operacao", "convenio") or "convenio"} for i in range(getattr(wak, "max_servers", 1) or 1)]
+
     return {
         "status": "success",
         "worker_key": uw.worker_key,
         "api_key": data.api_key,
+        "max_servers": getattr(wak, "max_servers", 1) if wak else 1,
+        "dispatch_stagger_seconds": getattr(wak, "dispatch_stagger_seconds", 15) if wak else 15,
+        "tipo_processamento": getattr(wak, "tipo_processamento", "local") if wak else "local",
+        "servers": servers_config,
+        "priority_rules": getattr(wak, "priority_rules", []) if wak else [],
         "message": f"Worker registrado com sucesso! Novo código dinâmico: {uw.worker_key}"
     }
 

@@ -820,10 +820,22 @@ class WorkerApiKey(Base):
     api_key = Column(Text, unique=True, nullable=False)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     tipo_processamento = Column(Text, nullable=False, default="local")
+    tipo_operacao = Column(Text, nullable=True, default="convenio")  # 'convenio' ou 'agendamento'
+    servers = Column(JSONB, nullable=True)  # ex: [{"server_num": 1, "tipo_operacao": "convenio"}, {"server_num": 2, "tipo_operacao": "agendamento"}]
+    max_servers = Column(Integer, default=1)  # Scaling individual do worker (instâncias)
+    dispatch_stagger_seconds = Column(Integer, default=15)  # Stagger individual do worker
+    id_convenio_preferencial = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="SET NULL"), nullable=True)
+    rotina_preferencial = Column(Text, nullable=True)
+    preference_bonus = Column(Integer, default=1)
+    base_priority = Column(Integer, default=2)
+    escalation_minutes = Column(Integer, default=10)
+    priority_rules = Column(JSONB, nullable=True)  # ex: lista de múltiplas regras [{id_convenio_preferencial, rotina_preferencial, preference_bonus, base_priority, escalation_minutes}]
     descricao = Column(Text, nullable=True)
     ativo = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    convenio_preferencial_rel = relationship("Convenio", foreign_keys=[id_convenio_preferencial])
 
 class MotivoFalta(Base):
     __tablename__ = "motivos_faltas"

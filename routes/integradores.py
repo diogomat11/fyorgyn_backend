@@ -6,7 +6,7 @@ from models import (
     WorkerConfig, WorkerApiKey
 )
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from dependencies import get_current_user
 from datetime import datetime
 
@@ -50,7 +50,32 @@ class WorkerApiKeyCreate(BaseModel):
     api_key: str
     user_id: int
     tipo_processamento: str = "local"
+    tipo_operacao: Optional[str] = "convenio"  # 'convenio' ou 'agendamento'
+    servers: Optional[List[Dict[str, Any]]] = None
+    max_servers: int = 1
+    dispatch_stagger_seconds: int = 15
+    id_convenio_preferencial: Optional[int] = None
+    rotina_preferencial: Optional[str] = None
+    preference_bonus: int = 1
+    base_priority: int = 2
+    escalation_minutes: int = 10
+    priority_rules: Optional[List[Dict[str, Any]]] = None
     descricao: Optional[str] = None
+
+class WorkerApiKeyUpdate(BaseModel):
+    tipo_processamento: Optional[str] = None
+    tipo_operacao: Optional[str] = None
+    servers: Optional[List[Dict[str, Any]]] = None
+    max_servers: Optional[int] = None
+    dispatch_stagger_seconds: Optional[int] = None
+    id_convenio_preferencial: Optional[int] = None
+    rotina_preferencial: Optional[str] = None
+    preference_bonus: Optional[int] = None
+    base_priority: Optional[int] = None
+    escalation_minutes: Optional[int] = None
+    priority_rules: Optional[List[Dict[str, Any]]] = None
+    descricao: Optional[str] = None
+    ativo: Optional[bool] = None
 
 class WorkerConfigUpdate(BaseModel):
     max_servers: int = 7
@@ -280,9 +305,11 @@ def list_worker_keys(
 ):
     """Lista chaves API de workers registradas com respectivo código de login worker_key."""
     import secrets
-    from models import UserWorker
+    from models import UserWorker, User, Convenio
 
-    keys = db.query(WorkerApiKey).all()
+    keys = db.query(WorkerApiKey).order_by(WorkerApiKey.id.asc()).all()
+    users = {u.id: u.username for u in db.query(User).all()}
+    conv_map = {c.id_convenio: c.nome for c in db.query(Convenio).all()}
     result = []
     for k in keys:
         uw = db.query(UserWorker).filter(UserWorker.user_id == k.user_id, UserWorker.ativo == True).first()
@@ -297,8 +324,20 @@ def list_worker_keys(
             "id": k.id,
             "api_key": k.api_key,
             "user_id": k.user_id,
+            "username": users.get(k.user_id, "Desconhecido"),
             "worker_key": uw.worker_key,
             "tipo_processamento": k.tipo_processamento,
+            "tipo_operacao": getattr(k, "tipo_operacao", "convenio") or "convenio",
+            "servers": getattr(k, "servers", None) or [],
+            "max_servers": getattr(k, "max_servers", 1) or 1,
+            "dispatch_stagger_seconds": getattr(k, "dispatch_stagger_seconds", 15) or 15,
+            "id_convenio_preferencial": getattr(k, "id_convenio_preferencial", None),
+            "nome_convenio_preferencial": conv_map.get(getattr(k, "id_convenio_preferencial", None)),
+            "rotina_preferencial": getattr(k, "rotina_preferencial", None),
+            "preference_bonus": getattr(k, "preference_bonus", 1) or 1,
+            "base_priority": getattr(k, "base_priority", 2) or 2,
+            "escalation_minutes": getattr(k, "escalation_minutes", 10) or 10,
+            "priority_rules": getattr(k, "priority_rules", None) or [],
             "descricao": k.descricao,
             "ativo": k.ativo,
             "created_at": k.created_at
@@ -316,10 +355,24 @@ def create_worker_key(
     import secrets
     from models import UserWorker
 
+    servers = data.servers or [{"server_num": 1, "tipo_operacao": data.tipo_operacao or "convenio"}]
+    max_servers = len(servers)
+    first_op = servers[0].get("tipo_operacao", "convenio") if servers else "convenio"
+
     wk = WorkerApiKey(
         api_key=data.api_key,
         user_id=data.user_id,
         tipo_processamento=data.tipo_processamento,
+        tipo_operacao=first_op,
+        servers=servers,
+        max_servers=max_servers,
+        dispatch_stagger_seconds=data.dispatch_stagger_seconds,
+        id_convenio_preferencial=data.id_convenio_preferencial,
+        rotina_preferencial=data.rotina_preferencial,
+        preference_bonus=data.preference_bonus,
+        base_priority=data.base_priority,
+        escalation_minutes=data.escalation_minutes,
+        priority_rules=data.priority_rules or [],
         descricao=data.descricao
     )
     db.add(wk)
@@ -341,9 +394,93 @@ def create_worker_key(
         "user_id": wk.user_id,
         "worker_key": uw.worker_key,
         "tipo_processamento": wk.tipo_processamento,
+        "tipo_operacao": getattr(wk, "tipo_operacao", "convenio"),
+        "servers": getattr(wk, "servers", []),
+        "max_servers": getattr(wk, "max_servers", 1),
+        "dispatch_stagger_seconds": getattr(wk, "dispatch_stagger_seconds", 15),
+        "id_convenio_preferencial": getattr(wk, "id_convenio_preferencial", None),
+        "rotina_preferencial": getattr(wk, "rotina_preferencial", None),
+        "preference_bonus": getattr(wk, "preference_bonus", 1),
+        "base_priority": getattr(wk, "base_priority", 2),
+        "escalation_minutes": getattr(wk, "escalation_minutes", 10),
+        "priority_rules": getattr(wk, "priority_rules", []),
         "descricao": wk.descricao,
         "ativo": wk.ativo
     }
+
+
+@router.put("/worker-keys/{id}")
+def update_worker_key(
+    id: int,
+    data: WorkerApiKeyUpdate,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Atualiza configurações de um worker (Admin)."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Apenas administradores podem atualizar workers.")
+    
+    wk = db.query(WorkerApiKey).filter(WorkerApiKey.id == id).first()
+    if not wk:
+        raise HTTPException(status_code=404, detail="Worker não encontrado")
+    
+    if data.tipo_processamento is not None: wk.tipo_processamento = data.tipo_processamento
+    if data.servers is not None:
+        wk.servers = data.servers
+        wk.max_servers = len(data.servers)
+        if len(data.servers) > 0 and "tipo_operacao" in data.servers[0]:
+            wk.tipo_operacao = data.servers[0]["tipo_operacao"]
+    elif data.max_servers is not None:
+        wk.max_servers = data.max_servers
+
+    if data.tipo_operacao is not None: wk.tipo_operacao = data.tipo_operacao
+    if data.dispatch_stagger_seconds is not None: wk.dispatch_stagger_seconds = data.dispatch_stagger_seconds
+    if data.id_convenio_preferencial is not None: wk.id_convenio_preferencial = data.id_convenio_preferencial if data.id_convenio_preferencial > 0 else None
+    if data.rotina_preferencial is not None: wk.rotina_preferencial = data.rotina_preferencial if data.rotina_preferencial else None
+    if data.preference_bonus is not None: wk.preference_bonus = data.preference_bonus
+    if data.base_priority is not None: wk.base_priority = data.base_priority
+    if data.escalation_minutes is not None: wk.escalation_minutes = data.escalation_minutes
+    if data.priority_rules is not None: wk.priority_rules = data.priority_rules
+    if data.descricao is not None: wk.descricao = data.descricao
+    if data.ativo is not None: wk.ativo = data.ativo
+    
+    db.commit()
+    db.refresh(wk)
+    return {"status": "success", "worker": {
+        "id": wk.id,
+        "tipo_processamento": wk.tipo_processamento,
+        "tipo_operacao": wk.tipo_operacao,
+        "servers": getattr(wk, "servers", []),
+        "max_servers": wk.max_servers,
+        "dispatch_stagger_seconds": wk.dispatch_stagger_seconds,
+        "id_convenio_preferencial": wk.id_convenio_preferencial,
+        "rotina_preferencial": wk.rotina_preferencial,
+        "preference_bonus": wk.preference_bonus,
+        "base_priority": wk.base_priority,
+        "escalation_minutes": wk.escalation_minutes,
+        "priority_rules": getattr(wk, "priority_rules", []),
+        "descricao": wk.descricao,
+        "ativo": wk.ativo
+    }}
+
+
+@router.delete("/worker-keys/{id}")
+def delete_worker_key(
+    id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Remove um worker cadastrado (Admin)."""
+    if not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="Apenas administradores podem remover workers.")
+    
+    wk = db.query(WorkerApiKey).filter(WorkerApiKey.id == id).first()
+    if not wk:
+        raise HTTPException(status_code=404, detail="Worker não encontrado")
+    
+    db.delete(wk)
+    db.commit()
+    return {"status": "success", "message": f"Worker {id} removido com sucesso"}
 
 
 

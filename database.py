@@ -17,14 +17,13 @@ DB_HOST = os.getenv("SUPABASE_DB_HOST", "db.ourddwzetcbdjnbvamgj.supabase.co")
 DB_PORT = os.getenv("SUPABASE_DB_PORT", "5432")
 DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
 
+from sqlalchemy.pool import NullPool
+
 # Prefer DATABASE_URL when explicitly set: enables the Supabase POOLER (IPv4),
-# needed in clouds like Render where the direct host db.*.supabase.co is
-# IPv6-only ("Network is unreachable"). Force port 5432 (session mode), safer
-# for SQLAlchemy ORM. connect_args already handles pooler compatibility
-# (prepare_threshold=None). Falls back to direct SUPABASE_DB_* construction.
+# using port 6543 (transaction mode) with NullPool to prevent connection exhaustion.
 _DATABASE_URL_ENV = os.getenv("DATABASE_URL", "").strip()
 if _DATABASE_URL_ENV:
-    SQLALCHEMY_DATABASE_URL = _DATABASE_URL_ENV.replace(":6543", ":5432")
+    SQLALCHEMY_DATABASE_URL = _DATABASE_URL_ENV.replace(":5432", ":6543")
 elif DB_HOST and "supabase.co" in DB_HOST and DB_PASSWORD:
     SQLALCHEMY_DATABASE_URL = f"postgresql://postgres:{DB_PASSWORD}@{DB_HOST}:5432/{DB_NAME}"
 else:
@@ -33,12 +32,7 @@ else:
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     use_native_hstore=False,
-    # Pool otimizado para concorrência multi-tenant sem bloqueio de threads
-    pool_size=10,
-    max_overflow=10,
-    pool_timeout=15,
-    pool_recycle=300,
-    pool_pre_ping=True,
+    poolclass=NullPool,
     connect_args={
         "prepare_threshold": None,
         "keepalives": 1,

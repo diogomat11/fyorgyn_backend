@@ -5,7 +5,10 @@ from models import ServerConfig
 from pydantic import BaseModel
 from typing import List, Optional
 
-router = APIRouter()
+router = APIRouter(
+    prefix="/server-configs",
+    tags=["server-configs"]
+)
 
 class ServerConfigBase(BaseModel):
     server_url: str

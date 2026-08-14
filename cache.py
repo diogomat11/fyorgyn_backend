@@ -20,7 +20,7 @@ class TenantCache:
         
     def _build_client(self, redis_url, redis_host, redis_port, redis_password, redis_db, ssl_cert_reqs=None):
         """Constroi o cliente redis. Para rediss:// (ex.: Upstash) aplica TLS."""
-        common = dict(socket_timeout=2.0, socket_connect_timeout=2.0, retry_on_timeout=True)
+        common = dict(socket_timeout=0.3, socket_connect_timeout=0.3, retry_on_timeout=False)
         if redis_url:
             kwargs = dict(common)
             # So repassa ssl_cert_reqs para URLs TLS (rediss://); evita afetar redis:// comum.
