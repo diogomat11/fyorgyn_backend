@@ -122,16 +122,21 @@ async def rate_limit_middleware(request: Request, call_next):
     client_ip = request.client.host if request.client else "127.0.0.1"
     now = time.time()
     path = request.url.path
+    auth_header = request.headers.get("Authorization", "")
+    is_authenticated = auth_header.startswith("Bearer ")
 
-    # Define rate limits and unique keys per bucket
-    if path == "/api/auth/login":
-        limit, window = 15, 60  # 15 req/min for login
+    # Requisições autenticadas de criação de jobs/lotes possuem cota liberada para lote (10.000 req/min)
+    if is_authenticated and (path.startswith("/api/jobs") or path.startswith("/api/agendamentos") or path.startswith("/api/lotes")):
+        limit, window = 10000, 60
+        key = f"{client_ip}:authenticated_batch"
+    elif path == "/api/auth/login":
+        limit, window = 15, 60  # 15 req/min para login (proteção contra força bruta)
         key = f"{client_ip}:login"
     elif path.startswith("/api/jobs") and request.method == "POST":
-        limit, window = 600, 60  # 600 req/min for job creation
+        limit, window = 1000, 60  # 1000 req/min
         key = f"{client_ip}:jobs_post"
     else:
-        limit, window = 1200, 60 # 1200 req/min general (reads, polling)
+        limit, window = 2000, 60 # 2000 req/min para leituras e polling geral
         key = f"{client_ip}:general"
 
     timestamps = [t for t in _rate_limit_records[key] if now - t < window]

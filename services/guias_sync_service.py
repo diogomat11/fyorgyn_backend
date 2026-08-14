@@ -693,8 +693,8 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             job.result_consumed = True
             continue
 
-        # Se for Unimed Goiânia (ID 3) ou rotina OP4 (Exames Finalizados)
-        if job.id_convenio == 3 or str(job.rotina).lower() in ("4", "op4_finalizados", "finalizados", "exames_finalizados"):
+        # Se for rotina OP4 (Exames Finalizados) da Unimed Goiânia / Geral
+        if str(job.rotina).lower() in ("4", "op4", "op4_finalizados", "finalizados", "exames_finalizados"):
             _sync_goiania_op4(db, job, synced_counts)
             job.result_consumed = True
             synced_counts["jobs_processed"] += 1
