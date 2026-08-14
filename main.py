@@ -123,15 +123,17 @@ async def rate_limit_middleware(request: Request, call_next):
     now = time.time()
     path = request.url.path
 
-    # Define rate limits
+    # Define rate limits and unique keys per bucket
     if path == "/api/auth/login":
-        limit, window = 10, 60  # 10 req/min for login
+        limit, window = 15, 60  # 15 req/min for login
+        key = f"{client_ip}:login"
     elif path.startswith("/api/jobs") and request.method == "POST":
-        limit, window = 60, 60  # 60 req/min for job creation
+        limit, window = 600, 60  # 600 req/min for job creation
+        key = f"{client_ip}:jobs_post"
     else:
-        limit, window = 300, 60 # 300 req/min general
+        limit, window = 1200, 60 # 1200 req/min general (reads, polling)
+        key = f"{client_ip}:general"
 
-    key = f"{client_ip}:{path if path == '/api/auth/login' else 'general'}"
     timestamps = [t for t in _rate_limit_records[key] if now - t < window]
     _rate_limit_records[key] = timestamps
 
