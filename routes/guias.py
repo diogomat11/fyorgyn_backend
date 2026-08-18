@@ -445,11 +445,12 @@ def export_guias(
 @router.get("/relatorios")
 def list_relatorios(
     id_paciente: Optional[str] = None,
+    nome_paciente: Optional[str] = None,
     tipo_relatorio: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    from models import RelatorioClinico
+    from models import RelatorioClinico, Carteirinha
     query = db.query(RelatorioClinico)
     
     # Se não for admin, filtra pelo user_id logado (tenant)
@@ -457,7 +458,32 @@ def list_relatorios(
         query = query.filter(RelatorioClinico.user_id == current_user.id)
         
     if id_paciente:
-        query = query.filter(RelatorioClinico.id_paciente == id_paciente)
+        id_pac_str = str(id_paciente).strip()
+        # 1. Tentar match direto pelo id_paciente
+        direct_exists = db.query(RelatorioClinico.id).filter(
+            RelatorioClinico.id_paciente == id_pac_str,
+            RelatorioClinico.user_id == current_user.id if not current_user.is_admin else True
+        ).first()
+        
+        if direct_exists:
+            query = query.filter(RelatorioClinico.id_paciente == id_pac_str)
+        else:
+            # 2. Buscar na tabela carteirinhas para obter paciente por id_paciente ou por id numérico
+            cart = db.query(Carteirinha).filter(
+                (Carteirinha.id_paciente == id_pac_str) | 
+                (Carteirinha.id == int(id_pac_str) if id_pac_str.isdigit() else False),
+                Carteirinha.user_id == current_user.id if not current_user.is_admin else True
+            ).first()
+            if cart and cart.paciente:
+                # Buscar relatórios pelo nome do paciente ou UUID da carteirinha
+                query = query.filter(
+                    (RelatorioClinico.id_paciente == cart.id_paciente) |
+                    (RelatorioClinico.nome_paciente.ilike(f"%{cart.paciente.strip()}%"))
+                )
+            else:
+                query = query.filter(RelatorioClinico.id_paciente == id_pac_str)
+    elif nome_paciente:
+        query = query.filter(RelatorioClinico.nome_paciente.ilike(f"%{nome_paciente.strip()}%"))
         
     if tipo_relatorio:
         query = query.filter(RelatorioClinico.tipo_relatorio == tipo_relatorio)

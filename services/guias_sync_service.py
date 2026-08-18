@@ -13,6 +13,66 @@ from sqlalchemy import text
 from models import BaseGuia, Log
 
 
+def _split_capturadas_por_outro_prestador(db: Session, job, results_list: list) -> tuple:
+    """
+    Multiprestador (convenios.guias_multiprestador): no portal Unimed, quando a guia
+    esta capturada por OUTRO cod_prestador ela simplesmente nao e exibida para os demais
+    (errosSapia so detecta inexistencia). O worker (op2_captura) sinaliza isso com
+    status "Capturada por outro prestador".
+
+    Aqui o hub:
+    - NAO grava essas guias como capturadas (removidas do upsert);
+    - cria JOB de consulta (op1) da carteirinha para re-sincronizar a base.
+
+    Retorna (results_filtrados, qtd_capturadas_por_outro_prestador).
+    """
+    rotina = str(job.rotina or "").lower()
+    if rotina not in ("op2_captura", "captura", "2", "op2"):
+        return results_list, 0
+
+    capturadas = [
+        i for i in results_list
+        if isinstance(i, dict) and str(i.get("status", "")).strip().lower() == "capturada por outro prestador"
+    ]
+    if not capturadas:
+        return results_list, 0
+
+    filtrados = [i for i in results_list if i not in capturadas]
+
+    # Job de consulta para re-sincronizar as guias da carteirinha
+    # (params do job origem carregam login/senha/cod_prestador/webhook)
+    from models import Job as JobModel, Convenio
+    convenio = db.query(Convenio).filter(Convenio.id_convenio == job.id_convenio).first()
+    if not convenio or not convenio.guias_multiprestador:
+        # Flag desligada: worker nao deveria ter marcado; mantem fluxo antigo (upsert)
+        return results_list, 0
+
+    try:
+        orig_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+    except Exception:
+        orig_params = {}
+
+    consulta_params = {k: v for k, v in orig_params.items() if k not in ("guias", "numero_guia", "guia")}
+
+    novo_job = JobModel(
+        carteirinha_id=job.carteirinha_id,
+        id_convenio=job.id_convenio,
+        user_id=job.user_id,
+        rotina="consulta_guias",
+        status="pending",
+        priority=0,
+        max_attempts=3,
+        depending_id=job.id,
+        params=consulta_params,
+    )
+    db.add(novo_job)
+    print(
+        f"[MULTIPRESTADOR] Job {job.id} (captura): {len(capturadas)} guia(s) marcada(s) "
+        f"'Capturada por outro prestador' -> job consulta criado para carteirinha {job.carteirinha_id}."
+    )
+    return filtrados, len(capturadas)
+
+
 def _persist_valida_prestador(db: Session, guia_numero: str, codigo_procedimento: str, valida_json: dict) -> int:
     """
     Persiste o JSON `valida_prestador` em public.base_guias para a guia identificada
@@ -758,21 +818,26 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                         nome_norm = normalize_name(raw_nome)
                         id_conv_item = _resolve_convenio_id(nome_plano)
                         
-                        # Buscar por id_paciente primeiro (escopado ao user_id)
+                        # 1. Buscar por id_paciente primeiro (escopado ao user_id)
                         existing = db.query(Carteirinha).filter(
                             Carteirinha.id_paciente == id_pac,
                             Carteirinha.user_id == job.user_id
                         ).first()
                         
-                        # Fallback: buscar por paciente + convênio + user_id
+                        # 2. Fallback: buscar por paciente + convênio + user_id
                         if not existing:
                             existing = db.query(Carteirinha).filter(
                                 Carteirinha.paciente == nome_norm,
                                 Carteirinha.id_convenio == id_conv_item,
                                 Carteirinha.user_id == job.user_id
                             ).first()
-                            if existing and not existing.id_paciente:
-                                existing.id_paciente = id_pac
+                        
+                        # 3. Fallback amplo: buscar por paciente + user_id (qualquer convênio)
+                        if not existing:
+                            existing = db.query(Carteirinha).filter(
+                                Carteirinha.paciente == nome_norm,
+                                Carteirinha.user_id == job.user_id
+                            ).first()
                         
                         is_new = False
                         if not existing:
@@ -788,16 +853,23 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                             db.flush()
                             is_new = True
                         else:
-                            # Atualizar nome e convênio se necessário
+                            # Atualizar nome, id_paciente e convênio se necessário
                             if existing.paciente != nome_norm:
                                 existing.paciente = nome_norm
-                            if not existing.id_paciente:
+                            if not existing.id_paciente or existing.id_paciente != id_pac:
                                 existing.id_paciente = id_pac
-                            if nome_plano and existing.id_convenio != id_conv_item:
+                            if nome_plano and (not existing.id_convenio or existing.id_convenio == 100):
                                 existing.id_convenio = id_conv_item
                         
-                        if is_new:
-                            # Passar id_convenio_pac para o op2 identificar o convênio correto no webhook
+                        # Evitar enfileirar OP2 e OP3 duplicados se já houver job pendente
+                        has_pending_op2 = db.query(JobModel.id).filter(
+                            JobModel.id_convenio == 100,
+                            JobModel.rotina.in_(["op2", "op2_obterDetalhes", "2"]),
+                            JobModel.params.ilike(f'%"{id_pac}"%'),
+                            JobModel.status.in_(["pending", "processing"])
+                        ).first()
+                        
+                        if not has_pending_op2:
                             op2_params = json.dumps({
                                 "id_paciente": id_pac,
                                 "id_convenio_pac": id_conv_item,
@@ -813,6 +885,14 @@ def sync_completed_worker_jobs(db: Session) -> dict:
                             )
                             db.add(op2_job)
                             
+                        has_pending_op3 = db.query(JobModel.id).filter(
+                            JobModel.id_convenio == 100,
+                            JobModel.rotina.in_(["op3", "op3_ListarPTS", "3"]),
+                            JobModel.params.ilike(f'%"{id_pac}"%'),
+                            JobModel.status.in_(["pending", "processing"])
+                        ).first()
+                        
+                        if not has_pending_op3:
                             op3_params = json.dumps({"id_paciente": id_pac, "nome_paciente": nome_norm})
                             op3_job = JobModel(
                                 status="pending",
@@ -1532,6 +1612,14 @@ def sync_completed_worker_jobs(db: Session) -> dict:
         elif isinstance(job.result_data, list):
             results_list = job.result_data
             
+        # Multiprestador: separa guias "Capturada por outro prestador" (nao gravar como
+        # capturada) e cria job de consulta para re-sincronizar a carteirinha.
+        if results_list:
+            results_list, qtd_outro_prestador = _split_capturadas_por_outro_prestador(db, job, results_list)
+            if qtd_outro_prestador:
+                synced_counts.setdefault("capturadas_por_outro_prestador", 0)
+                synced_counts["capturadas_por_outro_prestador"] += qtd_outro_prestador
+
         if results_list:
             res = bulk_upsert_guias_from_json(
                 db=db,
