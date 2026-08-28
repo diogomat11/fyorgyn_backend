@@ -2,6 +2,14 @@ from sqlalchemy.orm import Session
 from models import BaseGuia, PeiTemp, PatientPei
 from datetime import timedelta, date
 
+def _calcular_validade_pei(data_autorizacao: date, prazo_pei_dias) -> date:
+    """
+    Validade do PEI = data de autorizacao + prazo do convenio.
+    Fallback historico: 180 dias (prazo nulo/fora do range 30-365).
+    """
+    prazo_dias = prazo_pei_dias if (prazo_pei_dias and 30 <= prazo_pei_dias <= 365) else 180
+    return data_autorizacao + timedelta(days=prazo_dias)
+
 def update_patient_pei(db: Session, carteirinha_id: int, codigo_terapia: str, guia_instance: BaseGuia = None):
     """
     Recalculates and updates the PatientPei record for a specific patient and therapy.
@@ -79,8 +87,8 @@ def update_patient_pei(db: Session, carteirinha_id: int, codigo_terapia: str, gu
     validade = None
     
     if latest_guia.data_autorizacao:
-        # Validity Rule: Autorizacao + 180 days (approx 6 months)
-        validade = latest_guia.data_autorizacao + timedelta(days=180)
+        # Validity Rule: Autorizacao + prazo do convenio (configuravel, default historico 180 dias)
+        validade = _calcular_validade_pei(latest_guia.data_autorizacao, convenio.prazo_pei_dias)
     
 
 

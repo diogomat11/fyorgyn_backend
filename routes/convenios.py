@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Convenio, UserConvenio, User
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from dependencies import get_current_user
 from security_utils import encrypt_password
@@ -29,8 +29,8 @@ class ConvenioUpdate(BaseModel):
     id_integrador: Optional[int] = None
     operacoes_habilitadas: Optional[List[str]] = None
     timeout_captura: Optional[bool] = None
-
-from pydantic import Field
+    prazo_pei_dias: Optional[int] = Field(default=None, ge=30, le=365)
+    guias_multiprestador: Optional[bool] = None
 
 class ConvenioOperacaoResponse(BaseModel):
     id: int
@@ -46,6 +46,9 @@ class ConvenioResponse(ConvenioBase):
     digitos_carteirinha: Optional[int] = None
     id_integrador: Optional[int] = None
     operacoes_habilitadas: Optional[List[str]] = []
+    prazo_pei_dias: Optional[int] = 180
+    pei_automatico: Optional[bool] = False
+    guias_multiprestador: Optional[bool] = False
     operacoes: List[ConvenioOperacaoResponse] = Field(default=[], validation_alias="operacoes_rel")
     
     class Config:
@@ -260,6 +263,8 @@ def update_convenio(id_convenio: int, conv: ConvenioUpdate, db: Session = Depend
     if conv.id_integrador is not None: db_conv.id_integrador = conv.id_integrador
     if conv.operacoes_habilitadas is not None: db_conv.operacoes_habilitadas = conv.operacoes_habilitadas
     if conv.timeout_captura is not None: db_conv.timeout_captura = conv.timeout_captura
+    if conv.prazo_pei_dias is not None: db_conv.prazo_pei_dias = conv.prazo_pei_dias
+    if conv.guias_multiprestador is not None: db_conv.guias_multiprestador = conv.guias_multiprestador
     
     db.commit()
     db.refresh(db_conv)
@@ -295,6 +300,9 @@ def list_convenios_integrador_mapping(db: Session = Depends(get_db), current_use
             "id_integrador": c.id_integrador,
             "nome_integrador": linked_ing.nome if linked_ing else None,
             "integrador_timeout_captura": getattr(linked_ing, 'timeout_captura', False) if linked_ing else False,
+            "pei_automatico": bool(c.pei_automatico),
+            "prazo_pei_dias": c.prazo_pei_dias or 180,
+            "guias_multiprestador": bool(c.guias_multiprestador),
             "operacoes_habilitadas": c.operacoes_habilitadas or [],
             "operacoes_disponiveis": available_ops
         })
@@ -373,12 +381,12 @@ def list_all_convenios(db: Session = Depends(get_db), current_user = Depends(get
 
 @router.get("/worker-convenios")
 def list_worker_convenios(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    """Lista convênios do schema worker."""
-    from models import WorkerConvenio
-    w_convs = db.query(WorkerConvenio).filter(WorkerConvenio.ativo == True).all()
+    """Lista integradores do schema worker (resposta mantém chave id_convenio por compat de API)."""
+    from models import WorkerIntegrador
+    w_convs = db.query(WorkerIntegrador).filter(WorkerIntegrador.ativo == True).all()
     return [
         {
-            "id_convenio": getattr(c, 'id_convenio', getattr(c, 'id_integrador', None)),
+            "id_convenio": c.id_integrador,
             "nome": c.nome,
             "sigla": c.sigla,
             "ativo": c.ativo
@@ -405,8 +413,8 @@ def list_user_assignments(db: Session = Depends(get_db), current_user = Depends(
     users = {u.id: u.username for u in db.query(User).all()}
     convs = {c.id_convenio: c.nome for c in db.query(Convenio).all()}
     
-    from models import WorkerConvenio
-    w_convs = {getattr(c, 'id_convenio', getattr(c, 'id_integrador', None)): c.nome for c in db.query(WorkerConvenio).all()}
+    from models import WorkerIntegrador
+    w_convs = {c.id_integrador: c.nome for c in db.query(WorkerIntegrador).all()}
     
     res = []
     for uc in uconvs:
@@ -511,21 +519,19 @@ def list_worker_operacoes(id_convenio: Optional[int] = None, db: Session = Depen
     if not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Acesso negado.")
     
-    from models import WorkerConvenioOperacao, WorkerConvenio
-    query = db.query(WorkerConvenioOperacao)
+    from models import WorkerIntegradorOperacao, WorkerIntegrador
+    query = db.query(WorkerIntegradorOperacao)
     if id_convenio is not None:
-        int_id_col = getattr(WorkerConvenioOperacao, 'id_convenio', getattr(WorkerConvenioOperacao, 'id_integrador', None))
-        if int_id_col is not None:
-            query = query.filter(int_id_col == id_convenio)
+        query = query.filter(WorkerIntegradorOperacao.id_integrador == id_convenio)
 
     ops = query.all()
-    convs = {getattr(c, 'id_convenio', getattr(c, 'id_integrador', None)): c.nome for c in db.query(WorkerConvenio).all()}
+    convs = {c.id_integrador: c.nome for c in db.query(WorkerIntegrador).all()}
     
     return [
         {
             "id": op.id,
-            "id_convenio": getattr(op, 'id_convenio', getattr(op, 'id_integrador', None)),
-            "nome_convenio": convs.get(getattr(op, 'id_convenio', getattr(op, 'id_integrador', None)), f"Convênio {getattr(op, 'id_convenio', getattr(op, 'id_integrador', ''))}"),
+            "id_convenio": op.id_integrador,
+            "nome_convenio": convs.get(op.id_integrador, f"Integrador {op.id_integrador}"),
             "rotina": op.rotina,
             "descricao": op.descricao,
             "ativo": op.ativo,
@@ -545,8 +551,8 @@ def update_worker_operacao(id: int, req: UpdateOperacaoRequest, db: Session = De
     if not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Acesso negado.")
     
-    from models import WorkerConvenioOperacao
-    op = db.query(WorkerConvenioOperacao).filter(WorkerConvenioOperacao.id == id).first()
+    from models import WorkerIntegradorOperacao
+    op = db.query(WorkerIntegradorOperacao).filter(WorkerIntegradorOperacao.id == id).first()
     if not op:
         raise HTTPException(status_code=404, detail="Operação não encontrada.")
     

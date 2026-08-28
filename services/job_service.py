@@ -33,14 +33,45 @@ def _get_procedimentos_habilitados(db: Session, id_convenio: int) -> List[str]:
         return []
 
 
-def _enrich_params_with_procedimentos(db: Session, id_convenio: Optional[int], p_dict: dict) -> dict:
+def _enrich_params_with_convenio_config(db: Session, id_convenio: Optional[int], p_dict: dict, cache: Optional[dict] = None) -> dict:
     """
-    Enriquece p_dict com `procedimentos_habilitados` para o convenio 3 (Unimed Goiania),
-    conforme especificacao valida_prestador_replication_prompt.yaml.
-    Idempotente: nao sobrescreve se ja presente no payload.
+    Enriquece p_dict com a configuracao do convenio:
+    - prazo_pei_dias: prazo do PEI (validade no hub + cutoff de paginacao no scraper op1)
+    - guias_multiprestador: regra de captura/saldo no scraper (op2)
+    - procedimentos_habilitados: codigos ativos do convenio (Unimed Goiania, id_convenio=3),
+      conforme especificacao valida_prestador_replication_prompt.yaml.
+
+    Idempotente: nao sobrescreve chave ja presente no payload.
+    `cache` (opcional) evita N queries do convenio em loops com muitas carteirinhas.
     """
+    if id_convenio is None:
+        return p_dict
+
+    # Lookup do convenio (com cache opcional para loops grandes; miss cacheado = None)
+    _cache_key = ("convenio", id_convenio)
+    if cache is not None and _cache_key in cache:
+        convenio = cache[_cache_key]
+    else:
+        convenio = db.query(Convenio).filter(Convenio.id_convenio == id_convenio).first()
+        if cache is not None:
+            cache[_cache_key] = convenio
+
+    if convenio is None:
+        return p_dict
+
+    if "prazo_pei_dias" not in p_dict and convenio.prazo_pei_dias:
+        p_dict["prazo_pei_dias"] = convenio.prazo_pei_dias
+    if "guias_multiprestador" not in p_dict:
+        p_dict["guias_multiprestador"] = bool(convenio.guias_multiprestador)
+
     if id_convenio == 3 and "procedimentos_habilitados" not in p_dict:
-        procs = _get_procedimentos_habilitados(db, 3)
+        _procs_key = ("procs", id_convenio)
+        if cache is not None and _procs_key in cache:
+            procs = cache[_procs_key]
+        else:
+            procs = _get_procedimentos_habilitados(db, id_convenio) or None
+            if cache is not None:
+                cache[_procs_key] = procs
         if procs:
             p_dict["procedimentos_habilitados"] = procs
     return p_dict
@@ -77,7 +108,8 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
 
     base_p_dict = json.loads(params) if params else {}
     jobs_payload = []
-    
+    _conv_cache = {}  # cache de config de convenio (evita N queries em loops grandes)
+
     for cart in carteirinhas:
         p_dict = base_p_dict.copy()
         
@@ -112,8 +144,8 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
         # Injetar webhook_url
         p_dict["webhook_url"] = MY_WEBHOOK_URL
 
-        # Enriquecer com procedimentos_habilitados (Unimed Goiania, id_convenio=3)
-        p_dict = _enrich_params_with_procedimentos(db, target_conv_id, p_dict)
+        # Enriquecer com config do convenio (prazo PEI, multiprestador, procedimentos)
+        p_dict = _enrich_params_with_convenio_config(db, target_conv_id, p_dict, _conv_cache)
 
         job_data = {
             "carteirinha_id": cart.id,
@@ -142,7 +174,8 @@ def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Opti
         
     base_p_dict = json.loads(params) if params else {}
     jobs_payload = []
-    
+    _conv_cache = {}  # cache de config de convenio (evita N queries em loops grandes)
+
     for cart in all_carteirinhas:
         p_dict = base_p_dict.copy()
         
@@ -174,8 +207,8 @@ def create_all_jobs(db: Session, id_convenio: Optional[int] = None, rotina: Opti
                 
         p_dict["webhook_url"] = MY_WEBHOOK_URL
 
-        # Enriquecer com procedimentos_habilitados (Unimed Goiania, id_convenio=3)
-        p_dict = _enrich_params_with_procedimentos(db, target_conv_id, p_dict)
+        # Enriquecer com config do convenio (prazo PEI, multiprestador, procedimentos)
+        p_dict = _enrich_params_with_convenio_config(db, target_conv_id, p_dict, _conv_cache)
 
         job_data = {
             "carteirinha_id": cart.id,
@@ -249,8 +282,8 @@ def create_temp_job(db: Session, carteirinha: str, paciente: str, id_convenio: O
             
     p_dict["webhook_url"] = MY_WEBHOOK_URL
 
-    # Enriquecer com procedimentos_habilitados (Unimed Goiania, id_convenio=3)
-    p_dict = _enrich_params_with_procedimentos(db, id_convenio, p_dict)
+    # Enriquecer com config do convenio (prazo PEI, multiprestador, procedimentos)
+    p_dict = _enrich_params_with_convenio_config(db, id_convenio, p_dict)
 
     job_data = {
         "carteirinha_id": cart_id,

@@ -487,9 +487,9 @@ def create_jobs(
                         p_dict["login_fat"] = p_dict.get("login_fat") or uconv.login_fat
                         p_dict["senha_fat_criptografada"] = p_dict.get("senha_fat_criptografada") or uconv.senha_fat_criptografada
 
-                # Enriquecer com procedimentos_habilitados (Unimed Goiania, id_convenio=3)
-                from services.job_service import _enrich_params_with_procedimentos
-                p_dict = _enrich_params_with_procedimentos(db, target_convenio, p_dict)
+                # Enriquecer com config do convenio (prazo PEI, multiprestador, procedimentos)
+                from services.job_service import _enrich_params_with_convenio_config
+                p_dict = _enrich_params_with_convenio_config(db, target_convenio, p_dict)
 
                 job_payload = {
                     "carteirinha_id": None,

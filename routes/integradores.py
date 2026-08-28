@@ -84,6 +84,58 @@ class WorkerConfigUpdate(BaseModel):
 
 # --- Endpoints ---
 
+@router.get("/meus")
+def meus_integradores(
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Capabilities do tenant logado: integradores tipo 'agendamento' vinculados ao
+    usuário (via user_integradores, espaço W) com suas OPs canônicas ativas.
+    Fonte para o gating de botões no frontend (plano integradores agendamento, D5)."""
+    from dependencies import get_integradores_agendamento_usuario, get_effective_user_id
+    from models import Integrador, UserConvenio, WorkerIntegradorOperacao, WorkerIntegrador
+
+    ids = get_integradores_agendamento_usuario(db, current_user)
+    if not ids:
+        return []
+
+    integradores = db.query(WorkerIntegrador).filter(
+        WorkerIntegrador.id_integrador.in_(ids)
+    ).all()
+    ops_por_integrador = {}
+    for op in db.query(WorkerIntegradorOperacao).filter(
+        WorkerIntegradorOperacao.id_integrador.in_(ids),
+        WorkerIntegradorOperacao.ativo == True,  # noqa: E712
+        WorkerIntegradorOperacao.operacao_canonica.isnot(None)
+    ).all():
+        ops_por_integrador.setdefault(op.id_integrador, []).append(op.operacao_canonica)
+
+    # convênio canônico (public.integradores.id_convenio, UNIQUE — alinhado ao espaço W)
+    convenio_canonico = {
+        i.id_integrador: i.id_convenio
+        for i in db.query(Integrador).filter(Integrador.id_integrador.in_(ids)).all()
+    }
+
+    target_user_id = get_effective_user_id(current_user)
+    convenios_com_credencial = {
+        uc.id_convenio
+        for uc in db.query(UserConvenio).filter(UserConvenio.user_id == target_user_id).all()
+    }
+
+    return [
+        {
+            "id_integrador": ing.id_integrador,
+            "sigla": ing.sigla,
+            "nome": ing.nome,
+            "tipo_operacao": ing.tipo_operacao,
+            "id_convenio": convenio_canonico.get(ing.id_integrador),
+            "operacoes": sorted(ops_por_integrador.get(ing.id_integrador, [])),
+            "credenciais_configuradas": convenio_canonico.get(ing.id_integrador) in convenios_com_credencial
+        }
+        for ing in sorted(integradores, key=lambda x: x.id_integrador)
+    ]
+
+
 @router.get("/")
 def list_integradores(
     ativo_only: bool = False,

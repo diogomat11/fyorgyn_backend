@@ -120,7 +120,7 @@ def check_module_permission(user: User, modulo: str, acao: str = "visualizar") -
     """Valida se o usuário possui a permissão no módulo e ação especificados."""
     if user.is_admin or (getattr(user, "perfil", "") == "gestor"):
         return True
-    
+
     perm = getattr(user, "permissoes", {}) or {}
     if not perm:
         # Se não houver permissão customizada, usa default por perfil
@@ -136,12 +136,71 @@ def check_module_permission(user: User, modulo: str, acao: str = "visualizar") -
         elif perfil == "supervisor":
             return True
         return False
-        
+
     mod_perm = perm.get(modulo, {})
     if isinstance(mod_perm, bool):
         return mod_perm
     if isinstance(mod_perm, dict):
         return bool(mod_perm.get(acao, False))
     return False
+
+
+# ── Vínculo User↔Integrador (plano docs/plano_integradores_agendamento.md, D3) ──
+
+def get_integradores_agendamento_usuario(db, user: User) -> list:
+    """Ids (espaço W) dos integradores tipo 'agendamento' habilitados para o tenant.
+
+    - Admin: todos os integradores de agendamento ativos no worker.
+    - Gestor: vínculos ativos em user_integradores (interseção com integradores ativos).
+    - Sub-usuário: vínculos do gestor (via get_effective_user_id).
+    """
+    from models import UserIntegrador, WorkerIntegrador
+    ativos = {
+        r[0] for r in db.query(WorkerIntegrador.id_integrador).filter(
+            WorkerIntegrador.tipo_operacao == "agendamento",
+            WorkerIntegrador.ativo == True  # noqa: E712
+        ).all()
+    }
+    if user.is_admin:
+        return sorted(ativos)
+    vinculados = {
+        v[0] for v in db.query(UserIntegrador.id_integrador).filter(
+            UserIntegrador.user_id == get_effective_user_id(user),
+            UserIntegrador.ativo == True  # noqa: E712
+        ).all()
+    }
+    return sorted(vinculados & ativos)
+
+
+def check_integrador_habilitado(db, user: User, id_integrador: int, nome_integrador: str = None) -> None:
+    """Levanta 403 se o tenant não tiver o integrador (espaço W) habilitado."""
+    if user.is_admin:
+        return
+    if id_integrador not in get_integradores_agendamento_usuario(db, user):
+        from models import WorkerIntegrador
+        ing = db.query(WorkerIntegrador).filter(
+            WorkerIntegrador.id_integrador == id_integrador
+        ).first()
+        nome = nome_integrador or (ing.nome if ing else str(id_integrador))
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Integrador {nome} não habilitado para este usuário."
+        )
+
+
+def require_integrador_agendamento():
+    """Dependency factory: exige que o tenant tenha ao menos um integrador de
+    agendamento vinculado (rotas de OPs de portal)."""
+    async def _dependency(
+        user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+    ):
+        if not user.is_admin and not get_integradores_agendamento_usuario(db, user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Nenhum integrador de agendamento habilitado para este usuário."
+            )
+        return user
+    return _dependency
 
 

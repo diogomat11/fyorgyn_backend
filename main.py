@@ -93,20 +93,40 @@ async def run_guias_sync_loop():
             await asyncio.to_thread(sync_completed_worker_jobs_bg)
         except Exception as e:
             pass
-        
+
         await asyncio.sleep(5)
+
+async def run_cron_loop():
+    """Loop de segundo plano (a cada 60s) que dispara os crons de carteirinhas
+    configurados em public.cron_configs (guarda ultimo_run no banco; tz-aware)."""
+    while True:
+        db = None
+        try:
+            from database import SessionLocal
+            from services.cron_service import run_due_crons
+            db = SessionLocal()
+            await asyncio.to_thread(run_due_crons, db)
+        except Exception as e:
+            print(f"Cron Loop Error: {e}")
+        finally:
+            if db:
+                try: db.close()
+                except Exception: pass
+
+        await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(run_cleanup_loop())
     asyncio.create_task(run_guias_sync_loop())
+    asyncio.create_task(run_cron_loop())
 
-# Include routers
 from routes import (
     auth, carteirinhas, jobs, guias, logs, dashboard, debug_optimization,
     workers, pei, convenios, prio_rules, metrics, agendamentos, server_configs,
     lotes, conciliacao, protocolo, relatorios_rm, motivos_faltas, workflows,
-    unidades, crm, integradores, comprovante, workflow_trigger
+    unidades, crm, integradores, comprovante, workflow_trigger, crons,
+    docs_rm, docs_clinicos
 )
 
 # ── Rate Limiter Middleware ──
@@ -174,8 +194,11 @@ app.include_router(workflows.router, prefix="/api")
 app.include_router(unidades.router, prefix="/api")
 app.include_router(crm.router, prefix="/api")
 app.include_router(integradores.router, prefix="/api")
+app.include_router(crons.router, prefix="/api")
 app.include_router(comprovante.router, prefix="/api")
 app.include_router(workflow_trigger.router, prefix="/api")
+app.include_router(docs_rm.router, prefix="/api/docs/rm", tags=["Docs RM"])
+app.include_router(docs_clinicos.router, prefix="/api/docs/clinicos", tags=["Docs Clínicos"])
 
 @app.post("/api/webhook")
 @app.post("/webhook")

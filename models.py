@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Date, DateTime, Time, ForeignKey, Text, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, foreign
 from sqlalchemy.sql import func
 from database import Base
 
@@ -281,6 +281,8 @@ class Convenio(Base):
     biometria = Column(Boolean, default=False)
     timeout_captura = Column(Boolean, default=False)
     pei_automatico = Column(Boolean, default=False)
+    prazo_pei_dias = Column(Integer, default=180)  # Validade do PEI em dias (data_autorizacao + prazo); afeta tambem o cutoff do scraper
+    guias_multiprestador = Column(Boolean, default=False)  # TRUE: saldo da guia compartilhado entre prestadores (ex. Unimed Goiania)
     registro_ans = Column(Text, nullable=True)
     modo_execucao = Column(Text, default="automatico") # 'automatico' ou 'manual'
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -463,7 +465,8 @@ class CorpoClinico(Base):
     id_profissional = Column(Text, index=True)  # medicos importados via CRM ficam NULL
     nome = Column(Text, nullable=False)
     cpf = Column(Text)
-    area = Column(Text, default='')
+    area = Column(Text, default='')  # Legado textual (compat de leitura); fonte da verdade = id_area + corpo_clinico_areas
+    id_area = Column(Integer, ForeignKey("areas_atuacao.id_area", ondelete="SET NULL"), nullable=True, index=True)
     conselho = Column(Text)
     registro = Column(Text)
     UF = Column(Text)
@@ -474,6 +477,82 @@ class CorpoClinico(Base):
     # CRM-specific (v3 API Consulta CRM Medico)
     situacao = Column(Text)  # situacao no conselho (ativo/inativo/cancelado) em lowercase
     atualizado_crm = Column(DateTime(timezone=True))  # timestamp da ultima consulta CFM
+
+    area_rel = relationship("AreaAtuacao", foreign_keys=[id_area])
+
+class CorpoClinicoArea(Base):
+    """N:N profissional <-> areas de atuacao"""
+    __tablename__ = "corpo_clinico_areas"
+    __table_args__ = (
+        UniqueConstraint("corpo_clinico_id", "id_area", name="uq_corpo_clinico_area"),
+        {'extend_existing': True},
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    corpo_clinico_id = Column(Integer, ForeignKey("corpo_clinico.id", ondelete="CASCADE"), nullable=False, index=True)
+    id_area = Column(Integer, ForeignKey("areas_atuacao.id_area", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    profissional_rel = relationship("CorpoClinico")
+    area_rel = relationship("AreaAtuacao")
+
+class CorpoClinicoConvenio(Base):
+    """N:N profissional <-> convenios atendidos"""
+    __tablename__ = "corpo_clinico_convenios"
+    __table_args__ = (
+        UniqueConstraint("corpo_clinico_id", "id_convenio", name="uq_corpo_clinico_convenio"),
+        {'extend_existing': True},
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    corpo_clinico_id = Column(Integer, ForeignKey("corpo_clinico.id", ondelete="CASCADE"), nullable=False, index=True)
+    id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    profissional_rel = relationship("CorpoClinico")
+    convenio_rel = relationship("Convenio")
+
+class CorpoClinicoProcedimento(Base):
+    """N:N profissional <-> procedimentos habilitados (refinamento sobre areas ∩ convenios)"""
+    __tablename__ = "corpo_clinico_procedimentos"
+    __table_args__ = (
+        UniqueConstraint("corpo_clinico_id", "id_procedimento", name="uq_corpo_clinico_procedimento"),
+        {'extend_existing': True},
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    corpo_clinico_id = Column(Integer, ForeignKey("corpo_clinico.id", ondelete="CASCADE"), nullable=False, index=True)
+    id_procedimento = Column(Integer, ForeignKey("procedimentos.id_procedimento", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    profissional_rel = relationship("CorpoClinico")
+    procedimento_rel = relationship("Procedimento")
+
+class CorpoClinicoUser(Base):
+    """N:N profissional <-> users (um profissional pode vincular a mais de um user_id)"""
+    __tablename__ = "corpo_clinico_users"
+    __table_args__ = (
+        UniqueConstraint("corpo_clinico_id", "user_id", name="uq_corpo_clinico_user"),
+        {'extend_existing': True},
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    corpo_clinico_id = Column(Integer, ForeignKey("corpo_clinico.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    profissional_rel = relationship("CorpoClinico")
+
+class CronConfig(Base):
+    """Cron diario por integrador: cria jobs (rotina, default op1_consulta) para todas as carteirinhas ativas."""
+    __tablename__ = "cron_configs"
+    __table_args__ = {'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_integrador = Column(Integer, unique=True, nullable=False)  # ref. logica a worker.integradores (sem FK cross-schema)
+    enabled = Column(Boolean, default=False)
+    horario = Column(Time, nullable=False, default="23:01")
+    fuso = Column(Text, nullable=False, default="America/Sao_Paulo")
+    rotina = Column(Text, nullable=False, default="op1_consulta")
+    ultimo_run = Column(Date, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 class Agendamento(Base):
     __tablename__ = "agendamentos"
@@ -658,6 +737,37 @@ class ProtocoloItem(Base):
 
 
 
+class RelatorioMedico(Base):
+    """Pedidos/Relatórios Médicos (RM). Relaciona logicamente com RelatorioMedicoExtracao via id_relatorio."""
+    __tablename__ = "relatorios_medicos"
+    __table_args__ = (
+        UniqueConstraint('user_id', 'id_paciente', 'id_relatorio', name='uq_relatorio_medico_pac_rel'),
+        {'extend_existing': True}
+    )
+
+    id               = Column(Integer, primary_key=True, index=True)
+    user_id          = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    id_paciente      = Column(Text, nullable=False, index=True)
+    nome_paciente    = Column(Text)
+    id_relatorio     = Column(Text, index=True)   # ref. lógica -> relatorios_medicos_extracao.id_relatorio
+    url_arquivo      = Column(Text)
+    data_relatorio   = Column(Date)
+    nome_medico      = Column(Text)
+    especialidade    = Column(Text)
+    observacoes      = Column(Text)
+    is_active        = Column(Boolean, nullable=False, default=True)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at       = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relação lógica: uma RM pode ter N extrações AI associadas (join por id_relatorio)
+    extracoes = relationship(
+        "RelatorioMedicoExtracao",
+        primaryjoin="foreign(RelatorioMedico.id_relatorio) == RelatorioMedicoExtracao.id_relatorio",
+        uselist=True,
+        viewonly=True
+    )
+
+
 class RelatorioMedicoExtracao(Base):
     __tablename__ = "relatorios_medicos_extracao"
     __table_args__ = {'extend_existing': True}
@@ -708,6 +818,7 @@ class RelatorioClinico(Base):
     id_area = Column(Integer)
     data = Column(Date)
     nome_profissional = Column(Text)
+    is_active = Column(Boolean, nullable=False, default=True, server_default='true')
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -738,6 +849,7 @@ class IntegradorOperacao(Base):
     id_integrador_worker = Column(Integer, nullable=True) # Referência lógica ao worker schema sem FK cruzada
     id_convenio = Column(Integer, ForeignKey("convenios.id_convenio", ondelete="CASCADE"), nullable=False)
     rotina = Column(Text, nullable=False)
+    operacao_canonica = Column(Text, nullable=True) # Nome canônico cross-integrador (ex.: 'registrar_falta'); NULL = rotina interna
     descricao = Column(Text, nullable=True)
     tipo_processamento = Column(Text, nullable=False, default="local")  # 'local', 'server', 'remoto'
     ativo = Column(Boolean, default=True)
@@ -748,7 +860,9 @@ class IntegradorOperacao(Base):
 
 
 class UserIntegrador(Base):
-    """Integradores habilitados pelo Admin para um Client (User Gestor)."""
+    """Integradores habilitados pelo Admin para um Client (User Gestor).
+    id_integrador = referência LÓGICA ao id_integrador do schema worker (espaço W,
+    alinhado ao id_convenio canônico desde a migration 0102)."""
     __tablename__ = "user_integradores"
     __table_args__ = (
         UniqueConstraint('user_id', 'id_integrador', name='uq_user_integrador'),
@@ -787,6 +901,7 @@ class WorkerIntegradorOperacao(Base):
     id = Column(Integer, primary_key=True, index=True)
     id_integrador = Column(Integer, ForeignKey("worker.integradores.id_integrador", ondelete="CASCADE"), nullable=False)
     rotina = Column(Text, nullable=False)
+    operacao_canonica = Column(Text, nullable=True) # Nome canônico cross-integrador (ex.: 'registrar_falta'); NULL = rotina interna
     descricao = Column(Text, nullable=True)
     tipo_processamento = Column(Text, default="local")
     ativo = Column(Boolean, default=True)
@@ -795,11 +910,6 @@ class WorkerIntegradorOperacao(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     integrador_rel = relationship(WorkerIntegrador, primaryjoin="WorkerIntegradorOperacao.id_integrador == WorkerIntegrador.id_integrador")
-
-
-# Aliases para retrocompatibilidade
-WorkerConvenio = WorkerIntegrador
-WorkerConvenioOperacao = WorkerIntegradorOperacao
 
 
 class WorkerConfig(Base):

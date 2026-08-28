@@ -734,6 +734,519 @@ def _extract_results_list(result_data):
     return []
 
 
+def _resolve_job_integrador(db: Session, job):
+    """id_integrador (espaço W, worker.integradores) do convênio do job.
+
+    Usa o mapeamento 1:N convenios.id_integrador; None quando sem mapeamento."""
+    from models import Convenio
+    row = db.query(Convenio.id_integrador).filter(Convenio.id_convenio == job.id_convenio).first()
+    return row[0] if row and row[0] else None
+
+
+def _consume_evoluir(db: Session, job, synced_counts: dict) -> None:
+    """Handler de consumo de resultados do integrador Evoluir.
+
+    Extraído do loop de sync_completed_worker_jobs (paridade 1:1); chamado por
+    services.integrador_strategy.evoluir.EvoluirStrategy.consumir_resultado."""
+    rotina = str(job.rotina).lower()
+    results_list = _extract_results_list(job.result_data)
+
+    if results_list:
+        if "op1" in rotina or rotina == "1":
+            import unicodedata
+            from models import Carteirinha, Job as JobModel, Convenio
+
+            def normalize_name(name):
+                if not name:
+                    return ""
+                name = name.upper().strip()
+                name = "".join(c for c in unicodedata.normalize('NFD', name) if unicodedata.category(c) != 'Mn')
+                return " ".join(name.split())
+
+            # Cache local por execução para evitar queries repetidas
+            _conv_cache = {}
+
+            def _resolve_convenio_id(nome_plano_raw):
+                """Busca convênio por nome EXATO na tabela convenios.
+                Se não encontrado, insere novo usando próximo ID da sequência.
+                Retorna id_convenio."""
+                if not nome_plano_raw:
+                    return 6  # fallback IPASGO
+                nome_plano = nome_plano_raw.strip()
+                if nome_plano in _conv_cache:
+                    return _conv_cache[nome_plano]
+                conv = db.query(Convenio).filter(
+                    Convenio.nome == nome_plano
+                ).first()
+                if conv:
+                    _conv_cache[nome_plano] = conv.id_convenio
+                    return conv.id_convenio
+                # Não encontrado — inserir novo convênio com próximo ID da sequência
+                from sqlalchemy import text as sa_text
+                next_id = db.execute(sa_text("SELECT nextval('convenios_id_convenio_seq')")).scalar()
+                novo_conv = Convenio(
+                    id_convenio=next_id,
+                    nome=nome_plano,
+                    ativo=True
+                )
+                db.add(novo_conv)
+                db.flush()
+                _conv_cache[nome_plano] = next_id
+                return next_id
+
+            for p in results_list:
+                id_pac = str(p.get("id_paciente", "")).strip()
+                raw_nome = p.get("paciente", "")
+                nome_plano = p.get("plano", "").strip()
+                if not id_pac or not raw_nome:
+                    continue
+
+                nome_norm = normalize_name(raw_nome)
+                id_conv_item = _resolve_convenio_id(nome_plano)
+
+                # 1. Buscar por id_paciente primeiro (escopado ao user_id)
+                existing = db.query(Carteirinha).filter(
+                    Carteirinha.id_paciente == id_pac,
+                    Carteirinha.user_id == job.user_id
+                ).first()
+
+                # 2. Fallback: buscar por paciente + convênio + user_id
+                if not existing:
+                    existing = db.query(Carteirinha).filter(
+                        Carteirinha.paciente == nome_norm,
+                        Carteirinha.id_convenio == id_conv_item,
+                        Carteirinha.user_id == job.user_id
+                    ).first()
+
+                # 3. Fallback amplo: buscar por paciente + user_id (qualquer convênio)
+                if not existing:
+                    existing = db.query(Carteirinha).filter(
+                        Carteirinha.paciente == nome_norm,
+                        Carteirinha.user_id == job.user_id
+                    ).first()
+
+                is_new = False
+                if not existing:
+                    existing = Carteirinha(
+                        carteirinha=None,  # Será preenchido pelo op2 com o número real do cartão de convênio
+                        paciente=nome_norm,
+                        id_paciente=id_pac,
+                        id_convenio=id_conv_item,
+                        user_id=job.user_id,
+                        status="ativo"
+                    )
+                    db.add(existing)
+                    db.flush()
+                    is_new = True
+                else:
+                    # Atualizar nome, id_paciente e convênio se necessário
+                    if existing.paciente != nome_norm:
+                        existing.paciente = nome_norm
+                    if not existing.id_paciente or existing.id_paciente != id_pac:
+                        existing.id_paciente = id_pac
+                    if nome_plano and (not existing.id_convenio or existing.id_convenio == 100):
+                        existing.id_convenio = id_conv_item
+
+                # Evitar enfileirar OP2 e OP3 duplicados se já houver job pendente
+                has_pending_op2 = db.query(JobModel.id).filter(
+                    JobModel.id_convenio == 100,
+                    JobModel.rotina.in_(["op2", "op2_obterDetalhes", "2"]),
+                    JobModel.params.ilike(f'%"{id_pac}"%'),
+                    JobModel.status.in_(["pending", "processing"])
+                ).first()
+
+                if not has_pending_op2:
+                    op2_params = json.dumps({
+                        "id_paciente": id_pac,
+                        "id_convenio_pac": id_conv_item,
+                        "nome_plano": nome_plano
+                    })
+                    op2_job = JobModel(
+                        status="pending",
+                        id_convenio=100,
+                        user_id=job.user_id,
+                        rotina="op2_obterDetalhes",
+                        params=op2_params,
+                        priority=0
+                    )
+                    db.add(op2_job)
+
+                has_pending_op3 = db.query(JobModel.id).filter(
+                    JobModel.id_convenio == 100,
+                    JobModel.rotina.in_(["op3", "op3_ListarPTS", "3"]),
+                    JobModel.params.ilike(f'%"{id_pac}"%'),
+                    JobModel.status.in_(["pending", "processing"])
+                ).first()
+
+                if not has_pending_op3:
+                    op3_params = json.dumps({"id_paciente": id_pac, "nome_paciente": nome_norm})
+                    op3_job = JobModel(
+                        status="pending",
+                        id_convenio=100,
+                        user_id=job.user_id,
+                        rotina="op3_ListarPTS",
+                        params=op3_params,
+                        priority=0
+                    )
+                    db.add(op3_job)
+
+        elif "op2" in rotina or rotina == "2":
+            from models import Carteirinha, BaseGuia, Job as JobModel
+            # Recuperar id_convenio_pac dos params do job (injetado pelo op1)
+            try:
+                job_params_raw = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+            except Exception:
+                job_params_raw = {}
+            id_conv_from_job = job_params_raw.get("id_convenio_pac")
+
+            for item in results_list:
+                id_pac = str(item.get("id_paciente", "")).strip()
+                raw_cart_num = item.get("carteirinha")
+                cart_num = str(raw_cart_num).strip() if raw_cart_num is not None else ""
+                # Ignorar se cart_num for dict cru em formato texto, None ou placeholder
+                if cart_num.startswith('{') or cart_num.startswith('EVOLUIR_') or cart_num.lower() == 'none':
+                    cart_num = ""
+
+                cid_val = str(item.get("cid") or item.get("patologia") or "").strip()
+                if not cid_val or cid_val.lower() == 'none':
+                    cid_val = None
+
+                if not id_pac:
+                    continue
+
+                cart = db.query(Carteirinha).filter(
+                    Carteirinha.id_paciente == id_pac,
+                    Carteirinha.user_id == job.user_id
+                ).first()
+
+                if cart:
+                    # Atualizar id_convenio se o op1 passou via job params
+                    if id_conv_from_job and cart.id_convenio != int(id_conv_from_job):
+                        cart.id_convenio = int(id_conv_from_job)
+
+                    if cart_num:
+                        cart.codigo_beneficiario = cart_num
+
+                        # Verificar se já existe outra carteirinha com esse cart_num para este mesmo user_id
+                        other_cart = db.query(Carteirinha).filter(
+                            Carteirinha.carteirinha == cart_num,
+                            Carteirinha.user_id == job.user_id,
+                            Carteirinha.id != cart.id
+                        ).first()
+
+                        if other_cart:
+                            # Consolidar: mesclar id_paciente/cid no registro já existente com carteirinha real
+                            if not other_cart.id_paciente:
+                                other_cart.id_paciente = id_pac
+                            if id_conv_from_job and not other_cart.id_convenio:
+                                other_cart.id_convenio = int(id_conv_from_job)
+                            if cid_val and not other_cart.cid:
+                                other_cart.cid = cid_val
+                            other_cart.codigo_beneficiario = cart_num
+
+                            db.query(JobModel).filter(JobModel.carteirinha_id == cart.id).update({JobModel.carteirinha_id: other_cart.id}, synchronize_session=False)
+                            db.query(BaseGuia).filter(BaseGuia.carteirinha_id == cart.id).update({BaseGuia.carteirinha_id: other_cart.id}, synchronize_session=False)
+
+                            db.delete(cart)
+                            cart = None
+                        else:
+                            cart.carteirinha = cart_num
+
+                    if cid_val and cart is not None:
+                        cart.cid = cid_val
+
+        elif "op3" in rotina or rotina == "3":
+            from models import RelatorioClinico
+
+            # Resolve patient ID fallback from job params
+            job_id_paciente = None
+            try:
+                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+                job_id_paciente = p_params.get("id_paciente")
+            except Exception:
+                pass
+            if not job_id_paciente and job.carteirinha_id:
+                from models import Carteirinha
+                cart = db.query(Carteirinha).filter(Carteirinha.id == job.carteirinha_id).first()
+                if cart:
+                    job_id_paciente = cart.id_paciente
+
+            for r in results_list:
+                id_rel = str(r.get("id_relatorio", "")).strip()
+                if not id_rel:
+                    continue
+
+                id_pac_val = r.get("id_paciente") or job_id_paciente
+                t_rel = r.get("tipo_relatorio", "PTS")
+
+                existing_rel = db.query(RelatorioClinico).filter(
+                    RelatorioClinico.id_paciente == id_pac_val,
+                    RelatorioClinico.id_relatorio == id_rel,
+                    RelatorioClinico.tipo_relatorio == t_rel,
+                    RelatorioClinico.user_id == job.user_id
+                ).first()
+
+                data_rel = None
+                if r.get("data"):
+                    try:
+                        data_rel = datetime.strptime(str(r["data"]).strip()[:10], "%Y-%m-%d").date()
+                    except Exception:
+                        pass
+
+                if not existing_rel:
+                    new_rel = RelatorioClinico(
+                        user_id=job.user_id,
+                        id_paciente=id_pac_val,
+                        nome_paciente=r.get("nome_paciente"),
+                        tipo_relatorio=t_rel,
+                        id_relatorio=id_rel,
+                        url_arquivo=r.get("url_arquivo"),
+                        carga=str(r.get("carga")) if r.get("carga") is not None else None,
+                        tipo_carga_horaria=r.get("tipo_carga_horaria"),
+                        id_area=r.get("id_area"),
+                        data=data_rel,
+                        nome_profissional=r.get("nome_profissional")
+                    )
+                    db.add(new_rel)
+                else:
+                    existing_rel.nome_paciente = r.get("nome_paciente")
+                    existing_rel.url_arquivo = r.get("url_arquivo")
+                    existing_rel.carga = str(r.get("carga")) if r.get("carga") is not None else None
+                    existing_rel.tipo_carga_horaria = r.get("tipo_carga_horaria")
+                    existing_rel.id_area = r.get("id_area")
+                    existing_rel.nome_profissional = r.get("nome_profissional")
+                    if data_rel:
+                        existing_rel.data = data_rel
+
+        elif "op5" in rotina or rotina == "5":
+            from models import CorpoClinico
+            for p in results_list:
+                id_prof = str(p.get("id_profissional", "")).strip()
+                nome_prof = p.get("nome_profissional")
+                cpf_val = p.get("cpf")
+                registro_val = p.get("registro")
+                specs = p.get("especialidades") or []
+
+                if not id_prof or not nome_prof:
+                    continue
+
+                if not specs:
+                    specs = ['']
+
+                for spec in specs:
+                    spec_clean = str(spec).strip()
+                    spec_lower = spec_clean.lower()
+
+                    conselho_val = None
+                    if "fisioterapia" in spec_lower or "terapia ocupacional" in spec_lower or "terapeuta ocupacional" in spec_lower:
+                        conselho_val = "CREFITO"
+                    elif "fonoaudiologia" in spec_lower:
+                        conselho_val = "CREFONO"
+                    elif "psicologia" in spec_lower:
+                        conselho_val = "CRP"
+                    elif "psicopedagogia" in spec_lower:
+                        has_crp = db.query(CorpoClinico).filter(
+                            CorpoClinico.id_profissional == id_prof,
+                            CorpoClinico.conselho == "CRP"
+                        ).first() is not None
+                        conselho_val = "CRP" if has_crp else "ABPP"
+                    elif "psicomotricista" in spec_lower or "psicomotricidade" in spec_lower:
+                        has_crefito = db.query(CorpoClinico).filter(
+                            CorpoClinico.id_profissional == id_prof,
+                            CorpoClinico.conselho == "CREFITO"
+                        ).first() is not None
+                        conselho_val = "CREFITO" if has_crefito else "CREF"
+                    elif "musicoterapia" in spec_lower:
+                        conselho_val = "AGMT"
+
+                    cbo_val = None
+                    if "fisioterapia" in spec_lower:
+                        cbo_val = "223605"
+                    elif "terapia ocupacional" in spec_lower or "terapeuta ocupacional" in spec_lower:
+                        cbo_val = "223905"
+                    elif "fonoaudiologia" in spec_lower:
+                        cbo_val = "223810"
+                    elif "psicologia" in spec_lower:
+                        cbo_val = "251510"
+                    elif "psicopedagogia" in spec_lower:
+                        cbo_val = "239425"
+                    elif "psicomotricista" in spec_lower or "psicomotricidade" in spec_lower:
+                        cbo_val = "223910"
+                    elif "musicoterapia" in spec_lower:
+                        cbo_val = "223915"
+
+                    existing_prof = db.query(CorpoClinico).filter(
+                        CorpoClinico.id_profissional == id_prof,
+                        CorpoClinico.area == spec_clean
+                    ).first()
+
+                    if existing_prof:
+                        existing_prof.nome = nome_prof
+                        if cpf_val:
+                            existing_prof.cpf = cpf_val
+                        if registro_val:
+                            existing_prof.registro = registro_val
+                        if conselho_val:
+                            existing_prof.conselho = conselho_val
+                        if cbo_val:
+                            existing_prof.CBO = cbo_val
+                        existing_prof.status = "ativo"
+                        existing_prof.tipo_profissional = "profissional"
+                        existing_prof.user_id = 14
+                        synced_counts["updated"] += 1
+                    else:
+                        if not conselho_val or not cbo_val:
+                            any_prof_record = db.query(CorpoClinico).filter(
+                                CorpoClinico.id_profissional == id_prof
+                            ).first()
+                            if any_prof_record:
+                                if not conselho_val:
+                                    conselho_val = any_prof_record.conselho
+                                if not cbo_val:
+                                    cbo_val = any_prof_record.CBO
+
+                        new_prof = CorpoClinico(
+                            id_profissional=id_prof,
+                            nome=nome_prof,
+                            cpf=cpf_val,
+                            area=spec_clean,
+                            conselho=conselho_val,
+                            registro=registro_val,
+                            UF="GO",
+                            CBO=cbo_val,
+                            status="ativo",
+                            tipo_profissional="profissional",
+                            user_id=14
+                        )
+                        db.add(new_prof)
+                        synced_counts["inserted"] += 1
+        elif "op7" in rotina or "consultadocs" in rotina:
+            # OP_consultaDocs gera arquivo Excel e insere excel_url no result_data do Job.
+            pass
+
+    job.result_consumed = True
+    synced_counts["jobs_processed"] += 1
+    db.commit()
+
+    # Invalidar cache Redis e local do tenant para que as carteirinhas atualizadas fiquem visíveis imediatamente
+    try:
+        from cache import cache
+        cache.invalidate_tenant(job.user_id)
+    except Exception as _ce:
+        pass
+    return
+
+
+def _consume_aba_clmf(db: Session, job, synced_counts: dict) -> None:
+    """Handler de consumo de resultados do integrador ABA CLMF.
+
+    Extraído do loop de sync_completed_worker_jobs (paridade 1:1); chamado por
+    services.integrador_strategy.clmf.AbaClmfStrategy.consumir_resultado."""
+    rotina = str(job.rotina).lower()
+    results_list = _extract_results_list(job.result_data)
+
+    if "op1" in rotina or "importar_agendamentos" in rotina or rotina == "1":
+        _sync_aba_clmf_op1(db, job, results_list, synced_counts)
+    elif "op2" in rotina or "consultar_carteirinha" in rotina or rotina == "2":
+        _sync_aba_clmf_op2(db, job, results_list, synced_counts)
+    elif "op3" in rotina or "confirmar_agendamento" in rotina or rotina == "3":
+        p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+        ids = p_params.get("id_agendamento", [])
+        if isinstance(ids, (int, str)): ids = [int(ids)]
+        else: ids = [int(i) for i in ids]
+        num_situacao = p_params.get("num_situacao", 1)
+        new_status = "Confirmado" if num_situacao == 1 else "A Confirmar"
+        if ids:
+            from models import Agendamento, UserConvenio, Job as JobModel
+            db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).update({
+                Agendamento.Status: new_status,
+                Agendamento.execucao_status: "concluido"
+            }, synchronize_session=False)
+
+            # Automated Workflow Pipeline Chain: If auto_executar is enabled for user+convenio, auto-enqueue execution
+            if num_situacao == 1:
+                uc = db.query(UserConvenio).filter(
+                    UserConvenio.user_id == job.user_id,
+                    UserConvenio.id_convenio == 101
+                ).first()
+                if uc and uc.auto_executar:
+                    for ag_id in ids:
+                        exec_job = JobModel(
+                            status="pending",
+                            id_convenio=101,
+                            user_id=job.user_id,
+                            rotina="op3_execucao",
+                            params=json.dumps({"agendamento_id": ag_id}),
+                            priority=0
+                        )
+                        db.add(exec_job)
+
+    elif "op4" in rotina or "registrar_falta" in rotina or rotina == "4":
+        p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+        ids = p_params.get("id_agendamento", [])
+        if isinstance(ids, (int, str)): ids = [int(ids)]
+        else: ids = [int(i) for i in ids]
+        if ids:
+            from models import Agendamento
+            falta_ags = db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).all()
+            for ag in falta_ags:
+                ag.Status = "Falta"
+                ag.execucao_status = "concluido"
+                _unlink_guia_if_eligible(db, ag)
+    elif "op5" in rotina or "remover_falta" in rotina or rotina == "5":
+        p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+        ids = p_params.get("id_agendamento", [])
+        if isinstance(ids, (int, str)): ids = [int(ids)]
+        else: ids = [int(i) for i in ids]
+        if ids:
+            from models import Agendamento
+            db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).update({
+                Agendamento.Status: "A Confirmar",
+                Agendamento.execucao_status: "concluido"
+            }, synchronize_session=False)
+
+    elif "op6" in rotina or "atualizar_rc" in rotina or rotina == "6":
+        # OP6 ABA_CLMF (101): Atualizar Relatorio Clinico Mensal + baixar PDF.
+        # Resultado vem em result_data como {status, op, paciente, id_paciente,
+        # data_RC, pdf_caminho, pdf_nome}. O Hub apenas registra evento/log;
+        # persistencia adicional (tabela de RCs) fica para versao futura.
+        try:
+            rd = job.result_data if isinstance(job.result_data, dict) else {}
+            pdf_caminho = rd.get("pdf_caminho") or rd.get("pdf_path") or ""
+            paciente = rd.get("paciente", "")
+            if str(rd.get("status", "")).lower() == "success":
+                db.add(Log(
+                    job_id=job.id,
+                    user_id=job.user_id,
+                    level="INFO",
+                    message=f"[ABA_clmf OP6] RC atualizado para paciente='{paciente}'. PDF: {pdf_caminho}"
+                ))
+            else:
+                db.add(Log(
+                    job_id=job.id,
+                    user_id=job.user_id,
+                    level="WARN",
+                    message=f"[ABA_clmf OP6] Falha relatada pelo worker: {rd.get('message', '')} (code={rd.get('code', '')})"
+                ))
+        except Exception as log_e:
+            # Log de falha de log nao deve impedir o consumo do job.
+            try:
+                db.add(Log(
+                    job_id=job.id,
+                    user_id=job.user_id,
+                    level="ERROR",
+                    message=f"[ABA_clmf OP6] Erro ao registrar log de conclusao: {log_e}"
+                ))
+            except Exception:
+                pass
+
+    _trigger_next_workflow_node(db, job)
+    job.result_consumed = True
+    synced_counts["jobs_processed"] += 1
+    db.commit()
+    return
+
+
 def sync_completed_worker_jobs(db: Session) -> dict:
     """
     Consome resultados de jobs concluídos com sucesso e sincroniza com a base de guias.
@@ -760,501 +1273,15 @@ def sync_completed_worker_jobs(db: Session) -> dict:
             synced_counts["jobs_processed"] += 1
             continue
 
-        # Se for convênio Evoluir (ID 100)
-        if job.id_convenio == 100:
-            rotina = str(job.rotina).lower()
-            results_list = _extract_results_list(job.result_data)
-            
-            if results_list:
-                if "op1" in rotina or rotina == "1":
-                    import unicodedata
-                    from models import Carteirinha, Job as JobModel, Convenio
-
-                    def normalize_name(name):
-                        if not name:
-                            return ""
-                        name = name.upper().strip()
-                        name = "".join(c for c in unicodedata.normalize('NFD', name) if unicodedata.category(c) != 'Mn')
-                        return " ".join(name.split())
-
-                    # Cache local por execução para evitar queries repetidas
-                    _conv_cache = {}
-
-                    def _resolve_convenio_id(nome_plano_raw):
-                        """Busca convênio por nome EXATO na tabela convenios.
-                        Se não encontrado, insere novo usando próximo ID da sequência.
-                        Retorna id_convenio."""
-                        if not nome_plano_raw:
-                            return 6  # fallback IPASGO
-                        nome_plano = nome_plano_raw.strip()
-                        if nome_plano in _conv_cache:
-                            return _conv_cache[nome_plano]
-                        conv = db.query(Convenio).filter(
-                            Convenio.nome == nome_plano
-                        ).first()
-                        if conv:
-                            _conv_cache[nome_plano] = conv.id_convenio
-                            return conv.id_convenio
-                        # Não encontrado — inserir novo convênio com próximo ID da sequência
-                        from sqlalchemy import text as sa_text
-                        next_id = db.execute(sa_text("SELECT nextval('convenios_id_convenio_seq')")).scalar()
-                        novo_conv = Convenio(
-                            id_convenio=next_id,
-                            nome=nome_plano,
-                            ativo=True
-                        )
-                        db.add(novo_conv)
-                        db.flush()
-                        _conv_cache[nome_plano] = next_id
-                        return next_id
-
-                    for p in results_list:
-                        id_pac = str(p.get("id_paciente", "")).strip()
-                        raw_nome = p.get("paciente", "")
-                        nome_plano = p.get("plano", "").strip()
-                        if not id_pac or not raw_nome:
-                            continue
-                        
-                        nome_norm = normalize_name(raw_nome)
-                        id_conv_item = _resolve_convenio_id(nome_plano)
-                        
-                        # 1. Buscar por id_paciente primeiro (escopado ao user_id)
-                        existing = db.query(Carteirinha).filter(
-                            Carteirinha.id_paciente == id_pac,
-                            Carteirinha.user_id == job.user_id
-                        ).first()
-                        
-                        # 2. Fallback: buscar por paciente + convênio + user_id
-                        if not existing:
-                            existing = db.query(Carteirinha).filter(
-                                Carteirinha.paciente == nome_norm,
-                                Carteirinha.id_convenio == id_conv_item,
-                                Carteirinha.user_id == job.user_id
-                            ).first()
-                        
-                        # 3. Fallback amplo: buscar por paciente + user_id (qualquer convênio)
-                        if not existing:
-                            existing = db.query(Carteirinha).filter(
-                                Carteirinha.paciente == nome_norm,
-                                Carteirinha.user_id == job.user_id
-                            ).first()
-                        
-                        is_new = False
-                        if not existing:
-                            existing = Carteirinha(
-                                carteirinha=None,  # Será preenchido pelo op2 com o número real do cartão de convênio
-                                paciente=nome_norm,
-                                id_paciente=id_pac,
-                                id_convenio=id_conv_item,
-                                user_id=job.user_id,
-                                status="ativo"
-                            )
-                            db.add(existing)
-                            db.flush()
-                            is_new = True
-                        else:
-                            # Atualizar nome, id_paciente e convênio se necessário
-                            if existing.paciente != nome_norm:
-                                existing.paciente = nome_norm
-                            if not existing.id_paciente or existing.id_paciente != id_pac:
-                                existing.id_paciente = id_pac
-                            if nome_plano and (not existing.id_convenio or existing.id_convenio == 100):
-                                existing.id_convenio = id_conv_item
-                        
-                        # Evitar enfileirar OP2 e OP3 duplicados se já houver job pendente
-                        has_pending_op2 = db.query(JobModel.id).filter(
-                            JobModel.id_convenio == 100,
-                            JobModel.rotina.in_(["op2", "op2_obterDetalhes", "2"]),
-                            JobModel.params.ilike(f'%"{id_pac}"%'),
-                            JobModel.status.in_(["pending", "processing"])
-                        ).first()
-                        
-                        if not has_pending_op2:
-                            op2_params = json.dumps({
-                                "id_paciente": id_pac,
-                                "id_convenio_pac": id_conv_item,
-                                "nome_plano": nome_plano
-                            })
-                            op2_job = JobModel(
-                                status="pending",
-                                id_convenio=100,
-                                user_id=job.user_id,
-                                rotina="op2_obterDetalhes",
-                                params=op2_params,
-                                priority=0
-                            )
-                            db.add(op2_job)
-                            
-                        has_pending_op3 = db.query(JobModel.id).filter(
-                            JobModel.id_convenio == 100,
-                            JobModel.rotina.in_(["op3", "op3_ListarPTS", "3"]),
-                            JobModel.params.ilike(f'%"{id_pac}"%'),
-                            JobModel.status.in_(["pending", "processing"])
-                        ).first()
-                        
-                        if not has_pending_op3:
-                            op3_params = json.dumps({"id_paciente": id_pac, "nome_paciente": nome_norm})
-                            op3_job = JobModel(
-                                status="pending",
-                                id_convenio=100,
-                                user_id=job.user_id,
-                                rotina="op3_ListarPTS",
-                                params=op3_params,
-                                priority=0
-                            )
-                            db.add(op3_job)
-                            
-                elif "op2" in rotina or rotina == "2":
-                    from models import Carteirinha, BaseGuia, Job as JobModel
-                    # Recuperar id_convenio_pac dos params do job (injetado pelo op1)
-                    try:
-                        job_params_raw = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                    except Exception:
-                        job_params_raw = {}
-                    id_conv_from_job = job_params_raw.get("id_convenio_pac")
-
-                    for item in results_list:
-                        id_pac = str(item.get("id_paciente", "")).strip()
-                        raw_cart_num = item.get("carteirinha")
-                        cart_num = str(raw_cart_num).strip() if raw_cart_num is not None else ""
-                        # Ignorar se cart_num for dict cru em formato texto, None ou placeholder
-                        if cart_num.startswith('{') or cart_num.startswith('EVOLUIR_') or cart_num.lower() == 'none':
-                            cart_num = ""
-
-                        cid_val = str(item.get("cid") or item.get("patologia") or "").strip()
-                        if not cid_val or cid_val.lower() == 'none':
-                            cid_val = None
-                        
-                        if not id_pac:
-                            continue
-                            
-                        cart = db.query(Carteirinha).filter(
-                            Carteirinha.id_paciente == id_pac,
-                            Carteirinha.user_id == job.user_id
-                        ).first()
-                        
-                        if cart:
-                            # Atualizar id_convenio se o op1 passou via job params
-                            if id_conv_from_job and cart.id_convenio != int(id_conv_from_job):
-                                cart.id_convenio = int(id_conv_from_job)
-
-                            if cart_num:
-                                cart.codigo_beneficiario = cart_num
-                                
-                                # Verificar se já existe outra carteirinha com esse cart_num para este mesmo user_id
-                                other_cart = db.query(Carteirinha).filter(
-                                    Carteirinha.carteirinha == cart_num,
-                                    Carteirinha.user_id == job.user_id,
-                                    Carteirinha.id != cart.id
-                                ).first()
-                                
-                                if other_cart:
-                                    # Consolidar: mesclar id_paciente/cid no registro já existente com carteirinha real
-                                    if not other_cart.id_paciente:
-                                        other_cart.id_paciente = id_pac
-                                    if id_conv_from_job and not other_cart.id_convenio:
-                                        other_cart.id_convenio = int(id_conv_from_job)
-                                    if cid_val and not other_cart.cid:
-                                        other_cart.cid = cid_val
-                                    other_cart.codigo_beneficiario = cart_num
-                                    
-                                    db.query(JobModel).filter(JobModel.carteirinha_id == cart.id).update({JobModel.carteirinha_id: other_cart.id}, synchronize_session=False)
-                                    db.query(BaseGuia).filter(BaseGuia.carteirinha_id == cart.id).update({BaseGuia.carteirinha_id: other_cart.id}, synchronize_session=False)
-                                    
-                                    db.delete(cart)
-                                    cart = None
-                                else:
-                                    cart.carteirinha = cart_num
-                            
-                            if cid_val and cart is not None:
-                                cart.cid = cid_val
-                                
-                elif "op3" in rotina or rotina == "3":
-                    from models import RelatorioClinico
-                    
-                    # Resolve patient ID fallback from job params
-                    job_id_paciente = None
-                    try:
-                        p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                        job_id_paciente = p_params.get("id_paciente")
-                    except Exception:
-                        pass
-                    if not job_id_paciente and job.carteirinha_id:
-                        from models import Carteirinha
-                        cart = db.query(Carteirinha).filter(Carteirinha.id == job.carteirinha_id).first()
-                        if cart:
-                            job_id_paciente = cart.id_paciente
-
-                    for r in results_list:
-                        id_rel = str(r.get("id_relatorio", "")).strip()
-                        if not id_rel:
-                            continue
-                            
-                        id_pac_val = r.get("id_paciente") or job_id_paciente
-                        t_rel = r.get("tipo_relatorio", "PTS")
-                        
-                        existing_rel = db.query(RelatorioClinico).filter(
-                            RelatorioClinico.id_paciente == id_pac_val,
-                            RelatorioClinico.id_relatorio == id_rel,
-                            RelatorioClinico.tipo_relatorio == t_rel,
-                            RelatorioClinico.user_id == job.user_id
-                        ).first()
-                        
-                        data_rel = None
-                        if r.get("data"):
-                            try:
-                                data_rel = datetime.strptime(str(r["data"]).strip()[:10], "%Y-%m-%d").date()
-                            except Exception:
-                                pass
-                        
-                        if not existing_rel:
-                            new_rel = RelatorioClinico(
-                                user_id=job.user_id,
-                                id_paciente=id_pac_val,
-                                nome_paciente=r.get("nome_paciente"),
-                                tipo_relatorio=t_rel,
-                                id_relatorio=id_rel,
-                                url_arquivo=r.get("url_arquivo"),
-                                carga=str(r.get("carga")) if r.get("carga") is not None else None,
-                                tipo_carga_horaria=r.get("tipo_carga_horaria"),
-                                id_area=r.get("id_area"),
-                                data=data_rel,
-                                nome_profissional=r.get("nome_profissional")
-                            )
-                            db.add(new_rel)
-                        else:
-                            existing_rel.nome_paciente = r.get("nome_paciente")
-                            existing_rel.url_arquivo = r.get("url_arquivo")
-                            existing_rel.carga = str(r.get("carga")) if r.get("carga") is not None else None
-                            existing_rel.tipo_carga_horaria = r.get("tipo_carga_horaria")
-                            existing_rel.id_area = r.get("id_area")
-                            existing_rel.nome_profissional = r.get("nome_profissional")
-                            if data_rel:
-                                existing_rel.data = data_rel
-                                
-                elif "op5" in rotina or rotina == "5":
-                    from models import CorpoClinico
-                    for p in results_list:
-                        id_prof = str(p.get("id_profissional", "")).strip()
-                        nome_prof = p.get("nome_profissional")
-                        cpf_val = p.get("cpf")
-                        registro_val = p.get("registro")
-                        specs = p.get("especialidades") or []
-                        
-                        if not id_prof or not nome_prof:
-                            continue
-                            
-                        if not specs:
-                            specs = ['']
-                            
-                        for spec in specs:
-                            spec_clean = str(spec).strip()
-                            spec_lower = spec_clean.lower()
-                            
-                            conselho_val = None
-                            if "fisioterapia" in spec_lower or "terapia ocupacional" in spec_lower or "terapeuta ocupacional" in spec_lower:
-                                conselho_val = "CREFITO"
-                            elif "fonoaudiologia" in spec_lower:
-                                conselho_val = "CREFONO"
-                            elif "psicologia" in spec_lower:
-                                conselho_val = "CRP"
-                            elif "psicopedagogia" in spec_lower:
-                                has_crp = db.query(CorpoClinico).filter(
-                                    CorpoClinico.id_profissional == id_prof,
-                                    CorpoClinico.conselho == "CRP"
-                                ).first() is not None
-                                conselho_val = "CRP" if has_crp else "ABPP"
-                            elif "psicomotricista" in spec_lower or "psicomotricidade" in spec_lower:
-                                has_crefito = db.query(CorpoClinico).filter(
-                                    CorpoClinico.id_profissional == id_prof,
-                                    CorpoClinico.conselho == "CREFITO"
-                                ).first() is not None
-                                conselho_val = "CREFITO" if has_crefito else "CREF"
-                            elif "musicoterapia" in spec_lower:
-                                conselho_val = "AGMT"
-                                
-                            cbo_val = None
-                            if "fisioterapia" in spec_lower:
-                                cbo_val = "223605"
-                            elif "terapia ocupacional" in spec_lower or "terapeuta ocupacional" in spec_lower:
-                                cbo_val = "223905"
-                            elif "fonoaudiologia" in spec_lower:
-                                cbo_val = "223810"
-                            elif "psicologia" in spec_lower:
-                                cbo_val = "251510"
-                            elif "psicopedagogia" in spec_lower:
-                                cbo_val = "239425"
-                            elif "psicomotricista" in spec_lower or "psicomotricidade" in spec_lower:
-                                cbo_val = "223910"
-                            elif "musicoterapia" in spec_lower:
-                                cbo_val = "223915"
-                                
-                            existing_prof = db.query(CorpoClinico).filter(
-                                CorpoClinico.id_profissional == id_prof,
-                                CorpoClinico.area == spec_clean
-                            ).first()
-                            
-                            if existing_prof:
-                                existing_prof.nome = nome_prof
-                                if cpf_val:
-                                    existing_prof.cpf = cpf_val
-                                if registro_val:
-                                    existing_prof.registro = registro_val
-                                if conselho_val:
-                                    existing_prof.conselho = conselho_val
-                                if cbo_val:
-                                    existing_prof.CBO = cbo_val
-                                existing_prof.status = "ativo"
-                                existing_prof.tipo_profissional = "profissional"
-                                existing_prof.user_id = 14
-                                synced_counts["updated"] += 1
-                            else:
-                                if not conselho_val or not cbo_val:
-                                    any_prof_record = db.query(CorpoClinico).filter(
-                                        CorpoClinico.id_profissional == id_prof
-                                    ).first()
-                                    if any_prof_record:
-                                        if not conselho_val:
-                                            conselho_val = any_prof_record.conselho
-                                        if not cbo_val:
-                                            cbo_val = any_prof_record.CBO
-                                            
-                                new_prof = CorpoClinico(
-                                    id_profissional=id_prof,
-                                    nome=nome_prof,
-                                    cpf=cpf_val,
-                                    area=spec_clean,
-                                    conselho=conselho_val,
-                                    registro=registro_val,
-                                    UF="GO",
-                                    CBO=cbo_val,
-                                    status="ativo",
-                                    tipo_profissional="profissional",
-                                    user_id=14
-                                )
-                                db.add(new_prof)
-                                synced_counts["inserted"] += 1
-                elif "op7" in rotina or "consultadocs" in rotina:
-                    # OP_consultaDocs gera arquivo Excel e insere excel_url no result_data do Job.
-                    pass
-                                
-            job.result_consumed = True
-            synced_counts["jobs_processed"] += 1
-            db.commit()
-            
-            # Invalidar cache Redis e local do tenant para que as carteirinhas atualizadas fiquem visíveis imediatamente
-            try:
-                from cache import cache
-                cache.invalidate_tenant(job.user_id)
-            except Exception as _ce:
-                pass
-            continue
-
-        # Se for convênio ABA_clmf (ID 101)
-        if job.id_convenio == 101:
-            rotina = str(job.rotina).lower()
-            results_list = _extract_results_list(job.result_data)
-
-            if "op1" in rotina or "importar_agendamentos" in rotina or rotina == "1":
-                _sync_aba_clmf_op1(db, job, results_list, synced_counts)
-            elif "op2" in rotina or "consultar_carteirinha" in rotina or rotina == "2":
-                _sync_aba_clmf_op2(db, job, results_list, synced_counts)
-            elif "op3" in rotina or "confirmar_agendamento" in rotina or rotina == "3":
-                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                ids = p_params.get("id_agendamento", [])
-                if isinstance(ids, (int, str)): ids = [int(ids)]
-                else: ids = [int(i) for i in ids]
-                num_situacao = p_params.get("num_situacao", 1)
-                new_status = "Confirmado" if num_situacao == 1 else "A Confirmar"
-                if ids:
-                    from models import Agendamento, UserConvenio, Job as JobModel
-                    db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).update({
-                        Agendamento.Status: new_status,
-                        Agendamento.execucao_status: "concluido"
-                    }, synchronize_session=False)
-
-                    # Automated Workflow Pipeline Chain: If auto_executar is enabled for user+convenio, auto-enqueue execution
-                    if num_situacao == 1:
-                        uc = db.query(UserConvenio).filter(
-                            UserConvenio.user_id == job.user_id,
-                            UserConvenio.id_convenio == 101
-                        ).first()
-                        if uc and uc.auto_executar:
-                            for ag_id in ids:
-                                exec_job = JobModel(
-                                    status="pending",
-                                    id_convenio=101,
-                                    user_id=job.user_id,
-                                    rotina="op3_execucao",
-                                    params=json.dumps({"agendamento_id": ag_id}),
-                                    priority=0
-                                )
-                                db.add(exec_job)
-
-            elif "op4" in rotina or "registrar_falta" in rotina or rotina == "4":
-                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                ids = p_params.get("id_agendamento", [])
-                if isinstance(ids, (int, str)): ids = [int(ids)]
-                else: ids = [int(i) for i in ids]
-                if ids:
-                    from models import Agendamento
-                    falta_ags = db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).all()
-                    for ag in falta_ags:
-                        ag.Status = "Falta"
-                        ag.execucao_status = "concluido"
-                        _unlink_guia_if_eligible(db, ag)
-            elif "op5" in rotina or "remover_falta" in rotina or rotina == "5":
-                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                ids = p_params.get("id_agendamento", [])
-                if isinstance(ids, (int, str)): ids = [int(ids)]
-                else: ids = [int(i) for i in ids]
-                if ids:
-                    from models import Agendamento
-                    db.query(Agendamento).filter(Agendamento.id_agendamento.in_(ids)).update({
-                        Agendamento.Status: "A Confirmar",
-                        Agendamento.execucao_status: "concluido"
-                    }, synchronize_session=False)
-
-            elif "op6" in rotina or "atualizar_rc" in rotina or rotina == "6":
-                # OP6 ABA_CLMF (101): Atualizar Relatorio Clinico Mensal + baixar PDF.
-                # Resultado vem em result_data como {status, op, paciente, id_paciente,
-                # data_RC, pdf_caminho, pdf_nome}. O Hub apenas registra evento/log;
-                # persistencia adicional (tabela de RCs) fica para versao futura.
-                try:
-                    rd = job.result_data if isinstance(job.result_data, dict) else {}
-                    pdf_caminho = rd.get("pdf_caminho") or rd.get("pdf_path") or ""
-                    paciente = rd.get("paciente", "")
-                    if str(rd.get("status", "")).lower() == "success":
-                        db.add(Log(
-                            job_id=job.id,
-                            user_id=job.user_id,
-                            level="INFO",
-                            message=f"[ABA_clmf OP6] RC atualizado para paciente='{paciente}'. PDF: {pdf_caminho}"
-                        ))
-                    else:
-                        db.add(Log(
-                            job_id=job.id,
-                            user_id=job.user_id,
-                            level="WARN",
-                            message=f"[ABA_clmf OP6] Falha relatada pelo worker: {rd.get('message', '')} (code={rd.get('code', '')})"
-                        ))
-                except Exception as log_e:
-                    # Log de falha de log nao deve impedir o consumo do job.
-                    try:
-                        db.add(Log(
-                            job_id=job.id,
-                            user_id=job.user_id,
-                            level="ERROR",
-                            message=f"[ABA_clmf OP6] Erro ao registrar log de conclusao: {log_e}"
-                        ))
-                    except Exception:
-                        pass
-
-            _trigger_next_workflow_node(db, job)
-            job.result_consumed = True
-            synced_counts["jobs_processed"] += 1
-            db.commit()
-            continue
+        # Integradores tipo agendamento: consumo delegado à estratégia do integrador,
+        # resolvido via convenios.id_integrador (espaço W) — sem hardcode de id_convenio.
+        _id_integrador_w = _resolve_job_integrador(db, job)
+        if _id_integrador_w:
+            from services.integrador_strategy import get_strategy, NullStrategy
+            _strategy = get_strategy(db, _id_integrador_w)
+            if not isinstance(_strategy, NullStrategy):
+                _strategy.consumir_resultado(job, synced_counts)
+                continue
 
         # Se for convênio IPASGO (ID 6)
         if job.id_convenio == 6:

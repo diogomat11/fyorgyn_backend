@@ -70,8 +70,19 @@ def trigger_agendamento_workflow(
             "jobs": [{"id": j.id, "rotina": j.rotina, "status": j.status} for j in created_jobs]
         }
 
-    # Fallback default workflow (e.g. op5_confirmar)
-    rotina = "op5_confirmar" if id_convenio == 101 else "op2_executar"
+    # Fallback default workflow: resolve a rotina de confirmação do integrador do
+    # convênio via catálogo canônico (sem hardcode por id_convenio). Preserva o
+    # legado "op2_executar" para convênios sem OP canônica de confirmação.
+    from services.integrador_strategy import resolver_integrador_do_convenio
+    from services.integrador_strategy.canonico import rotina_por_operacao_canonica
+    rotina = None
+    id_integrador = resolver_integrador_do_convenio(db, id_convenio)
+    if id_integrador:
+        op_confirmar = rotina_por_operacao_canonica(db, id_integrador, "confirmar_agendamento")
+        if op_confirmar:
+            rotina = op_confirmar.rotina
+    if not rotina:
+        rotina = "op2_executar"
     job_params = {
         "agendamento_ids": req.agendamento_ids,
         "cod_prestador": cod_prestador,

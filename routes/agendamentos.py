@@ -10,11 +10,24 @@ from models import (
     Carteirinha,
     Convenio,
     CorpoClinico,
+    CorpoClinicoArea,
+    CorpoClinicoConvenio,
+    CorpoClinicoProcedimento,
+    CorpoClinicoUser,
+    AreaAtuacao,
     Procedimento,
     ProcedimentoFaturamento,
+    User,
     BaseGuia
 )
-from dependencies import get_current_user, get_current_worker_key, get_effective_user_id
+from dependencies import (
+    get_current_user,
+    get_current_worker_key,
+    get_effective_user_id,
+    get_integradores_agendamento_usuario,
+    check_integrador_habilitado,
+    require_integrador_agendamento,
+)
 from sqlalchemy import func, String, cast, or_
 
 router = APIRouter(
@@ -178,48 +191,48 @@ class SincronizarAgendamentosRequest(BaseModel):
     data_inicio: Optional[date] = None
     data_fim: Optional[date] = None
     id_paciente: Optional[str] = "0"
-    id_convenio: Optional[int] = 101
+    id_convenio: Optional[int] = None     # legado (frontend envia 101); resolvido via convenios.id_integrador
+    id_integrador: Optional[int] = None   # id no espaço W (worker.integradores)
 
 
 @router.post("/sincronizar")
 def sincronizar_agendamentos_portal(
     req: SincronizarAgendamentosRequest,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_integrador_agendamento())
 ):
-    from models import UserConvenio, Job
-    import json
+    """Cria job de sincronização de agendamentos no portal do integrador vinculado (OP canônica)."""
+    from services.integrador_strategy import get_strategy, resolver_integrador_do_convenio
 
-    target_id_convenio = req.id_convenio or 101
-    
-    # Verifica se o usuario tem credenciais cadastradas para o convenio ABA_clmf (ou id_convenio alvo)
-    user_conv = db.query(UserConvenio).filter(
-        UserConvenio.user_id == current_user.id,
-        UserConvenio.id_convenio == target_id_convenio
-    ).first()
+    vinculos = get_integradores_agendamento_usuario(db, current_user)
 
-    if not user_conv:
+    if req.id_integrador:
+        id_integrador = req.id_integrador
+    elif req.id_convenio:
+        id_integrador = resolver_integrador_do_convenio(db, req.id_convenio)
+        if not id_integrador:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Convênio {req.id_convenio} não possui integrador de agendamento vinculado."
+            )
+    elif len(vinculos) == 1:
+        id_integrador = vinculos[0]
+    else:
         raise HTTPException(
             status_code=400,
-            detail=f"Usuário não possui credenciais vinculadas para o convênio ID {target_id_convenio} (ABA_clmf)."
+            detail="Informe id_integrador: este usuário possui mais de um integrador de "
+                   f"agendamento habilitado ({', '.join(str(v) for v in vinculos)})."
         )
 
-    params_dict = {
-        "data_inicio": req.data_inicio.strftime("%Y-%m-%d") if req.data_inicio else None,
-        "data_fim": req.data_fim.strftime("%Y-%m-%d") if req.data_fim else None,
-        "id_paciente": req.id_paciente or "0"
-    }
+    check_integrador_habilitado(db, current_user, id_integrador)
+    strategy = get_strategy(db, id_integrador)
 
-    new_job = Job(
-        id_convenio=target_id_convenio,
-        rotina="op1_importar_agendamentos",
-        status="pending",
-        params=json.dumps(params_dict),
-        user_id=get_effective_user_id(current_user)
+    new_job = strategy.sincronizar_agendamentos(
+        get_effective_user_id(current_user),
+        data_inicio=req.data_inicio,
+        data_fim=req.data_fim,
+        id_paciente=req.id_paciente
     )
-    db.add(new_job)
-    db.commit()
-    db.refresh(new_job)
 
     return {
         "status": "success",
@@ -1102,16 +1115,19 @@ def list_profissionais(
 
     items = [
         {
+            "id": p.id,
             "id_profissional": p.id_profissional,
             "nome": p.nome,
             "cpf": p.cpf or "",
             "area": p.area or "",
+            "id_area": p.id_area,
             "conselho": p.conselho or "",
             "registro": p.registro or "",
             "UF": p.UF or "",
             "CBO": p.CBO or "",
             "codigo_ipasgo": p.codigo_ipasgo or "",
-            "tipo_profissional": p.tipo_profissional or "profissional"
+            "tipo_profissional": p.tipo_profissional or "profissional",
+            "situacao": p.situacao or ""
         }
         for p in profissionais
     ]
@@ -1257,21 +1273,181 @@ def delete_profissional(
     return {"status": "success", "message": "Profissional desativado com sucesso."}
 
 
+# ── Vínculos do Profissional (N:N áreas / convênios / procedimentos / usuários) ──
+
+@router.get("/areas")
+def list_areas_atuacao(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
+    """Lista áreas de atuação ativas (catálogo para vínculos do corpo clínico)."""
+    areas = db.query(AreaAtuacao).filter(AreaAtuacao.status == "ativo").order_by(AreaAtuacao.nome).all()
+    return [
+        {"id_area": a.id_area, "nome": a.nome, "cbo": a.cbo or ""}
+        for a in areas
+    ]
+
+
+class VinculosUpdateSchema(BaseModel):
+    id_areas: List[int] = []
+    id_convenios: List[int] = []
+    id_procedimentos: List[int] = []
+    user_ids: List[int] = []
+
+
+@router.get("/profissionais/{profissional_id}/vinculos")
+def get_vinculos_profissional(
+    profissional_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Retorna os vínculos N:N do profissional (áreas, convênios, procedimentos habilitados e usuários)."""
+    prof = db.query(CorpoClinico).filter(CorpoClinico.id == profissional_id).first()
+    if not prof:
+        raise HTTPException(status_code=404, detail="Profissional não encontrado.")
+
+    areas = (
+        db.query(CorpoClinicoArea, AreaAtuacao)
+        .join(AreaAtuacao, CorpoClinicoArea.id_area == AreaAtuacao.id_area)
+        .filter(CorpoClinicoArea.corpo_clinico_id == profissional_id)
+        .all()
+    )
+    convenios = (
+        db.query(CorpoClinicoConvenio, Convenio)
+        .join(Convenio, CorpoClinicoConvenio.id_convenio == Convenio.id_convenio)
+        .filter(CorpoClinicoConvenio.corpo_clinico_id == profissional_id)
+        .all()
+    )
+    procedimentos = (
+        db.query(CorpoClinicoProcedimento, Procedimento)
+        .join(Procedimento, CorpoClinicoProcedimento.id_procedimento == Procedimento.id_procedimento)
+        .filter(CorpoClinicoProcedimento.corpo_clinico_id == profissional_id)
+        .all()
+    )
+    users = (
+        db.query(CorpoClinicoUser, User)
+        .join(User, CorpoClinicoUser.user_id == User.id)
+        .filter(CorpoClinicoUser.corpo_clinico_id == profissional_id)
+        .all()
+    )
+
+    return {
+        "profissional_id": profissional_id,
+        "id_areas": [a.id_area for _, a in areas],
+        "areas": [{"id_area": a.id_area, "nome": a.nome} for _, a in areas],
+        "id_convenios": [c.id_convenio for _, c in convenios],
+        "convenios": [{"id_convenio": c.id_convenio, "nome": c.nome} for _, c in convenios],
+        "id_procedimentos": [p.id_procedimento for _, p in procedimentos],
+        "procedimentos": [
+            {"id_procedimento": p.id_procedimento, "nome": p.nome, "codigo_procedimento": p.codigo_procedimento or ""}
+            for _, p in procedimentos
+        ],
+        "user_ids": [u.id for _, u in users],
+        "users": [{"id": u.id, "username": u.username} for _, u in users]
+    }
+
+
+@router.put("/profissionais/{profissional_id}/vinculos")
+def update_vinculos_profissional(
+    profissional_id: int,
+    req: VinculosUpdateSchema,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Substitui (replace) transacionalmente os vínculos N:N do profissional.
+    Se id_areas for informado, sincroniza id_area/area (texto, compat) com a 1ª área.
+    """
+    prof = db.query(CorpoClinico).filter(CorpoClinico.id == profissional_id).first()
+    if not prof:
+        raise HTTPException(status_code=404, detail="Profissional não encontrado.")
+    if not current_user.is_admin and prof.user_id != current_user.id and prof.user_id is not None:
+        raise HTTPException(status_code=403, detail="Sem permissão para editar vínculos deste profissional.")
+
+    # Validação de FKs (falha rápido, sem gravação parcial)
+    if req.id_areas:
+        valid_areas = {a[0] for a in db.query(AreaAtuacao.id_area).filter(AreaAtuacao.id_area.in_(req.id_areas)).all()}
+        invalid = set(req.id_areas) - valid_areas
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Áreas inválidas: {sorted(invalid)}")
+    if req.id_convenios:
+        valid_convs = {c[0] for c in db.query(Convenio.id_convenio).filter(Convenio.id_convenio.in_(req.id_convenios)).all()}
+        invalid = set(req.id_convenios) - valid_convs
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Convênios inválidos: {sorted(invalid)}")
+    if req.id_procedimentos:
+        valid_procs = {p[0] for p in db.query(Procedimento.id_procedimento).filter(Procedimento.id_procedimento.in_(req.id_procedimentos)).all()}
+        invalid = set(req.id_procedimentos) - valid_procs
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Procedimentos inválidos: {sorted(invalid)}")
+    if req.user_ids:
+        valid_users = {u[0] for u in db.query(User.id).filter(User.id.in_(req.user_ids)).all()}
+        invalid = set(req.user_ids) - valid_users
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Usuários inválidos: {sorted(invalid)}")
+
+    try:
+        # Substituição atômica: delete + bulk insert dentro da mesma transação
+        db.query(CorpoClinicoArea).filter(CorpoClinicoArea.corpo_clinico_id == profissional_id).delete()
+        db.query(CorpoClinicoConvenio).filter(CorpoClinicoConvenio.corpo_clinico_id == profissional_id).delete()
+        db.query(CorpoClinicoProcedimento).filter(CorpoClinicoProcedimento.corpo_clinico_id == profissional_id).delete()
+        db.query(CorpoClinicoUser).filter(CorpoClinicoUser.corpo_clinico_id == profissional_id).delete()
+
+        db.add_all([CorpoClinicoArea(corpo_clinico_id=profissional_id, id_area=v) for v in dict.fromkeys(req.id_areas)])
+        db.add_all([CorpoClinicoConvenio(corpo_clinico_id=profissional_id, id_convenio=v) for v in dict.fromkeys(req.id_convenios)])
+        db.add_all([CorpoClinicoProcedimento(corpo_clinico_id=profissional_id, id_procedimento=v) for v in dict.fromkeys(req.id_procedimentos)])
+        db.add_all([CorpoClinicoUser(corpo_clinico_id=profissional_id, user_id=v) for v in dict.fromkeys(req.user_ids)])
+
+        # Sincroniza id_area/area textual (compat) com a 1ª área da lista
+        if req.id_areas:
+            primeira_area = db.query(AreaAtuacao).filter(AreaAtuacao.id_area == req.id_areas[0]).first()
+            if primeira_area:
+                prof.id_area = primeira_area.id_area
+                prof.area = primeira_area.nome
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar vínculos: {str(e)}")
+
+    try:
+        from cache import cache
+        cache.invalidate_tenant(get_effective_user_id(current_user))
+    except Exception:
+        pass
+
+    return {"status": "success", "message": "Vínculos atualizados com sucesso."}
+
+
 # ── Pipeline Workflow Endpoints ──
 
 class ConfirmarPortalRequest(BaseModel):
     agendamento_ids: List[int]
     remover: bool = False
 
+def _resolver_integrador_dos_agendamentos(db: Session, agendamentos: list) -> int:
+    """Valida que todos os agendamentos pertencem a um mesmo integrador de
+    agendamento e retorna seu id (espaço W)."""
+    from services.integrador_strategy import resolver_integrador_do_convenio
+    integradores = {resolver_integrador_do_convenio(db, ag.id_convenio) for ag in agendamentos}
+    if None in integradores or len(integradores) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Selecione agendamentos de um mesmo integrador de agendamento."
+        )
+    return integradores.pop()
+
+def _validar_posse_agendamentos(current_user, agendamentos: list, target_user_id: int) -> None:
+    if not current_user.is_admin:
+        for ag in agendamentos:
+            if ag.user_id != target_user_id:
+                raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
+
 @router.post("/confirmar-portal")
 def confirmar_portal(
     req: ConfirmarPortalRequest,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_integrador_agendamento())
 ):
-    """Cria Job worker OP3 para confirmar/remover confirmação no portal ABA."""
-    from models import Job, UserConvenio
-    import os
+    """Cria Job de confirmação no portal do integrador vinculado (OP canônica confirmar_agendamento)."""
+    from services.integrador_strategy import get_strategy
 
     if not req.agendamento_ids:
         raise HTTPException(status_code=400, detail="Nenhum agendamento selecionado.")
@@ -1282,40 +1458,15 @@ def confirmar_portal(
     if not agendamentos:
         raise HTTPException(status_code=404, detail="Agendamentos não encontrados.")
 
-    if not current_user.is_admin:
-        for ag in agendamentos:
-            if ag.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
+    target_user_id = get_effective_user_id(current_user)
+    _validar_posse_agendamentos(current_user, agendamentos, target_user_id)
 
-    uconv = db.query(UserConvenio).filter(
-        UserConvenio.user_id == current_user.id,
-        UserConvenio.id_convenio == 101
-    ).first()
-    if not uconv or not uconv.login or not uconv.senha_criptografada:
-        raise HTTPException(status_code=400, detail="Credenciais ABA CLMF não configuradas.")
+    id_integrador = _resolver_integrador_dos_agendamentos(db, agendamentos)
+    check_integrador_habilitado(db, current_user, id_integrador)
+    strategy = get_strategy(db, id_integrador)
 
     portal_ids = [ag.id_agendamento for ag in agendamentos]
-    num_situacao = 0 if req.remover else 1
-
-    params_dict = {
-        "id_agendamento": portal_ids,
-        "num_situacao": num_situacao,
-        "login": uconv.login,
-        "senha_criptografada": uconv.senha_criptografada,
-        "cod_prestador": uconv.cod_prestador,
-        "webhook_url": os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
-    }
-
-    new_job = Job(
-        id_convenio=101,
-        rotina="op3_confirmar_agendamento",
-        status="pending",
-        params=params_dict,
-        user_id=get_effective_user_id(current_user)
-    )
-    db.add(new_job)
-    db.commit()
-    db.refresh(new_job)
+    new_job = strategy.confirmar_agendamentos(target_user_id, portal_ids, remover=req.remover)
 
     # Set execucao_status to processando while preserving current stage for spinner UI
     db.query(Agendamento).filter(Agendamento.id_agendamento.in_(portal_ids)).update({
@@ -1346,11 +1497,11 @@ class RegistrarFaltaPortalRequest(BaseModel):
 def registrar_falta_portal(
     req: RegistrarFaltaPortalRequest,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_integrador_agendamento())
 ):
-    """Cria Job worker OP4 para registrar falta no portal ABA."""
-    from models import Job, UserConvenio, MotivoFalta
-    import json, os
+    """Cria Job de registro de falta no portal do integrador vinculado (OP canônica registrar_falta)."""
+    from models import MotivoFalta
+    from services.integrador_strategy import get_strategy
 
     if not req.agendamento_ids:
         raise HTTPException(status_code=400, detail="Nenhum agendamento selecionado.")
@@ -1362,41 +1513,21 @@ def registrar_falta_portal(
     agendamentos = db.query(Agendamento).filter(
         Agendamento.id_agendamento.in_(req.agendamento_ids)
     ).all()
-    if not current_user.is_admin:
-        for ag in agendamentos:
-            if ag.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
+    target_user_id = get_effective_user_id(current_user)
+    _validar_posse_agendamentos(current_user, agendamentos, target_user_id)
 
-    uconv = db.query(UserConvenio).filter(
-        UserConvenio.user_id == current_user.id,
-        UserConvenio.id_convenio == 101
-    ).first()
-    if not uconv or not uconv.login or not uconv.senha_criptografada:
-        raise HTTPException(status_code=400, detail="Credenciais ABA CLMF não configuradas.")
+    id_integrador = _resolver_integrador_dos_agendamentos(db, agendamentos)
+    check_integrador_habilitado(db, current_user, id_integrador)
+    strategy = get_strategy(db, id_integrador)
 
     portal_ids = [ag.id_agendamento for ag in agendamentos]
-
-    params_dict = {
-        "id_agendamento": portal_ids,
-        "id_paciente": req.id_paciente,
-        "tipo_desagendamento": motivo.id_mapeado,
-        "doc_justificativa": req.doc_justificativa or "",
-        "login": uconv.login,
-        "senha_criptografada": uconv.senha_criptografada,
-        "cod_prestador": uconv.cod_prestador,
-        "webhook_url": os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
-    }
-
-    new_job = Job(
-        id_convenio=101,
-        rotina="op4_registrar_falta",
-        status="pending",
-        params=params_dict,
-        user_id=get_effective_user_id(current_user)
+    new_job = strategy.registrar_falta(
+        target_user_id,
+        portal_ids,
+        id_paciente=req.id_paciente,
+        motivo_mapeado=motivo.id_mapeado,
+        doc_justificativa=req.doc_justificativa
     )
-    db.add(new_job)
-    db.commit()
-    db.refresh(new_job)
 
     db.query(Agendamento).filter(Agendamento.id_agendamento.in_(req.agendamento_ids)).update({
         Agendamento.execucao_status: "processando"
@@ -1426,12 +1557,11 @@ class RemoverFaltaPortalRequest(BaseModel):
 def remover_falta_portal(
     req: RemoverFaltaPortalRequest,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_integrador_agendamento())
 ):
-    """Cria Job worker OP5 para remover falta no portal ABA."""
-    from models import Job, UserConvenio
-    import os
+    """Cria Job de remoção de falta no portal do integrador vinculado (OP canônica remover_falta)."""
     from datetime import date as _date
+    from services.integrador_strategy import get_strategy
 
     if not req.agendamento_ids:
         raise HTTPException(status_code=400, detail="Nenhum agendamento selecionado.")
@@ -1439,42 +1569,23 @@ def remover_falta_portal(
     agendamentos = db.query(Agendamento).filter(
         Agendamento.id_agendamento.in_(req.agendamento_ids)
     ).all()
-    if not current_user.is_admin:
-        for ag in agendamentos:
-            if ag.user_id != current_user.id:
-                raise HTTPException(status_code=403, detail="Sem permissão para este agendamento.")
+    target_user_id = get_effective_user_id(current_user)
+    _validar_posse_agendamentos(current_user, agendamentos, target_user_id)
 
-    uconv = db.query(UserConvenio).filter(
-        UserConvenio.user_id == current_user.id,
-        UserConvenio.id_convenio == 101
-    ).first()
-    if not uconv or not uconv.login or not uconv.senha_criptografada:
-        raise HTTPException(status_code=400, detail="Credenciais ABA CLMF não configuradas.")
+    id_integrador = _resolver_integrador_dos_agendamentos(db, agendamentos)
+    check_integrador_habilitado(db, current_user, id_integrador)
+    strategy = get_strategy(db, id_integrador)
 
     portal_ids = [ag.id_agendamento for ag in agendamentos]
     today_str = _date.today().strftime("%Y-%m-%d")
 
-    params_dict = {
-        "id_agendamento": portal_ids,
-        "id_paciente": req.id_paciente,
-        "data_inicial": req.data_inicial or today_str,
-        "data_final": req.data_final or today_str,
-        "login": uconv.login,
-        "senha_criptografada": uconv.senha_criptografada,
-        "cod_prestador": uconv.cod_prestador,
-        "webhook_url": os.getenv("MY_WEBHOOK_URL", "http://localhost:8000/api/jobs/webhook")
-    }
-
-    new_job = Job(
-        id_convenio=101,
-        rotina="op5_remover_falta",
-        status="pending",
-        params=params_dict,
-        user_id=get_effective_user_id(current_user)
+    new_job = strategy.remover_falta(
+        target_user_id,
+        portal_ids,
+        id_paciente=req.id_paciente,
+        data_inicial=req.data_inicial or today_str,
+        data_final=req.data_final or today_str
     )
-    db.add(new_job)
-    db.commit()
-    db.refresh(new_job)
 
     db.query(Agendamento).filter(Agendamento.id_agendamento.in_(req.agendamento_ids)).update({
         Agendamento.execucao_status: "processando"
@@ -1485,6 +1596,12 @@ def remover_falta_portal(
         cache.invalidate_tenant(get_effective_user_id(current_user))
     except Exception:
         pass
+
+    return {
+        "status": "success",
+        "message": f"Job #{new_job.id} de remoção de falta criado para {len(portal_ids)} agendamento(s).",
+        "job_id": new_job.id
+    }
 
 class ImprimirIpasgoRequest(BaseModel):
     agendamento_id: int
