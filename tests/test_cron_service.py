@@ -124,7 +124,10 @@ class TestRunCronJobs:
              patch("services.job_service.create_jobs_bulk", return_value=1) as mock_bulk:
             resumo = cron_service.run_cron_jobs(db, cron)
         assert resumo["jobs_criados"] == 1
-        mock_bulk.assert_called_once_with(db, [101], id_convenio=3, rotina="op1_consulta", user_id=1)
+        mock_bulk.assert_called_once_with(
+            db, [101], id_convenio=3, rotina="op1_consulta", user_id=1,
+            params='{"origem_cron": true, "cron_id": 1}')
+
 
 
 class TestRunDueCrons:

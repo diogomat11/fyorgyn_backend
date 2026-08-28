@@ -76,13 +76,19 @@ async def run_cleanup_loop():
             db = SessionLocal()
             delete_expired_patients(db)
             cleanup_expired_attachments(db)
+            # Retenção de worker.jobs/logs (2026-08): pending stale (>24h sem
+            # processar é apagado), finalizados e logs antigos (>30d).
+            from services.retention_service import run_retention
+            resumo = run_retention(db)
+            if any(resumo.values()):
+                print(f"[RETENTION] {resumo}")
         except Exception as e:
             print(f"Cleanup Loop Error: {e}")
         finally:
             if db:
                 try: db.close()
                 except Exception: pass
-        
+
         await asyncio.sleep(600)  # Run every 10 minutes
 
 async def run_guias_sync_loop():

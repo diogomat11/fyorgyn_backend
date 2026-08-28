@@ -17,6 +17,7 @@ para TODAS as carteirinhas ativas dos convênios do integrador, agrupadas por
 from datetime import date, datetime, time as dt_time
 from typing import List, Optional
 from zoneinfo import ZoneInfo
+import json
 
 from sqlalchemy.orm import Session
 
@@ -29,12 +30,33 @@ def _cron_logger(msg: str):
 
 
 def list_crons(db: Session) -> List[dict]:
-    """Lista configs de cron com nome do integrador (para o painel admin)."""
+    """Lista configs de cron com nome do integrador (para o painel admin).
+
+    Inclui visibilidade operacional do lote: jobs pendentes da rotina do cron
+    nos convênios do integrador, separados entre recentes (<24h) e antigos
+    (>=24h — stale; o serviço de retenção os apaga automaticamente)."""
     from models import WorkerIntegrador
+    from sqlalchemy import text as sa_text
     integradores = {i.id_integrador: i.nome for i in db.query(WorkerIntegrador).all()}
+    convenios_por_integrador: dict = {}
+    for c_id, c_int in db.query(Convenio.id_convenio, Convenio.id_integrador).filter(
+            Convenio.id_integrador.isnot(None)).all():
+        convenios_por_integrador.setdefault(c_int, []).append(c_id)
+
     crons = db.query(CronConfig).order_by(CronConfig.id_integrador).all()
-    return [
-        {
+    resultado = []
+    for c in crons:
+        pendentes_recentes, pendentes_antigos = 0, 0
+        conv_ids = convenios_por_integrador.get(c.id_integrador) or []
+        if conv_ids:
+            row = db.execute(sa_text("""
+                SELECT count(*) FILTER (WHERE created_at >= now() - interval '24 hours'),
+                       count(*) FILTER (WHERE created_at <  now() - interval '24 hours')
+                FROM worker.jobs
+                WHERE status = 'pending' AND rotina = :rotina AND id_convenio = ANY(:conv_ids)
+            """), {"rotina": c.rotina or "op1_consulta", "conv_ids": conv_ids}).fetchone()
+            pendentes_recentes, pendentes_antigos = int(row[0]), int(row[1])
+        resultado.append({
             "id": c.id,
             "id_integrador": c.id_integrador,
             "nome_integrador": integradores.get(c.id_integrador, f"Integrador {c.id_integrador}"),
@@ -43,9 +65,10 @@ def list_crons(db: Session) -> List[dict]:
             "fuso": c.fuso or "America/Sao_Paulo",
             "rotina": c.rotina or "op1_consulta",
             "ultimo_run": c.ultimo_run.isoformat() if c.ultimo_run else None,
-        }
-        for c in crons
-    ]
+            "jobs_pendentes": pendentes_recentes,
+            "jobs_pendentes_antigos": pendentes_antigos,
+        })
+    return resultado
 
 
 def update_cron_config(
@@ -126,7 +149,11 @@ def run_cron_jobs(db: Session, cron: CronConfig) -> dict:
             _cron_logger(f"Integrador {cron.id_integrador}: user={user_id} convenio={conv_id} sem credenciais - pulado.")
             continue
         try:
-            criados = create_jobs_bulk(db, cart_ids, id_convenio=conv_id, rotina=cron.rotina, user_id=user_id)
+            # Marcador de origem: distingue jobs do lote diário (stale após 24h,
+            # apagados pela retenção) dos jobs criados por ação do usuário.
+            params_cron = json.dumps({"origem_cron": True, "cron_id": cron.id})
+            criados = create_jobs_bulk(db, cart_ids, id_convenio=conv_id, rotina=cron.rotina,
+                                       params=params_cron, user_id=user_id)
             resumo["jobs_criados"] += criados or 0
             resumo["carteirinhas"] += len(cart_ids)
         except Exception as e:
