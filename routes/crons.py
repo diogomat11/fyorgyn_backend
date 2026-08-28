@@ -14,6 +14,7 @@ class CronConfigUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     horario: Optional[str] = None  # formato HH:MM
     rotina: Optional[str] = None
+    descricao: Optional[str] = None
 
 
 def _require_admin(current_user):
@@ -33,13 +34,15 @@ def get_crons(db: Session = Depends(get_db), current_user=Depends(get_current_us
 def update_cron(cron_id: int, req: CronConfigUpdateRequest, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     """Atualiza habilitação, horário ou rotina de um cron."""
     _require_admin(current_user)
-    cron = update_cron_config(db, cron_id, enabled=req.enabled, horario=req.horario, rotina=req.rotina)
+    cron = update_cron_config(db, cron_id, enabled=req.enabled, horario=req.horario,
+                              rotina=req.rotina, descricao=req.descricao)
     return {
         "status": "success",
         "id": cron.id,
         "enabled": bool(cron.enabled),
         "horario": cron.horario.strftime("%H:%M") if cron.horario else None,
         "rotina": cron.rotina,
+        "descricao": cron.descricao,
     }
 
 

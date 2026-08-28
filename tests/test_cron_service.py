@@ -21,7 +21,8 @@ from services.cron_service import (
 )
 
 
-def _cron(enabled=True, horario=time(23, 1), ultimo_run=None, id_integrador=3, rotina="op1_consulta"):
+def _cron(enabled=True, horario=time(23, 1), ultimo_run=None, id_integrador=3, rotina="op1_consulta",
+          descricao=None):
     return SimpleNamespace(
         id=1,
         id_integrador=id_integrador,
@@ -29,6 +30,7 @@ def _cron(enabled=True, horario=time(23, 1), ultimo_run=None, id_integrador=3, r
         horario=horario,
         fuso="America/Sao_Paulo",
         rotina=rotina,
+        descricao=descricao,
         ultimo_run=ultimo_run,
     )
 
@@ -47,12 +49,18 @@ class TestListCrons:
         # 1a query: WorkerIntegrador (.all direto); 2a: CronConfig (.order_by().all)
         db.query.return_value.all.return_value = [SimpleNamespace(id_integrador=3, nome="Unimed Goiânia")]
         db.query.return_value.order_by.return_value.all.return_value = [cron]
+        # convenios do integrador (contagem de pendentes): vazio -> contadores zerados
+        db.query.return_value.filter.return_value.all.return_value = []
+        db.execute.return_value.fetchone.return_value = (0, 0)
         result = list_crons(db)
         assert len(result) == 1
         assert result[0]["nome_integrador"] == "Unimed Goiânia"
         assert result[0]["horario"] == "23:01"
         assert result[0]["ultimo_run"] == "2026-08-15"
         assert result[0]["enabled"] is True
+        assert result[0]["jobs_pendentes"] == 0
+        assert result[0]["jobs_pendentes_antigos"] == 0
+        assert "descricao" in result[0]
 
 
 class TestUpdateCronConfig:

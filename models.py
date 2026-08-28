@@ -540,16 +540,22 @@ class CorpoClinicoUser(Base):
     profissional_rel = relationship("CorpoClinico")
 
 class CronConfig(Base):
-    """Cron diario por integrador: cria jobs (rotina, default op1_consulta) para todas as carteirinhas ativas."""
+    """Cron diário por integrador+rotina: lote de CONSULTA de guias (op1_consulta)
+    para todas as carteirinhas. Distinto da execução de sessões (op3_execucao),
+    que é job por agendamento controlado por modo_execucao/auto_executar."""
     __tablename__ = "cron_configs"
-    __table_args__ = {'extend_existing': True}
+    __table_args__ = (
+        UniqueConstraint('id_integrador', 'rotina', name='uq_cron_configs_integrador_rotina'),
+        {'extend_existing': True}
+    )
 
     id = Column(Integer, primary_key=True, index=True)
-    id_integrador = Column(Integer, unique=True, nullable=False)  # ref. logica a worker.integradores (sem FK cross-schema)
+    id_integrador = Column(Integer, nullable=False)  # ref. logica a worker.integradores (sem FK cross-schema)
     enabled = Column(Boolean, default=False)
     horario = Column(Time, nullable=False, default="23:01")
     fuso = Column(Text, nullable=False, default="America/Sao_Paulo")
     rotina = Column(Text, nullable=False, default="op1_consulta")
+    descricao = Column(Text, nullable=True)  # rótulo claro no painel admin (aba Agendamentos)
     ultimo_run = Column(Date, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

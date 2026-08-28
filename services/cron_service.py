@@ -64,6 +64,7 @@ def list_crons(db: Session) -> List[dict]:
             "horario": c.horario.strftime("%H:%M") if c.horario else "23:01",
             "fuso": c.fuso or "America/Sao_Paulo",
             "rotina": c.rotina or "op1_consulta",
+            "descricao": c.descricao or f"Lote diário — {c.rotina or 'op1_consulta'}",
             "ultimo_run": c.ultimo_run.isoformat() if c.ultimo_run else None,
             "jobs_pendentes": pendentes_recentes,
             "jobs_pendentes_antigos": pendentes_antigos,
@@ -77,8 +78,9 @@ def update_cron_config(
     enabled: Optional[bool] = None,
     horario: Optional[str] = None,
     rotina: Optional[str] = None,
+    descricao: Optional[str] = None,
 ) -> CronConfig:
-    """Atualiza habilitação/horário/rotina de um cron (painel admin)."""
+    """Atualiza habilitação/horário/rotina/descrição de um cron (painel admin)."""
     cron = db.query(CronConfig).filter(CronConfig.id == cron_id).first()
     if not cron:
         from fastapi import HTTPException
@@ -94,6 +96,8 @@ def update_cron_config(
             raise HTTPException(status_code=400, detail="Horário inválido. Use formato HH:MM.")
     if rotina is not None and rotina.strip():
         cron.rotina = rotina.strip()
+    if descricao is not None:
+        cron.descricao = descricao.strip()
     db.commit()
     db.refresh(cron)
     return cron
