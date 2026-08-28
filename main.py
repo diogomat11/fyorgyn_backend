@@ -86,15 +86,22 @@ async def run_cleanup_loop():
         await asyncio.sleep(600)  # Run every 10 minutes
 
 async def run_guias_sync_loop():
-    """Loop contínuo de segundo plano (a cada 5s) para consumir jobs de worker pendentes de sincronização."""
+    """Loop de fundo (fallback do webhook) que consome jobs success não consumidos.
+
+    Intervalo configurável (SYNC_LOOP_INTERVAL, default 15s): o webhook continua
+    sendo o caminho primário; polls de 5s re-transferiam do Supabas a fila inteira
+    de jobs não consumidos a cada ciclo (fonte do egress de 2026-08)."""
+    sync_interval = int(os.getenv("SYNC_LOOP_INTERVAL", "15"))
     while True:
         try:
             from services.guias_sync_service import sync_completed_worker_jobs_bg
             await asyncio.to_thread(sync_completed_worker_jobs_bg)
         except Exception as e:
-            pass
+            # Nunca engolir silenciosamente: erros engolidos aqui deixaram a fila
+            # de jobs não consumidos crescer unnoticed por dias (egress).
+            print(f"Guias Sync Loop Error: {e}")
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(sync_interval)
 
 async def run_cron_loop():
     """Loop de segundo plano (a cada 60s) que dispara os crons de carteirinhas

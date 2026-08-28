@@ -4,6 +4,7 @@ Consome JSON retornado pelo worker e insere/atualiza em base_guias via INSERT ON
 
 Substitui o loop row-by-row do dispatcher por uma única query batch.
 """
+import os
 import json
 from datetime import datetime, timezone, timedelta, date
 
@@ -1247,450 +1248,505 @@ def _consume_aba_clmf(db: Session, job, synced_counts: dict) -> None:
     return
 
 
-def sync_completed_worker_jobs(db: Session) -> dict:
-    """
-    Consome resultados de jobs concluídos com sucesso e sincroniza com a base de guias.
-    """
-    from models import Job
-    
-    # Busca todos os jobs bem-sucedidos cujo resultado ainda não foi consumido pelo backend principal
-    jobs = db.query(Job).filter(
-        Job.status == "success",
-        Job.result_consumed == False
-    ).all()
-    
-    synced_counts = {"jobs_processed": 0, "inserted": 0, "updated": 0, "skipped": 0}
-    
-    for job in jobs:
-        if not job.result_data:
-            job.result_consumed = True
-            continue
+def _quarantine_job(db: Session, job_id: int, motivo: str) -> None:
+    """Marca como consumido um job cujo processamento falhou (quarentena).
 
-        # Se for rotina OP4 (Exames Finalizados) da Unimed Goiânia / Geral
-        if str(job.rotina).lower() in ("4", "op4", "op4_finalizados", "finalizados", "exames_finalizados"):
-            _sync_goiania_op4(db, job, synced_counts)
+    Sem isso, um job com problema prende o lote: a exceção rolava back as marcas
+    de consumo de todos e o loop de sync re-transportava o lote inteiro a cada
+    ciclo (causa-raiz do consumo de egress de 2026-08). O result_data é
+    preservado no banco para análise posterior."""
+    from models import Job, Log
+    try:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job and not job.result_consumed:
+            job.result_consumed = True
+            db.add(Log(
+                job_id=job.id,
+                user_id=job.user_id,
+                carteirinha_id=job.carteirinha_id,
+                level="ERROR",
+                message=f"[SYNC] Consumo falhou; job colocado em quarentena: {motivo[:500]}"
+            ))
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[SYNC] Falha ao quarentenar job {job_id}: {e}")
+
+
+def _process_single_job(db: Session, job, synced_counts: dict) -> None:
+    """Dispatch de consumo de um ÚNICO job (extraído 1:1 do antigo loop único)."""
+    if not job.result_data:
+        job.result_consumed = True
+        return
+
+    # Se for rotina OP4 (Exames Finalizados) da Unimed Goiânia / Geral
+    if str(job.rotina).lower() in ("4", "op4", "op4_finalizados", "finalizados", "exames_finalizados"):
+        _sync_goiania_op4(db, job, synced_counts)
+        job.result_consumed = True
+        synced_counts["jobs_processed"] += 1
+        return
+
+    # Integradores tipo agendamento: consumo delegado à estratégia do integrador,
+    # resolvido via convenios.id_integrador (espaço W) — sem hardcode de id_convenio.
+    _id_integrador_w = _resolve_job_integrador(db, job)
+    if _id_integrador_w:
+        from services.integrador_strategy import get_strategy, NullStrategy
+        _strategy = get_strategy(db, _id_integrador_w)
+        if not isinstance(_strategy, NullStrategy):
+            _strategy.consumir_resultado(job, synced_counts)
+            return
+
+    # Se for convênio IPASGO (ID 6)
+    if job.id_convenio == 6:
+        rotina = str(job.rotina).lower()
+        res_data = job.result_data
+
+        if (rotina in ["6", "op6", "op6_check_baixados"]) and res_data:
+            p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+            numero_lote = p_params.get("numero_lote", p_params.get("loteId"))
+            codigo_prestador = p_params.get("codigoPrestador", "")
+            id_lote_interno = p_params.get("id_lote_interno")
+
+            results_list = []
+            if isinstance(res_data, list):
+                results_list = res_data
+            elif isinstance(res_data, dict):
+                results_list = res_data.get("data", [])
+                if not isinstance(results_list, list):
+                    if isinstance(res_data, dict) and "detalheId" in res_data:
+                        results_list = [res_data]
+                    else:
+                        results_list = []
+
+            from models import LoteConvenio, FaturamentoLote, LoteAgendamentoItem, LoteAgendamento
+            lote_interno = None
+            if id_lote_interno:
+                lote_interno = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
+            if not lote_interno and numero_lote:
+                lote_interno = db.query(LoteConvenio).filter(
+                    LoteConvenio.numero_lote == int(numero_lote),
+                    LoteConvenio.id_convenio == 6
+                ).first()
+
+            if not lote_interno and numero_lote:
+                datas = []
+                for item in results_list:
+                    dt_val = item.get('dataRealizacao')
+                    if dt_val:
+                        try:
+                            if isinstance(dt_val, str):
+                                dt = datetime.fromisoformat(dt_val.split('T')[0])
+                                datas.append(dt.date())
+                        except Exception:
+                            pass
+                data_inicio_lote = min(datas) if datas else None
+                data_fim_lote = max(datas) if datas else None
+
+                lote_interno = LoteConvenio(
+                    id_convenio=6,
+                    numero_lote=int(numero_lote),
+                    cod_prestador=codigo_prestador,
+                    status="Aberto",
+                    user_id=job.user_id,
+                    data_inicio=data_inicio_lote,
+                    data_fim=data_fim_lote
+                )
+                db.add(lote_interno)
+                db.flush()
+
+            lote_interno_id = lote_interno.id_lote if lote_interno else None
+
+            if results_list and lote_interno_id:
+                detalhe_ids = [item['detalheId'] for item in results_list if 'detalheId' in item]
+                existing_items = {}
+                chunk_size = 900
+                for i in range(0, len(detalhe_ids), chunk_size):
+                    chunk = detalhe_ids[i:i+chunk_size]
+                    db_items = db.query(FaturamentoLote).filter(FaturamentoLote.detalheId.in_(chunk)).all()
+                    for db_item in db_items:
+                        existing_items[db_item.detalheId] = db_item
+
+                now_utc = datetime.now(timezone.utc)
+                lotes_ag_para_reconciliar = set()
+
+                for item in results_list:
+                    det_id = item['detalheId']
+                    existing = existing_items.get(det_id)
+                    new_data_realizacao = item.get('dataRealizacao')
+                    if new_data_realizacao and isinstance(new_data_realizacao, str):
+                        try:
+                            new_data_realizacao = datetime.fromisoformat(new_data_realizacao.split('T')[0]).date()
+                        except:
+                            pass
+
+                    new_status = item.get('StatusConferencia', 0)
+
+                    if existing:
+                        data_mudou = str(existing.dataRealizacao) != str(new_data_realizacao)
+                        status_era_conferido = existing.StatusConferencia == 67
+                        status_mudou = existing.StatusConferencia != new_status
+
+                        deve_desvincular = (
+                            existing.agendamento_id is not None and
+                            (data_mudou or (status_era_conferido and status_mudou))
+                        )
+
+                        if deve_desvincular:
+                            lai = db.query(LoteAgendamentoItem).filter(
+                                LoteAgendamentoItem.id_faturamento_lote == existing.id
+                            ).first()
+                            if lai:
+                                lotes_ag_para_reconciliar.add(lai.id_lote_ag)
+                                lai.status_conciliacao = "Não Conciliado"
+                                lai.id_faturamento_lote = None
+
+                            existing.agendamento_id = None
+                            existing.StatusConciliacao = "pendente"
+
+                        existing.dataRealizacao = new_data_realizacao
+                        existing.Guia = str(item.get('Guia', ''))
+                        existing.StatusConferencia = new_status
+                        existing.ValorProcedimento = item.get('ValorProcedimento', 0.0)
+                        existing.CodigoBeneficiario = item.get('CodigoBeneficiario', '')
+                        existing.cod_procedimento_fat = item.get('cod_procedimento_fat', '')
+                        existing.updated_at = now_utc
+                        existing.id_lote = lote_interno_id
+                        existing.user_id = job.user_id
+                    else:
+                        novo = FaturamentoLote(
+                            detalheId=det_id,
+                            CodigoBeneficiario=item.get('CodigoBeneficiario', ''),
+                            dataRealizacao=new_data_realizacao,
+                            Guia=str(item.get('Guia', '')),
+                            StatusConferencia=new_status,
+                            ValorProcedimento=item.get('ValorProcedimento', 0.0),
+                            cod_procedimento_fat=item.get('cod_procedimento_fat', ''),
+                            id_lote=lote_interno_id,
+                            StatusConciliacao="pendente",
+                            updated_at=now_utc,
+                            user_id=job.user_id
+                        )
+                        db.add(novo)
+
+                db.commit()
+
+                if lotes_ag_para_reconciliar:
+                    try:
+                        from routes.conciliacao import process_conciliacao_bg
+                        for id_lote_ag in lotes_ag_para_reconciliar:
+                            lote_ag = db.query(LoteAgendamento).filter_by(id_lote_ag=id_lote_ag).first()
+                            if lote_ag and lote_ag.id_lote_convenio:
+                                process_conciliacao_bg(lote_ag.id_lote_convenio, id_lote_ag, job.user_id)
+                    except Exception as e:
+                        print(f"Error triggering background reconciliation: {e}")
+
             job.result_consumed = True
             synced_counts["jobs_processed"] += 1
-            continue
+            db.commit()
+            return
 
-        # Integradores tipo agendamento: consumo delegado à estratégia do integrador,
-        # resolvido via convenios.id_integrador (espaço W) — sem hardcode de id_convenio.
-        _id_integrador_w = _resolve_job_integrador(db, job)
-        if _id_integrador_w:
-            from services.integrador_strategy import get_strategy, NullStrategy
-            _strategy = get_strategy(db, _id_integrador_w)
-            if not isinstance(_strategy, NullStrategy):
-                _strategy.consumir_resultado(job, synced_counts)
-                continue
+        elif (rotina in ["7", "op7", "op7_fat_facplan"]) and isinstance(res_data, dict):
+            itens_sucesso = res_data.get("itens_sucesso", [])
+            p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+            status_env = p_params.get("status")
 
-        # Se for convênio IPASGO (ID 6)
-        if job.id_convenio == 6:
-            rotina = str(job.rotina).lower()
-            res_data = job.result_data
-            
-            if (rotina in ["6", "op6", "op6_check_baixados"]) and res_data:
-                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                numero_lote = p_params.get("numero_lote", p_params.get("loteId"))
-                codigo_prestador = p_params.get("codigoPrestador", "")
-                id_lote_interno = p_params.get("id_lote_interno")
-                
-                results_list = []
-                if isinstance(res_data, list):
-                    results_list = res_data
-                elif isinstance(res_data, dict):
-                    results_list = res_data.get("data", [])
-                    if not isinstance(results_list, list):
-                        if isinstance(res_data, dict) and "detalheId" in res_data:
-                            results_list = [res_data]
-                        else:
-                            results_list = []
-                
-                from models import LoteConvenio, FaturamentoLote, LoteAgendamentoItem, LoteAgendamento
-                lote_interno = None
-                if id_lote_interno:
-                    lote_interno = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
-                if not lote_interno and numero_lote:
-                    lote_interno = db.query(LoteConvenio).filter(
-                        LoteConvenio.numero_lote == int(numero_lote),
-                        LoteConvenio.id_convenio == 6
-                    ).first()
-                
-                if not lote_interno and numero_lote:
-                    datas = []
-                    for item in results_list:
-                        dt_val = item.get('dataRealizacao')
-                        if dt_val:
-                            try:
-                                if isinstance(dt_val, str):
-                                    dt = datetime.fromisoformat(dt_val.split('T')[0])
-                                    datas.append(dt.date())
-                            except Exception:
-                                pass
-                    data_inicio_lote = min(datas) if datas else None
-                    data_fim_lote = max(datas) if datas else None
-                    
-                    lote_interno = LoteConvenio(
-                        id_convenio=6,
-                        numero_lote=int(numero_lote),
-                        cod_prestador=codigo_prestador,
-                        status="Aberto",
-                        user_id=job.user_id,
-                        data_inicio=data_inicio_lote,
-                        data_fim=data_fim_lote
-                    )
-                    db.add(lote_interno)
-                    db.flush()
-                
-                lote_interno_id = lote_interno.id_lote if lote_interno else None
-                
-                if results_list and lote_interno_id:
-                    detalhe_ids = [item['detalheId'] for item in results_list if 'detalheId' in item]
-                    existing_items = {}
-                    chunk_size = 900
-                    for i in range(0, len(detalhe_ids), chunk_size):
-                        chunk = detalhe_ids[i:i+chunk_size]
-                        db_items = db.query(FaturamentoLote).filter(FaturamentoLote.detalheId.in_(chunk)).all()
-                        for db_item in db_items:
-                            existing_items[db_item.detalheId] = db_item
-                    
-                    now_utc = datetime.now(timezone.utc)
-                    lotes_ag_para_reconciliar = set()
-                    
-                    for item in results_list:
-                        det_id = item['detalheId']
-                        existing = existing_items.get(det_id)
-                        new_data_realizacao = item.get('dataRealizacao')
-                        if new_data_realizacao and isinstance(new_data_realizacao, str):
-                            try:
-                                new_data_realizacao = datetime.fromisoformat(new_data_realizacao.split('T')[0]).date()
-                            except:
-                                pass
-                        
-                        new_status = item.get('StatusConferencia', 0)
-                        
-                        if existing:
-                            data_mudou = str(existing.dataRealizacao) != str(new_data_realizacao)
-                            status_era_conferido = existing.StatusConferencia == 67
-                            status_mudou = existing.StatusConferencia != new_status
-                            
-                            deve_desvincular = (
-                                existing.agendamento_id is not None and
-                                (data_mudou or (status_era_conferido and status_mudou))
-                            )
-                            
-                            if deve_desvincular:
-                                lai = db.query(LoteAgendamentoItem).filter(
-                                    LoteAgendamentoItem.id_faturamento_lote == existing.id
-                                ).first()
-                                if lai:
-                                    lotes_ag_para_reconciliar.add(lai.id_lote_ag)
-                                    lai.status_conciliacao = "Não Conciliado"
-                                    lai.id_faturamento_lote = None
-                                
-                                existing.agendamento_id = None
-                                existing.StatusConciliacao = "pendente"
-                            
-                            existing.dataRealizacao = new_data_realizacao
-                            existing.Guia = str(item.get('Guia', ''))
-                            existing.StatusConferencia = new_status
-                            existing.ValorProcedimento = item.get('ValorProcedimento', 0.0)
-                            existing.CodigoBeneficiario = item.get('CodigoBeneficiario', '')
-                            existing.cod_procedimento_fat = item.get('cod_procedimento_fat', '')
-                            existing.updated_at = now_utc
-                            existing.id_lote = lote_interno_id
-                            existing.user_id = job.user_id
-                        else:
-                            novo = FaturamentoLote(
-                                detalheId=det_id,
-                                CodigoBeneficiario=item.get('CodigoBeneficiario', ''),
-                                dataRealizacao=new_data_realizacao,
-                                Guia=str(item.get('Guia', '')),
-                                StatusConferencia=new_status,
-                                ValorProcedimento=item.get('ValorProcedimento', 0.0),
-                                cod_procedimento_fat=item.get('cod_procedimento_fat', ''),
-                                id_lote=lote_interno_id,
-                                StatusConciliacao="pendente",
-                                updated_at=now_utc,
-                                user_id=job.user_id
-                            )
-                            db.add(novo)
-                    
-                    db.commit()
-                    
-                    if lotes_ag_para_reconciliar:
-                        try:
-                            from routes.conciliacao import process_conciliacao_bg
-                            for id_lote_ag in lotes_ag_para_reconciliar:
-                                lote_ag = db.query(LoteAgendamento).filter_by(id_lote_ag=id_lote_ag).first()
-                                if lote_ag and lote_ag.id_lote_convenio:
-                                    process_conciliacao_bg(lote_ag.id_lote_convenio, id_lote_ag, job.user_id)
-                        except Exception as e:
-                            print(f"Error triggering background reconciliation: {e}")
-                
-                job.result_consumed = True
-                synced_counts["jobs_processed"] += 1
+            status_map = {}
+            if not status_env:
+                itens_param = p_params.get("itens", [])
+                status_map = {str(it.get("detalheId")): it.get("status") for it in itens_param}
+
+            from models import FaturamentoLote
+            if itens_sucesso:
+                fats = db.query(FaturamentoLote).filter(
+                    FaturamentoLote.detalheId.in_(itens_sucesso)
+                ).all()
+                for f in fats:
+                    f.StatusConferencia = status_map.get(str(f.detalheId), status_env or 67)
+                    f.updated_at = datetime.now(timezone.utc)
                 db.commit()
-                continue
-                
-            elif (rotina in ["7", "op7", "op7_fat_facplan"]) and isinstance(res_data, dict):
-                itens_sucesso = res_data.get("itens_sucesso", [])
-                p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                status_env = p_params.get("status")
-                
-                status_map = {}
-                if not status_env:
-                    itens_param = p_params.get("itens", [])
-                    status_map = {str(it.get("detalheId")): it.get("status") for it in itens_param}
-                
-                from models import FaturamentoLote
-                if itens_sucesso:
-                    fats = db.query(FaturamentoLote).filter(
-                        FaturamentoLote.detalheId.in_(itens_sucesso)
-                    ).all()
-                    for f in fats:
-                        f.StatusConferencia = status_map.get(str(f.detalheId), status_env or 67)
-                        f.updated_at = datetime.now(timezone.utc)
+
+            job.result_consumed = True
+            synced_counts["jobs_processed"] += 1
+            db.commit()
+            return
+
+        elif (rotina in ["13", "op13", "op13_criar_lote"]) and isinstance(res_data, dict):
+            id_lote_interno = res_data.get("id_lote_interno")
+            cod_prestador = res_data.get("cod_prestador")
+            data_fim = res_data.get("data_fim")
+
+            from models import LoteConvenio, Job as JobModel
+            if id_lote_interno:
+                lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
+                if lote_obj:
+                    lote_obj.status = "Criando"
                     db.commit()
-                
-                job.result_consumed = True
-                synced_counts["jobs_processed"] += 1
+
+            if data_fim:
+                parts = data_fim.split('/')
+                data_fim_iso = f"{parts[2]}-{parts[1]}-{parts[0]}" if len(parts) == 3 else data_fim
+                poll_params = {
+                    "cod_prestador": cod_prestador,
+                    "data_fim": data_fim,
+                    "data_fim_iso": data_fim_iso,
+                    "id_lote_interno": id_lote_interno,
+                    "poll_attempt": 0
+                }
+                new_job = JobModel(
+                    id_convenio=job.id_convenio,
+                    rotina="13_poll",
+                    params=json.dumps(poll_params),
+                    status="pending",
+                    priority=10,
+                    user_id=job.user_id
+                )
+                db.add(new_job)
                 db.commit()
-                continue
-                
-            elif (rotina in ["13", "op13", "op13_criar_lote"]) and isinstance(res_data, dict):
-                id_lote_interno = res_data.get("id_lote_interno")
-                cod_prestador = res_data.get("cod_prestador")
-                data_fim = res_data.get("data_fim")
-                
-                from models import LoteConvenio, Job as JobModel
+
+            job.result_consumed = True
+            synced_counts["jobs_processed"] += 1
+            db.commit()
+            return
+
+        elif (rotina in ["13_poll", "op13_poll"]) and isinstance(res_data, dict):
+            status_lote = res_data.get("status")
+            id_lote_interno = res_data.get("id_lote_interno")
+            lote_id_api = res_data.get("lote_id_api")
+            cod_prestador = res_data.get("cod_prestador")
+            poll_attempt = res_data.get("poll_attempt", 0)
+
+            from models import LoteConvenio, Job as JobModel
+            if status_lote == "ready" and lote_id_api:
                 if id_lote_interno:
                     lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
                     if lote_obj:
-                        lote_obj.status = "Criando"
+                        lote_obj.numero_lote = lote_id_api
+                        lote_obj.status = "Aberto"
                         db.commit()
-                
-                if data_fim:
-                    parts = data_fim.split('/')
-                    data_fim_iso = f"{parts[2]}-{parts[1]}-{parts[0]}" if len(parts) == 3 else data_fim
-                    poll_params = {
-                        "cod_prestador": cod_prestador,
-                        "data_fim": data_fim,
-                        "data_fim_iso": data_fim_iso,
-                        "id_lote_interno": id_lote_interno,
-                        "poll_attempt": 0
-                    }
-                    new_job = JobModel(
-                        id_convenio=job.id_convenio,
-                        rotina="13_poll",
-                        params=json.dumps(poll_params),
-                        status="pending",
-                        priority=10,
-                        user_id=job.user_id
-                    )
-                    db.add(new_job)
-                    db.commit()
-                
-                job.result_consumed = True
-                synced_counts["jobs_processed"] += 1
+
+                op6_params = {
+                    "codigoPrestador": cod_prestador,
+                    "numero_lote": lote_id_api,
+                    "id_lote_interno": id_lote_interno
+                }
+                new_job = JobModel(
+                    id_convenio=job.id_convenio,
+                    rotina="6",
+                    params=json.dumps(op6_params),
+                    status="pending",
+                    priority=10,
+                    user_id=job.user_id
+                )
+                db.add(new_job)
                 db.commit()
-                continue
-                
-            elif (rotina in ["13_poll", "op13_poll"]) and isinstance(res_data, dict):
-                status_lote = res_data.get("status")
-                id_lote_interno = res_data.get("id_lote_interno")
-                lote_id_api = res_data.get("lote_id_api")
-                cod_prestador = res_data.get("cod_prestador")
-                poll_attempt = res_data.get("poll_attempt", 0)
-                
-                from models import LoteConvenio, Job as JobModel
-                if status_lote == "ready" and lote_id_api:
-                    if id_lote_interno:
-                        lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
-                        if lote_obj:
-                            lote_obj.numero_lote = lote_id_api
-                            lote_obj.status = "Aberto"
-                            db.commit()
-                    
-                    op6_params = {
-                        "codigoPrestador": cod_prestador,
-                        "numero_lote": lote_id_api,
-                        "id_lote_interno": id_lote_interno
-                    }
-                    new_job = JobModel(
-                        id_convenio=job.id_convenio,
-                        rotina="6",
-                        params=json.dumps(op6_params),
-                        status="pending",
-                        priority=10,
-                        user_id=job.user_id
-                    )
-                    db.add(new_job)
-                    db.commit()
-                elif status_lote == "processing":
-                    p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                    poll_params = {
-                        "cod_prestador": cod_prestador,
-                        "data_fim": p_params.get("data_fim"),
-                        "data_fim_iso": p_params.get("data_fim_iso"),
-                        "id_lote_interno": id_lote_interno,
-                        "poll_attempt": poll_attempt + 1
-                    }
-                    new_job = JobModel(
-                        id_convenio=job.id_convenio,
-                        rotina="13_poll",
-                        params=json.dumps(poll_params),
-                        status="pending",
-                        priority=15,
-                        user_id=job.user_id
-                    )
-                    db.add(new_job)
-                    db.commit()
-                
-                job.result_consumed = True
-                synced_counts["jobs_processed"] += 1
-                db.commit()
-                continue
-                
-            elif rotina in ["14", "op14", "op14_cancelar_lote"]:
+            elif status_lote == "processing":
                 p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
-                id_lote_interno = p_params.get("id_lote_interno")
-                numero_lote = p_params.get("numero_lote")
-                
-                from models import LoteConvenio, FaturamentoLote
-                lote_obj = None
-                if id_lote_interno:
-                    lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
-                if not lote_obj and numero_lote:
-                    lote_obj = db.query(LoteConvenio).filter_by(numero_lote=numero_lote).first()
-                
-                if lote_obj:
-                    lote_obj.status = "Cancelado"
-                    items = db.query(FaturamentoLote).filter_by(id_lote=lote_obj.id_lote).all()
-                    for item in items:
-                        item.StatusConciliacao = "bloqueado"
-                    db.commit()
-                
-                job.result_consumed = True
-                synced_counts["jobs_processed"] += 1
+                poll_params = {
+                    "cod_prestador": cod_prestador,
+                    "data_fim": p_params.get("data_fim"),
+                    "data_fim_iso": p_params.get("data_fim_iso"),
+                    "id_lote_interno": id_lote_interno,
+                    "poll_attempt": poll_attempt + 1
+                }
+                new_job = JobModel(
+                    id_convenio=job.id_convenio,
+                    rotina="13_poll",
+                    params=json.dumps(poll_params),
+                    status="pending",
+                    priority=15,
+                    user_id=job.user_id
+                )
+                db.add(new_job)
                 db.commit()
-                continue
 
-        # Se for convênio Unimeds (ID 2 ou 3)
-        if job.id_convenio in [2, 3]:
-            rotina = str(job.rotina).lower()
-            res_data = job.result_data
-            
-            if rotina in ["3", "op3_execucao"] and res_data:
-                results_list = []
-                if isinstance(res_data, list):
-                    results_list = res_data
-                elif isinstance(res_data, dict):
-                    results_list = res_data.get("data", [])
-                    if not isinstance(results_list, list):
-                        results_list = [results_list]
-                        
-                from models import Agendamento
-                for item in results_list:
-                    ag_id = item.get("agendamento_id")
-                    executado = item.get("executado", False)
-                    if ag_id and executado:
-                        agenda = db.query(Agendamento).filter(Agendamento.id_agendamento == int(ag_id)).first()
-                        if agenda:
-                            agenda.execucao_status = "sucesso"
+            job.result_consumed = True
+            synced_counts["jobs_processed"] += 1
+            db.commit()
+            return
+
+        elif rotina in ["14", "op14", "op14_cancelar_lote"]:
+            p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
+            id_lote_interno = p_params.get("id_lote_interno")
+            numero_lote = p_params.get("numero_lote")
+
+            from models import LoteConvenio, FaturamentoLote
+            lote_obj = None
+            if id_lote_interno:
+                lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
+            if not lote_obj and numero_lote:
+                lote_obj = db.query(LoteConvenio).filter_by(numero_lote=numero_lote).first()
+
+            if lote_obj:
+                lote_obj.status = "Cancelado"
+                items = db.query(FaturamentoLote).filter_by(id_lote=lote_obj.id_lote).all()
+                for item in items:
+                    item.StatusConciliacao = "bloqueado"
                 db.commit()
-                
-                job.result_consumed = True
-                synced_counts["jobs_processed"] += 1
-                db.commit()
-                continue
 
-            # Unimed Goiania (id_convenio=3), rotina op1_consulta:
-            # o worker devolve result_data.valida_prestador com {tipo_json, guias}.
-            # IMPORTANTE: NAO fazemos `continue` aqui - deixamos o fluxo cair no
-            # fallback generico abaixo, que executa bulk_upsert_guias_from_json e
-            # insere/atualiza as guias em public.base_guias. Apos o upsert, aplicamos
-            # o valida_prestador (no finally do loop). Para sinalizar que este job
-            # tem valida_prestador para aplicar, marcamos um flag no synced_counts.
-            if job.id_convenio == 3 and rotina in ["1", "op1_consulta", "consulta_guias"] and res_data:
-                valida = res_data.get("valida_prestador") if isinstance(res_data, dict) else None
-                if isinstance(valida, dict) and valida.get("guias"):
-                    # Flag: apos o bulk_upsert, aplicar valida_prestador para as guias deste job.
-                    synced_counts.setdefault("_pending_valida_prestador", [])
-                    synced_counts["_pending_valida_prestador"].append({
-                        "job_id": job.id,
-                        "valida": valida,
-                    })
+            job.result_consumed = True
+            synced_counts["jobs_processed"] += 1
+            db.commit()
+            return
 
-        results_list = []
-        if isinstance(job.result_data, dict):
-            # Se for dicionário, pode ter a chave 'data' ou 'op11_data' que contém a lista
-            data_payload = job.result_data.get("data", {})
-            if isinstance(data_payload, dict):
-                if "op11_data" in data_payload and isinstance(data_payload["op11_data"], list):
-                    results_list = data_payload["op11_data"]
-                elif "data" in data_payload and isinstance(data_payload["data"], list):
-                    results_list = data_payload["data"]
-                else:
-                    results_list = [data_payload]
-            elif isinstance(data_payload, list):
-                results_list = data_payload
+    # Se for convênio Unimeds (ID 2 ou 3)
+    if job.id_convenio in [2, 3]:
+        rotina = str(job.rotina).lower()
+        res_data = job.result_data
+
+        if rotina in ["3", "op3_execucao"] and res_data:
+            results_list = []
+            if isinstance(res_data, list):
+                results_list = res_data
+            elif isinstance(res_data, dict):
+                results_list = res_data.get("data", [])
+                if not isinstance(results_list, list):
+                    results_list = [results_list]
+
+            from models import Agendamento
+            for item in results_list:
+                ag_id = item.get("agendamento_id")
+                executado = item.get("executado", False)
+                if ag_id and executado:
+                    agenda = db.query(Agendamento).filter(Agendamento.id_agendamento == int(ag_id)).first()
+                    if agenda:
+                        agenda.execucao_status = "sucesso"
+            db.commit()
+
+            job.result_consumed = True
+            synced_counts["jobs_processed"] += 1
+            db.commit()
+            return
+
+        # Unimed Goiania (id_convenio=3), rotina op1_consulta:
+        # o worker devolve result_data.valida_prestador com {tipo_json, guias}.
+        # IMPORTANTE: NAO fazemos `continue` aqui - deixamos o fluxo cair no
+        # fallback generico abaixo, que executa bulk_upsert_guias_from_json e
+        # insere/atualiza as guias em public.base_guias. Apos o upsert, aplicamos
+        # o valida_prestador (no finally do loop). Para sinalizar que este job
+        # tem valida_prestador para aplicar, marcamos um flag no synced_counts.
+        if job.id_convenio == 3 and rotina in ["1", "op1_consulta", "consulta_guias"] and res_data:
+            valida = res_data.get("valida_prestador") if isinstance(res_data, dict) else None
+            if isinstance(valida, dict) and valida.get("guias"):
+                # Flag: apos o bulk_upsert, aplicar valida_prestador para as guias deste job.
+                synced_counts.setdefault("_pending_valida_prestador", [])
+                synced_counts["_pending_valida_prestador"].append({
+                    "job_id": job.id,
+                    "valida": valida,
+                })
+
+    results_list = []
+    if isinstance(job.result_data, dict):
+        # Se for dicionário, pode ter a chave 'data' ou 'op11_data' que contém a lista
+        data_payload = job.result_data.get("data", {})
+        if isinstance(data_payload, dict):
+            if "op11_data" in data_payload and isinstance(data_payload["op11_data"], list):
+                results_list = data_payload["op11_data"]
+            elif "data" in data_payload and isinstance(data_payload["data"], list):
+                results_list = data_payload["data"]
             else:
-                results_list = [job.result_data]
-        elif isinstance(job.result_data, list):
-            results_list = job.result_data
-            
-        # Multiprestador: separa guias "Capturada por outro prestador" (nao gravar como
-        # capturada) e cria job de consulta para re-sincronizar a carteirinha.
-        if results_list:
-            results_list, qtd_outro_prestador = _split_capturadas_por_outro_prestador(db, job, results_list)
-            if qtd_outro_prestador:
-                synced_counts.setdefault("capturadas_por_outro_prestador", 0)
-                synced_counts["capturadas_por_outro_prestador"] += qtd_outro_prestador
+                results_list = [data_payload]
+        elif isinstance(data_payload, list):
+            results_list = data_payload
+        else:
+            results_list = [job.result_data]
+    elif isinstance(job.result_data, list):
+        results_list = job.result_data
 
-        if results_list:
-            res = bulk_upsert_guias_from_json(
-                db=db,
-                results=results_list,
-                id_convenio=job.id_convenio,
-                user_id=job.user_id,
-                carteirinha_id=job.carteirinha_id,
-                job_id=job.id
-            )
-            synced_counts["inserted"] += res.get("inserted", 0)
-            synced_counts["updated"] += res.get("updated", 0)
-            synced_counts["skipped"] += res.get("skipped", 0)
+    # Multiprestador: separa guias "Capturada por outro prestador" (nao gravar como
+    # capturada) e cria job de consulta para re-sincronizar a carteirinha.
+    if results_list:
+        results_list, qtd_outro_prestador = _split_capturadas_por_outro_prestador(db, job, results_list)
+        if qtd_outro_prestador:
+            synced_counts.setdefault("capturadas_por_outro_prestador", 0)
+            synced_counts["capturadas_por_outro_prestador"] += qtd_outro_prestador
 
-            # Apos o bulk_upsert, as guias deste job ja existem em base_guias.
-            # Se houver valida_prestador pendente para este job, aplica-lo agora.
-            pending = synced_counts.get("_pending_valida_prestador") or []
-            pending_for_job = [p for p in pending if p.get("job_id") == job.id]
-            if pending_for_job:
-                persisted = 0
-                for entry in pending_for_job:
-                    valida = entry.get("valida") or {}
-                    for guia_num, attr in (valida.get("guias") or {}).items():
-                        codigo_proc = (attr or {}).get("codigo_procedimento") or (attr or {}).get("codigo_terapia")
-                        persisted += _persist_valida_prestador(db, guia_num, codigo_proc, attr or {})
-                synced_counts.setdefault("valida_prestador_persisted", 0)
-                synced_counts["valida_prestador_persisted"] += persisted
-                # Remove da lista de pendentes
-                synced_counts["_pending_valida_prestador"] = [
-                    p for p in pending if p.get("job_id") != job.id
-                ]
+    if results_list:
+        res = bulk_upsert_guias_from_json(
+            db=db,
+            results=results_list,
+            id_convenio=job.id_convenio,
+            user_id=job.user_id,
+            carteirinha_id=job.carteirinha_id,
+            job_id=job.id
+        )
+        synced_counts["inserted"] += res.get("inserted", 0)
+        synced_counts["updated"] += res.get("updated", 0)
+        synced_counts["skipped"] += res.get("skipped", 0)
 
-        job.result_consumed = True
-        synced_counts["jobs_processed"] += 1
-        
-    if synced_counts["jobs_processed"] > 0:
-        db.commit()
+        # Apos o bulk_upsert, as guias deste job ja existem em base_guias.
+        # Se houver valida_prestador pendente para este job, aplica-lo agora.
+        pending = synced_counts.get("_pending_valida_prestador") or []
+        pending_for_job = [p for p in pending if p.get("job_id") == job.id]
+        if pending_for_job:
+            persisted = 0
+            for entry in pending_for_job:
+                valida = entry.get("valida") or {}
+                for guia_num, attr in (valida.get("guias") or {}).items():
+                    codigo_proc = (attr or {}).get("codigo_procedimento") or (attr or {}).get("codigo_terapia")
+                    persisted += _persist_valida_prestador(db, guia_num, codigo_proc, attr or {})
+            synced_counts.setdefault("valida_prestador_persisted", 0)
+            synced_counts["valida_prestador_persisted"] += persisted
+            # Remove da lista de pendentes
+            synced_counts["_pending_valida_prestador"] = [
+                p for p in pending if p.get("job_id") != job.id
+            ]
+
+
+
+# Limite por ciclo do loop de sync: controla o volume transferido por poll e
+# evita que a listagem carregue a fila inteira de uma vez (egress).
+SYNC_BATCH_LIMIT = int(os.getenv("SYNC_BATCH_LIMIT", "100"))
+
+
+def sync_completed_worker_jobs(db: Session) -> dict:
+    """
+    Consome resultados de jobs concluídos com sucesso e sincroniza com a base de guias.
+
+    Otimização de egress (2026-08-26): a listagem busca apenas o id (sem
+    params/result_data), ordena por updated_at e limita por ciclo; cada job é
+    carregado e processado isoladamente com commit incremental e quarentena em
+    caso de erro — a falha de um job nunca mais prende o lote inteiro.
+    """
+    from models import Job
+
+    rows = db.query(Job.id).filter(
+        Job.status == "success",
+        Job.result_consumed == False  # noqa: E712
+    ).order_by(
+        Job.updated_at.asc()
+    ).limit(SYNC_BATCH_LIMIT).all()
+
+    synced_counts = {"jobs_processed": 0, "inserted": 0, "updated": 0, "skipped": 0}
+    users_to_invalidate = set()
+
+    for row in rows:
+        job = db.query(Job).filter(Job.id == row.id).first()
+        if not job:
+            continue
+        try:
+            if not job.result_data:
+                job.result_consumed = True
+                db.commit()
+            else:
+                _process_single_job(db, job, synced_counts)
+                job.result_consumed = True
+                db.commit()
+            synced_counts["jobs_processed"] += 1
+            if job.user_id:
+                users_to_invalidate.add(job.user_id)
+        except Exception as e:
+            db.rollback()
+            _quarantine_job(db, row.id, str(e))
+            synced_counts["jobs_processed"] += 1
+
+    if users_to_invalidate:
         try:
             from cache import cache
-            for j in jobs:
-                if j.user_id:
-                    cache.invalidate_tenant(j.user_id)
+            for uid in users_to_invalidate:
+                cache.invalidate_tenant(uid)
         except Exception as e:
             print(f"Error invalidating cache after sync_completed_worker_jobs: {e}")
-        
+
     return synced_counts
 
 
