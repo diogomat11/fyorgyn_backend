@@ -35,6 +35,11 @@ class ExtrairRequest(BaseModel):
     id_relatorio: Optional[str] = None
 
 
+class ExtrairLoteRequest(BaseModel):
+    id_paciente: Optional[str] = None
+    reprocessar: bool = False
+
+
 class UpdateExtractionRequest(BaseModel):
     carga_psicologia: Optional[int] = None
     carga_fisioterapia: Optional[int] = None
@@ -83,6 +88,37 @@ def extrair_relatorio(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro na extração: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# POST /extrair-lote — Extract ALL pending medical reports of the user
+# ---------------------------------------------------------------------------
+
+@router.post("/extrair-lote")
+def extrair_relatorios_lote(
+    body: ExtrairLoteRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Agenda a extração Gemini de todos os relatórios médicos pendentes do
+    usuário (ativos, com arquivo e ainda sem extração). O progresso fica
+    visível na listagem via status de cada registro (polling do frontend).
+    """
+    from services.relatorio_rm_service import queue_extraction_lote
+
+    try:
+        result = queue_extraction_lote(
+            db=db,
+            user_id=current_user.id,
+            background_tasks=background_tasks,
+            id_paciente=body.id_paciente,
+            reprocessar=body.reprocessar,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao agendar lote: {str(e)}")
 
 
 # ---------------------------------------------------------------------------

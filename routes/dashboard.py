@@ -9,7 +9,7 @@ router = APIRouter(
     tags=["Dashboard"]
 )
 
-from dependencies import get_current_user
+from dependencies import get_current_user, get_effective_user_id
 
 from typing import Optional
 
@@ -20,6 +20,10 @@ def get_dashboard_stats(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    # Multitenancy: dados sempre do tenant do usuário logado (sub-usuário vê os
+    # dados do gestor/parent, mesmo padrão das listas de guias/agendamentos)
+    uid = get_effective_user_id(current_user)
+
     cache_params = {
         "id_convenio": id_convenio
     }
@@ -32,23 +36,19 @@ def get_dashboard_stats(
         print(f"Error scheduling completed jobs during dashboard load: {e}")
         
     from cache import cache
-    cached_res = cache.get(current_user.id, "dashboard", cache_params)
+    cached_res = cache.get(uid, "dashboard", cache_params)
     if cached_res:
         return cached_res
 
-    # Isolation
-    cart_query = db.query(Carteirinha)
-    guia_query = db.query(BaseGuia)
+    # Isolation: sempre escopado ao tenant do usuário logado (admin incluso)
+    cart_query = db.query(Carteirinha).filter(Carteirinha.user_id == uid)
+    guia_query = db.query(BaseGuia).filter(BaseGuia.user_id == uid)
     job_query = db.query(
         func.count(Job.id).label("total"),
         func.sum(case((Job.status == 'success', 1), else_=0)).label("success"),
         func.sum(case((Job.status == 'error', 1), else_=0)).label("error"),
         func.sum(case((Job.status.in_(['pending', 'processing']), 1), else_=0)).label("pending")
-    )
-    if not current_user.is_admin:
-        cart_query = cart_query.filter(Carteirinha.user_id == current_user.id)
-        guia_query = guia_query.filter(BaseGuia.user_id == current_user.id)
-        job_query = job_query.filter(Job.user_id == current_user.id)
+    ).filter(Job.user_id == uid)
     
     from dependencies import get_allowed_convenio_ids
     from fastapi import HTTPException
@@ -77,9 +77,7 @@ def get_dashboard_stats(
     
     # Obter contagens de solicitações por status
     from models import Solicitacao
-    sol_query = db.query(Solicitacao)
-    if not current_user.is_admin:
-        sol_query = sol_query.filter(Solicitacao.user_id == current_user.id)
+    sol_query = db.query(Solicitacao).filter(Solicitacao.user_id == uid)
     
     if id_convenio:
         sol_query = sol_query.filter(Solicitacao.id_convenio == id_convenio)
@@ -90,18 +88,19 @@ def get_dashboard_stats(
         Solicitacao.status_solicitacao, func.count(Solicitacao.id)
     ).all()
     
-    sol_counts = {"Pendente": 0, "Negada": 0, "Cancelada": 0}
+    sol_counts = {"Pendente": 0, "Em análise": 0, "Negada": 0, "Cancelada": 0}
     for status_name, count_val in sol_status_counts:
         status_clean = str(status_name).strip().lower()
         if "autorizad" in status_clean or "liberad" in status_clean:
             continue
-        elif "pendente" in status_clean or "estudo" in status_clean or "fila" in status_clean:
-            sol_counts["Pendente"] += count_val
-        elif "negad" in status_clean:
-            sol_counts["Negada"] += count_val
         elif "cancelad" in status_clean:
             sol_counts["Cancelada"] += count_val
+        elif "negad" in status_clean:
+            sol_counts["Negada"] += count_val
+        elif "anális" in status_clean or "analise" in status_clean:
+            sol_counts["Em análise"] += count_val
         else:
+            # pendente, em estudo, fila, solicitado, aguardando etc.
             sol_counts["Pendente"] += count_val
             
     total_autorizadas = total_guias
@@ -116,6 +115,7 @@ def get_dashboard_stats(
                 "total": total_all,
                 "autorizadas": total_autorizadas,
                 "pendentes": sol_counts["Pendente"],
+                "em_analise": sol_counts["Em análise"],
                 "negadas": sol_counts["Negada"],
                 "canceladas": sol_counts["Cancelada"]
             }
@@ -127,5 +127,5 @@ def get_dashboard_stats(
         }
     }
     
-    cache.set(current_user.id, "dashboard", cache_params, res_payload, ttl=10)
+    cache.set(uid, "dashboard", cache_params, res_payload, ttl=10)
     return res_payload

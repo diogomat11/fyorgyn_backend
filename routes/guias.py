@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from database import get_db
 from dependencies import get_current_user, get_effective_user_id
-from models import BaseGuia, Carteirinha, Job
+from models import BaseGuia, Carteirinha, Job, Procedimento, AreaAtuacao
 from typing import Optional
 from datetime import date, datetime, timedelta
 from openpyxl import Workbook
@@ -15,12 +16,259 @@ router = APIRouter(
     tags=["Guias"]
 )
 
+# Rotinas internas de sistema que NÃO devem aparecer no modal de Solicitações
+_ROTINAS_SISTEMA_EVOLUIR = [
+    "op2_obterDetalhes", "op3_ListarPTS", "op5_ImportCorpoClinico",
+    "op1_importPacientes", "op6_baixarFaturados", "op4_atualizarDataPTS",
+]
+
+
+def _parse_iso_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], '%Y-%m-%d').date()
+    except ValueError:
+        return None
+
+
+def _solicitacao_status_conditions(status_param):
+    """Condições SQL do filtro de status da aba Solicitações.
+
+    Mapeia os valores canônicos do dropdown para padrões tolerantes ao texto
+    cru vindo dos portais (acentos, ex.: 'Cancelado(Aguardando documentação)',
+    'Em análise'/'Em analise'), espelhando os buckets do dashboard.
+    """
+    from models import Solicitacao
+    col = Solicitacao.status_solicitacao
+    s = (status_param or "").strip().lower()
+    if "cancelad" in s:
+        return col.ilike('%cancelad%')
+    if "negad" in s:
+        return col.ilike('%negad%')
+    if "análise" in s or "analise" in s:
+        from sqlalchemy import or_
+        return or_(col.ilike('%análise%'), col.ilike('%analise%'))
+    if "aguardando" in s:
+        from sqlalchemy import and_
+        # 'Cancelado(Aguardando documentação)' pertence ao filtro Cancelado
+        return and_(col.ilike('%aguardando%'), ~col.ilike('%cancelad%'))
+    if "pendente" in s:
+        from sqlalchemy import and_, or_
+        return and_(
+            ~col.ilike('%negad%'),
+            ~col.ilike('%cancelad%'),
+            ~or_(col.ilike('%análise%'), col.ilike('%analise%'))
+        )
+    return col.ilike(f'%{status_param}%')
+
+
+def _serialize_solicitacao_row(sol_obj, nome_paciente, carteirinha_numero):
+    """Converte uma Solicitacao no dict consumido pela aba Solicitações.
+
+    A data da solicitação é a data real registrada no portal (coluna vinda da
+    OP11, campo DadosParaDtLiberacaoTela) — não a data de importação
+    (created_at). Fallback para a criação apenas quando o portal não informou.
+    """
+    from sqlalchemy import inspect
+    from models import Solicitacao
+    sol_mapper = inspect(Solicitacao)
+    s_dict = {attr.key: getattr(sol_obj, attr.key) for attr in sol_mapper.column_attrs}
+    s_dict['status_guia'] = s_dict['status_solicitacao']
+    s_dict['nome_paciente'] = nome_paciente
+    s_dict['carteirinha_numero'] = carteirinha_numero
+    s_dict['sessoes_realizadas'] = 0
+    s_dict['saldo'] = s_dict.get('sessoes_autorizadas', 0)
+
+    # Localize datetimes
+    s_dict['created_at'] = localize_datetime(s_dict.get('created_at'))
+    s_dict['updated_at'] = localize_datetime(s_dict.get('updated_at'))
+    if not s_dict.get('data_solicitacao'):
+        s_dict['data_solicitacao'] = s_dict['created_at'].date() if s_dict['created_at'] else None
+    return s_dict
+
+
+def _fetch_solicitacoes_data(
+    db: Session, current_user,
+    created_at_start=None, created_at_end=None, carteirinha_id=None,
+    id_convenio=None, status=None, senha=None, codigo_terapia=None,
+    data_solicitacao_start=None, data_solicitacao_end=None,
+):
+    """Fonte de dados da aba 'solicitacoes', compartilhada entre list_guias e
+    /guias/export: jobs em andamento + solicitacoes ainda sem guia
+    correspondente em base_guias (a aba NÃO lista registros de base_guias)."""
+    from sqlalchemy import and_, or_, exists
+    from models import Solicitacao
+    from dependencies import get_allowed_convenio_ids
+
+    allowed_ids = get_allowed_convenio_ids(current_user)
+
+    jobs_data = []
+    job_query = db.query(Job, Carteirinha.paciente.label('nome_paciente'), Carteirinha.carteirinha.label('carteirinha_numero'))\
+        .outerjoin(Carteirinha, Job.carteirinha_id == Carteirinha.id)
+    if not current_user.is_admin:
+        job_query = job_query.filter(Job.user_id == get_effective_user_id(current_user))
+    if id_convenio:
+        job_query = job_query.filter(Job.id_convenio == id_convenio)
+    # Excluir jobs de rotinas internas de sistema
+    job_query = job_query.filter(~Job.rotina.in_(_ROTINAS_SISTEMA_EVOLUIR))
+    if status:
+        status_lower = status.lower()
+        if "pendente" in status_lower:
+            job_query = job_query.filter(Job.status.in_(["pending", "processing"]))
+        elif "negad" in status_lower:
+            job_query = job_query.filter(Job.status == "error")
+        else:
+            job_query = job_query.filter(Job.id == -1)
+    else:
+        job_query = job_query.filter(Job.status.in_(["pending", "processing", "error"]))
+    # Filtro por data da solicitação: para jobs em andamento, a data da
+    # solicitação é a criação do job
+    if data_solicitacao_start:
+        job_query = job_query.filter(Job.created_at >= datetime.combine(data_solicitacao_start, datetime.min.time()))
+    if data_solicitacao_end:
+        end_dt = datetime.combine(data_solicitacao_end, datetime.min.time()) + timedelta(days=1)
+        job_query = job_query.filter(Job.created_at < end_dt)
+    db_jobs = job_query.order_by(Job.created_at.desc()).all()
+
+    for job_row in db_jobs:
+        job_obj = job_row[0]
+        nome_paciente = job_row[1]
+        carteirinha_numero = job_row[2]
+
+        params = job_obj.params or {}
+        if isinstance(params, str):
+            try:
+                import json
+                params = json.loads(params)
+            except Exception:
+                params = {}
+        elif not isinstance(params, dict):
+            params = {}
+
+        status_desc = job_obj.status
+        if job_obj.status == "error" and job_obj.error_message:
+            status_desc = f"Erro: {job_obj.error_message}"
+        elif job_obj.status == "pending":
+            status_desc = "Pendente (Fila)"
+        elif job_obj.status == "processing":
+            status_desc = "Processando"
+
+        loc_created = localize_datetime(job_obj.created_at) if job_obj.created_at else None
+        loc_updated = localize_datetime(job_obj.updated_at) if job_obj.updated_at else None
+        jobs_data.append({
+            "id": f"job-{job_obj.id}",
+            "carteirinha_id": job_obj.carteirinha_id,
+            "id_convenio": job_obj.id_convenio,
+            "cod_prestador": params.get("codigo_prestador") or "",
+            "codigo_beneficiario": params.get("carteira") or carteirinha_numero or "",
+            "guia": f"Solicitação #{job_obj.id}",
+            "guia_prestador": "",
+            "data_solicitacao": loc_created.date() if loc_created else None,
+            "data_autorizacao": None,
+            "senha": "",
+            "status_guia": status_desc,
+            "validade": None,
+            "codigo_terapia": params.get("codigoProcedimento_aut") or "",
+            "nome_terapia": "Solicitação em andamento...",
+            "qtde_solicitada": int(params.get("qtde") or 1),
+            "sessoes_autorizadas": 0,
+            "sessoes_realizadas": 0,
+            "saldo": 0,
+            "created_at": loc_created,
+            "updated_at": loc_updated,
+            "nome_paciente": nome_paciente or "Paciente",
+            "carteirinha_numero": carteirinha_numero or params.get("carteira") or ""
+        })
+
+    sol_query = db.query(
+        Solicitacao,
+        Carteirinha.paciente.label('nome_paciente'),
+        Carteirinha.carteirinha.label('carteirinha_numero')
+    ).select_from(Solicitacao)\
+     .outerjoin(Carteirinha, and_(
+         Solicitacao.carteirinha_id == Carteirinha.id,
+         or_(
+             Solicitacao.user_id == Carteirinha.user_id,
+             Carteirinha.user_id.is_(None),
+             Solicitacao.user_id.is_(None)
+         )
+     ))
+
+    if not current_user.is_admin:
+        sol_query = sol_query.filter(Solicitacao.user_id == get_effective_user_id(current_user))
+
+    # Excluir guias autorizadas/liberadas e solicitações que já possuem guias correspondentes na base_guias para evitar duplicação.
+    # guia autorizada = virou guia: sai da aba Solicitações. O casamento aceita
+    # base_guias com user_id NULL (imports de tenant diverso) — antes essas
+    # linhas vazavam para a listagem como "solicitações".
+    has_base_guia_subq = exists().where(
+        and_(
+            BaseGuia.guia == Solicitacao.guia,
+            BaseGuia.id_convenio == Solicitacao.id_convenio,
+            BaseGuia.codigo_terapia == Solicitacao.codigo_terapia,
+            or_(
+                BaseGuia.user_id == Solicitacao.user_id,
+                BaseGuia.user_id.is_(None)
+            )
+        )
+    )
+    sol_query = sol_query.filter(
+        and_(
+            ~or_(
+                Solicitacao.status_solicitacao.ilike('%autorizad%'),
+                Solicitacao.status_solicitacao.ilike('%liberad%')
+            ),
+            Solicitacao.base_guia_id.is_(None),
+            ~has_base_guia_subq
+        )
+    )
+
+    if id_convenio:
+        sol_query = sol_query.filter(Solicitacao.id_convenio == id_convenio)
+    elif allowed_ids:
+        sol_query = sol_query.filter(Solicitacao.id_convenio.in_(allowed_ids))
+
+    if created_at_start:
+        sol_query = sol_query.filter(Solicitacao.updated_at >= created_at_start)
+    if created_at_end:
+        end_dt = datetime.combine(created_at_end, datetime.min.time()) + timedelta(days=1)
+        sol_query = sol_query.filter(Solicitacao.updated_at < end_dt)
+    # Filtro por intervalo da data da solicitação (coluna vinda da OP11)
+    if data_solicitacao_start:
+        sol_query = sol_query.filter(Solicitacao.data_solicitacao >= data_solicitacao_start)
+    if data_solicitacao_end:
+        sol_query = sol_query.filter(Solicitacao.data_solicitacao <= data_solicitacao_end)
+    if carteirinha_id:
+        sol_query = sol_query.filter(Solicitacao.carteirinha_id == carteirinha_id)
+    if status:
+        sol_query = sol_query.filter(_solicitacao_status_conditions(status))
+    if senha:
+        sol_query = sol_query.filter(Solicitacao.senha.ilike(f'%{senha}%'))
+    if codigo_terapia:
+        sol_query = sol_query.filter(Solicitacao.codigo_terapia.ilike(f'%{codigo_terapia}%'))
+
+    db_sols = sol_query.order_by(Solicitacao.created_at.desc()).all()
+
+    solicitacoes_data = []
+    for row in db_sols:
+        solicitacoes_data.append(_serialize_solicitacao_row(row[0], row[1], row[2]))
+
+    combined = jobs_data + solicitacoes_data
+    combined.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
+    return combined
+
 @router.get("/")
 def list_guias(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     created_at_start: Optional[date] = None, 
     created_at_end: Optional[date] = None,
+    data_solicitacao_start: Optional[date] = None,
+    data_solicitacao_end: Optional[date] = None,
+    data_autorizacao_start: Optional[date] = None,
+    data_autorizacao_end: Optional[date] = None,
+    guia: Optional[str] = None,
     carteirinha_id: Optional[int] = None,
     id_convenio: Optional[int] = None,
     aba: Optional[str] = None,
@@ -42,6 +290,11 @@ def list_guias(
         "end_date": str(end_date) if end_date else None,
         "created_at_start": str(created_at_start) if created_at_start else None,
         "created_at_end": str(created_at_end) if created_at_end else None,
+        "data_solicitacao_start": str(data_solicitacao_start) if data_solicitacao_start else None,
+        "data_solicitacao_end": str(data_solicitacao_end) if data_solicitacao_end else None,
+        "data_autorizacao_start": str(data_autorizacao_start) if data_autorizacao_start else None,
+        "data_autorizacao_end": str(data_autorizacao_end) if data_autorizacao_end else None,
+        "guia": guia,
         "carteirinha_id": carteirinha_id,
         "id_convenio": id_convenio,
         "aba": aba,
@@ -107,6 +360,12 @@ def list_guias(
         # Inclusive end date (until end of day)
         end_dt = datetime.combine(created_at_end, datetime.min.time()) + timedelta(days=1)
         query = query.filter(BaseGuia.updated_at < end_dt)
+    if data_autorizacao_start:
+        query = query.filter(BaseGuia.data_autorizacao >= data_autorizacao_start)
+    if data_autorizacao_end:
+        query = query.filter(BaseGuia.data_autorizacao <= data_autorizacao_end)
+    if guia:
+        query = query.filter(BaseGuia.guia.ilike(f'%{guia.strip()}%'))
     if carteirinha_id:
         query = query.filter(BaseGuia.carteirinha_id == carteirinha_id)
     if status:
@@ -126,172 +385,19 @@ def list_guias(
 
 
 
-    # Rotinas internas de sistema que NÃO devem aparecer no modal de Solicitações
-    _ROTINAS_SISTEMA_EVOLUIR = [
-        "op2_obterDetalhes", "op3_ListarPTS", "op5_ImportCorpoClinico",
-        "op1_importPacientes", "op6_baixarFaturados", "op4_atualizarDataPTS",
-    ]
-
-    # Fetch active/failed jobs when looking at solicitacoes
-    jobs_data = []
     if aba == "solicitacoes":
-        job_query = db.query(Job, Carteirinha.paciente.label('nome_paciente'), Carteirinha.carteirinha.label('carteirinha_numero'))\
-            .outerjoin(Carteirinha, Job.carteirinha_id == Carteirinha.id)
-        if not current_user.is_admin:
-            job_query = job_query.filter(Job.user_id == get_effective_user_id(current_user))
-        if id_convenio:
-            job_query = job_query.filter(Job.id_convenio == id_convenio)
-        # Excluir jobs de rotinas internas de sistema
-        job_query = job_query.filter(~Job.rotina.in_(_ROTINAS_SISTEMA_EVOLUIR))
-        if status:
-            status_lower = status.lower()
-            if "pendente" in status_lower:
-                job_query = job_query.filter(Job.status.in_(["pending", "processing"]))
-            elif "negad" in status_lower:
-                job_query = job_query.filter(Job.status == "error")
-            else:
-                job_query = job_query.filter(Job.id == -1)
-        else:
-            job_query = job_query.filter(Job.status.in_(["pending", "processing", "error"]))
-        db_jobs = job_query.order_by(Job.created_at.desc()).all()
-        
-        for job_row in db_jobs:
-            job_obj = job_row[0]
-            nome_paciente = job_row[1]
-            carteirinha_numero = job_row[2]
-            
-            params = job_obj.params or {}
-            if isinstance(params, str):
-                try:
-                    import json
-                    params = json.loads(params)
-                except Exception:
-                    params = {}
-            elif not isinstance(params, dict):
-                params = {}
-                
-            status_desc = job_obj.status
-            if job_obj.status == "error" and job_obj.error_message:
-                status_desc = f"Erro: {job_obj.error_message}"
-            elif job_obj.status == "pending":
-                status_desc = "Pendente (Fila)"
-            elif job_obj.status == "processing":
-                status_desc = "Processando"
-                
-            loc_created = localize_datetime(job_obj.created_at) if job_obj.created_at else None
-            loc_updated = localize_datetime(job_obj.updated_at) if job_obj.updated_at else None
-            jobs_data.append({
-                "id": f"job-{job_obj.id}",
-                "carteirinha_id": job_obj.carteirinha_id,
-                "id_convenio": job_obj.id_convenio,
-                "cod_prestador": params.get("codigo_prestador") or "",
-                "codigo_beneficiario": params.get("carteira") or carteirinha_numero or "",
-                "guia": f"Solicitação #{job_obj.id}",
-                "guia_prestador": "",
-                "data_solicitacao": loc_created.date() if loc_created else None,
-                "data_autorizacao": None,
-                "senha": "",
-                "status_guia": status_desc,
-                "validade": None,
-                "codigo_terapia": params.get("codigoProcedimento_aut") or "",
-                "nome_terapia": "Solicitação em andamento...",
-                "qtde_solicitada": int(params.get("qtde") or 1),
-                "sessoes_autorizadas": 0,
-                "sessoes_realizadas": 0,
-                "saldo": 0,
-                "created_at": loc_created,
-                "updated_at": loc_updated,
-                "nome_paciente": nome_paciente or "Paciente",
-                "carteirinha_numero": carteirinha_numero or params.get("carteira") or ""
-            })
-
-    if aba == "solicitacoes":
-        from models import Solicitacao
-        
-        sol_query = db.query(
-            Solicitacao,
-            Carteirinha.paciente.label('nome_paciente'),
-            Carteirinha.carteirinha.label('carteirinha_numero')
-        ).select_from(Solicitacao)\
-         .outerjoin(Carteirinha, and_(
-             Solicitacao.carteirinha_id == Carteirinha.id,
-             or_(
-                 Solicitacao.user_id == Carteirinha.user_id,
-                 Carteirinha.user_id.is_(None),
-                 Solicitacao.user_id.is_(None)
-             )
-         ))
-         
-        if not current_user.is_admin:
-            sol_query = sol_query.filter(Solicitacao.user_id == get_effective_user_id(current_user))
-            
-        # Excluir guias autorizadas/liberadas e solicitações que já possuem guias correspondentes na base_guias para evitar duplicação
-        from sqlalchemy import exists
-        
-        has_base_guia_subq = exists().where(
-            and_(
-                BaseGuia.guia == Solicitacao.guia,
-                BaseGuia.id_convenio == Solicitacao.id_convenio,
-                BaseGuia.codigo_terapia == Solicitacao.codigo_terapia,
-                BaseGuia.user_id == Solicitacao.user_id
-            )
+        combined = _fetch_solicitacoes_data(
+            db, current_user,
+            created_at_start=created_at_start,
+            created_at_end=created_at_end,
+            carteirinha_id=carteirinha_id,
+            id_convenio=id_convenio,
+            status=status,
+            senha=senha,
+            codigo_terapia=codigo_terapia,
+            data_solicitacao_start=data_solicitacao_start,
+            data_solicitacao_end=data_solicitacao_end,
         )
-        sol_query = sol_query.filter(
-            and_(
-                ~or_(
-                    Solicitacao.status_solicitacao.ilike('%autorizad%'),
-                    Solicitacao.status_solicitacao.ilike('%liberad%')
-                ),
-                Solicitacao.base_guia_id.is_(None),
-                ~has_base_guia_subq
-            )
-        )
-            
-        if id_convenio:
-            sol_query = sol_query.filter(Solicitacao.id_convenio == id_convenio)
-        elif allowed_ids:
-            sol_query = sol_query.filter(Solicitacao.id_convenio.in_(allowed_ids))
-            
-        if created_at_start:
-            sol_query = sol_query.filter(Solicitacao.updated_at >= created_at_start)
-        if created_at_end:
-            end_dt = datetime.combine(created_at_end, datetime.min.time()) + timedelta(days=1)
-            sol_query = sol_query.filter(Solicitacao.updated_at < end_dt)
-        if carteirinha_id:
-            sol_query = sol_query.filter(Solicitacao.carteirinha_id == carteirinha_id)
-        if status:
-            sol_query = sol_query.filter(Solicitacao.status_solicitacao.ilike(f'%{status}%'))
-        if senha:
-            sol_query = sol_query.filter(Solicitacao.senha.ilike(f'%{senha}%'))
-        if codigo_terapia:
-            sol_query = sol_query.filter(Solicitacao.codigo_terapia.ilike(f'%{codigo_terapia}%'))
-            
-        db_sols = sol_query.order_by(Solicitacao.created_at.desc()).all()
-        
-        from sqlalchemy import inspect
-        sol_mapper = inspect(Solicitacao)
-        solicitacoes_data = []
-        for row in db_sols:
-            sol_obj = row[0]
-            nome_paciente = row[1]
-            carteirinha_numero = row[2]
-            
-            s_dict = {attr.key: getattr(sol_obj, attr.key) for attr in sol_mapper.column_attrs}
-            s_dict['status_guia'] = s_dict['status_solicitacao']
-            s_dict['nome_paciente'] = nome_paciente
-            s_dict['carteirinha_numero'] = carteirinha_numero
-            s_dict['sessoes_realizadas'] = 0
-            s_dict['saldo'] = s_dict.get('sessoes_autorizadas', 0)
-            
-            # Localize datetimes
-            s_dict['created_at'] = localize_datetime(s_dict.get('created_at'))
-            s_dict['updated_at'] = localize_datetime(s_dict.get('updated_at'))
-            s_dict['data_solicitacao'] = s_dict['created_at'].date() if s_dict['created_at'] else None
-            
-            solicitacoes_data.append(s_dict)
-            
-        combined = jobs_data + solicitacoes_data
-        combined.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
         total = len(combined)
         guias_data = combined[skip : skip + limit]
         
@@ -332,6 +438,8 @@ def list_guias(
 def export_guias(
     created_at_start: Optional[str] = Query(None, description="Start Date (YYYY-MM-DD)"),
     created_at_end: Optional[str] = Query(None, description="End Date (YYYY-MM-DD)"),
+    data_solicitacao_start: Optional[str] = Query(None, description="Data Solicitação início (YYYY-MM-DD)"),
+    data_solicitacao_end: Optional[str] = Query(None, description="Data Solicitação fim (YYYY-MM-DD)"),
     carteirinha_id: Optional[int] = Query(None, description="Filter by Carteirinha ID"),
     id_convenio: Optional[int] = Query(None, description="Filter by Convenio ID"),
     aba: Optional[str] = Query(None, description="Filter by ABA (autorizadas/solicitacoes)"),
@@ -347,7 +455,7 @@ def export_guias(
         ws = wb.create_sheet("Guias")
         
         headers = ["Carteirinha", "Paciente", "Guia", "Senha", "Status", "Data Solicitacao", 
-                   "Data Autorizacao", "Codigo", "Qtde Solicit", "Qtde Aut", "Validade", "Data Importacao"]
+                   "Data Autorizacao", "Codigo", "Qtde Solicit", "Qtde Aut", "Validade", "abrev_area", "Data Importacao"]
         ws.append(headers)
         
         # Helper to format date
@@ -357,6 +465,22 @@ def export_guias(
         
         print("DEBUG: Executing Query with raw tuples...")
         # Use yield_per to reduce memory overhead and tuple selection to avoid N+1 and lazy loading issues
+        from sqlalchemy import and_ as and_exp
+
+        # Join com procedimentos deduplicado: (codigo_procedimento, id_convenio)
+        # NÃO tem constraint única — cadastros repetidos (ex.: ids 5/153, 7/154,
+        # 8/155 do convênio 6) multiplicavam cada guia correspondente no Excel
+        # (fan-out do outerjoin, sem DISTINCT). A subquery agrega uma linha por
+        # código+convênio; o join com areas_atuacao segue por PK (1:1).
+        proc_area_sub = db.query(
+            Procedimento.codigo_procedimento.label("codigo_procedimento"),
+            Procedimento.id_convenio.label("id_convenio"),
+            func.min(Procedimento.id_area).label("id_area"),
+        ).group_by(
+            Procedimento.codigo_procedimento,
+            Procedimento.id_convenio
+        ).subquery()
+
         query = db.query(
             Carteirinha.carteirinha,         # 0
             Carteirinha.paciente,            # 1
@@ -370,8 +494,17 @@ def export_guias(
             BaseGuia.created_at,             # 9
             BaseGuia.codigo_beneficiario,    # 10
             BaseGuia.status_guia,            # 11
-            BaseGuia.data_solicitacao        # 12
-        ).select_from(BaseGuia).outerjoin(Carteirinha, BaseGuia.carteirinha_id == Carteirinha.id)
+            BaseGuia.data_solicitacao,       # 12
+            AreaAtuacao.abrev                # 13
+        ).select_from(BaseGuia)\
+         .outerjoin(Carteirinha, BaseGuia.carteirinha_id == Carteirinha.id)\
+         .outerjoin(proc_area_sub, and_exp(
+             BaseGuia.codigo_terapia == proc_area_sub.c.codigo_procedimento,
+             BaseGuia.id_convenio == proc_area_sub.c.id_convenio
+         ))\
+         .outerjoin(AreaAtuacao, proc_area_sub.c.id_area == AreaAtuacao.id_area)\
+         .distinct()\
+         .order_by(BaseGuia.guia, BaseGuia.codigo_terapia)
 
         # Isolation: if user has a convenio, only show guias from that convenio
         from dependencies import get_allowed_convenio_ids
@@ -404,28 +537,59 @@ def export_guias(
             
         if aba == "autorizadas":
             query = query.filter(BaseGuia.status_guia.ilike('%autorizad%'))
-        elif aba == "solicitacoes":
-            query = query.filter(~BaseGuia.status_guia.ilike('%autorizad%'))
-        
-        results = query.yield_per(1000)
-        
+
         count = 0
-        for row in results:
-            count += 1
-            ws.append([
-                row.carteirinha or row.codigo_beneficiario or "",
-                row.paciente or "",
-                row.guia,
-                row.senha,
-                row.status_guia,
-                fmt_date(row.data_solicitacao),
-                fmt_date(row.data_autorizacao),
-                row.codigo_terapia,
-                row.qtde_solicitada,
-                row.sessoes_autorizadas,
-                fmt_date(row.validade),
-                row.created_at.strftime("%d/%m/%Y %H:%M:%S") if row.created_at else ""
-            ])
+        if aba == "solicitacoes":
+            # Mesma fonte da listagem (jobs + solicitacoes); consultar apenas
+            # base_guias aqui gerava o Excel só com a linha de cabeçalho.
+            for row in _fetch_solicitacoes_data(
+                db, current_user,
+                created_at_start=_parse_iso_date(created_at_start),
+                created_at_end=_parse_iso_date(created_at_end),
+                carteirinha_id=carteirinha_id,
+                id_convenio=id_convenio,
+                status=status,
+                senha=senha,
+                codigo_terapia=codigo_terapia,
+                data_solicitacao_start=_parse_iso_date(data_solicitacao_start),
+                data_solicitacao_end=_parse_iso_date(data_solicitacao_end),
+            ):
+                count += 1
+                ws.append([
+                    row.get("carteirinha_numero") or row.get("codigo_beneficiario") or "",
+                    row.get("nome_paciente") or "",
+                    row.get("guia") or "",
+                    row.get("senha") or "",
+                    row.get("status_guia") or "",
+                    fmt_date(row.get("data_solicitacao")),
+                    fmt_date(row.get("data_autorizacao")),
+                    row.get("codigo_terapia") or "",
+                    row.get("qtde_solicitada") or 0,
+                    row.get("sessoes_autorizadas") or 0,
+                    fmt_date(row.get("validade")),
+                    "",
+                    row.get("created_at").strftime("%d/%m/%Y %H:%M:%S") if row.get("created_at") else "",
+                ])
+        else:
+            results = query.yield_per(1000)
+
+            for row in results:
+                count += 1
+                ws.append([
+                    row.carteirinha or row.codigo_beneficiario or "",
+                    row.paciente or "",
+                    row.guia,
+                    row.senha,
+                    row.status_guia,
+                    fmt_date(row.data_solicitacao),
+                    fmt_date(row.data_autorizacao),
+                    row.codigo_terapia,
+                    row.qtde_solicitada,
+                    row.sessoes_autorizadas,
+                    fmt_date(row.validade),
+                    row.abrev or "",
+                    row.created_at.strftime("%d/%m/%Y %H:%M:%S") if row.created_at else ""
+                ])
 
         print(f"DEBUG: Processed {count} rows. Saving Workbook...")
         output = io.BytesIO()

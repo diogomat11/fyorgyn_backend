@@ -14,6 +14,8 @@ import json
 import logging
 import tempfile
 import threading
+import time
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
@@ -107,13 +109,69 @@ def _load_prompt_yaml() -> str:
 # File Download
 # ---------------------------------------------------------------------------
 
+EVOLUIR_PORTAL_HOST = "sistemaevoluir.com.br"
+
+# Cache da sessão autenticada do Evoluir: sem ele, cada extração fazia um login
+# completo no portal (281 logins seguidos do IP do servidor num lote — lento,
+# agressivo ao portal e mantinha transação aberta durante download+Gemini).
+_EVOLUIR_SESSION_TTL = 20 * 60  # segundos
+# Intervalo entre extrações do lote: descarrega a CPU compartilhada do free
+# tier e espaça as chamadas ao Gemini/portal (evita rate limit e starvation).
+LOTE_INTERVALO_SEGUNDOS = float(os.getenv("RM_LOTE_INTERVALO_SEGUNDOS", "3"))
+_evoluir_session_cache = {"user_id": None, "session": None, "ts": 0.0}
+_evoluir_session_lock = threading.Lock()
+
+
+def _get_evoluir_session_cached(db, user_id: Optional[int]):
+    """Sessão Evoluir autenticada com cache por user (TTL). Retorna (session, criada)."""
+    with _evoluir_session_lock:
+        now = time.time()
+        if (_evoluir_session_cache["user_id"] == user_id
+                and _evoluir_session_cache["session"] is not None
+                and now - _evoluir_session_cache["ts"] < _EVOLUIR_SESSION_TTL):
+            return _evoluir_session_cache["session"], False
+
+        from routes.jobs import get_evoluir_session
+        session = get_evoluir_session(db, user_id)
+        # A query de credenciais abre transação: encerrar imediatamente para não
+        # pinar conexão do pooler (modo transação) durante download+Gemini.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _evoluir_session_cache.update(user_id=user_id, session=session, ts=now)
+        return session, True
+
+
+def _invalidate_evoluir_session_cache():
+    with _evoluir_session_lock:
+        _evoluir_session_cache.update(user_id=None, session=None, ts=0.0)
+
+
+def _resolve_mime(url: str, content_type_header: str = "") -> str:
+    """MIME pela extensão da URL, com fallback no Content-Type da resposta."""
+    url_lower = url.lower().split("?")[0]  # strip query params
+    ext = os.path.splitext(url_lower)[1]
+    mime_type = MIME_MAP.get(ext, "application/octet-stream")
+
+    if mime_type == "application/octet-stream":
+        ct = (content_type_header or "").lower()
+        if "pdf" in ct:
+            mime_type = "application/pdf"
+        elif "jpeg" in ct or "jpg" in ct:
+            mime_type = "image/jpeg"
+        elif "png" in ct:
+            mime_type = "image/png"
+    return mime_type
+
+
 def download_file_from_url(url: str) -> tuple[bytes, str]:
     """
     Download a file from a URL into memory.
-    
+
     Returns:
         (file_bytes, mime_type)
-    
+
     Raises:
         ValueError on download failure or unsupported file type.
     """
@@ -124,23 +182,40 @@ def download_file_from_url(url: str) -> tuple[bytes, str]:
     except httpx.HTTPError as e:
         raise ValueError(f"Falha ao baixar arquivo da URL: {e}")
 
-    # Determine MIME type from URL extension
-    url_lower = url.lower().split("?")[0]  # strip query params
-    ext = os.path.splitext(url_lower)[1]
-    mime_type = MIME_MAP.get(ext, "application/octet-stream")
-
-    if mime_type == "application/octet-stream":
-        # Try content-type header
-        ct = response.headers.get("content-type", "").lower()
-        if "pdf" in ct:
-            mime_type = "application/pdf"
-        elif "jpeg" in ct or "jpg" in ct:
-            mime_type = "image/jpeg"
-        elif "png" in ct:
-            mime_type = "image/png"
-
+    mime_type = _resolve_mime(url, response.headers.get("content-type", ""))
     logger.info(f"Downloaded file from URL: {len(response.content)} bytes, mime={mime_type}")
     return response.content, mime_type
+
+
+def download_rm_file(db, user_id: Optional[int], url: str, evoluir_session=None) -> tuple[bytes, str]:
+    """Baixa o arquivo do RM para extração.
+
+    URLs do portal Evoluir são protegidas por login: usam sessão autenticada
+    COM CACHE (um login por lote, não um por arquivo). Demais URLs (ex.:
+    anexos do Supabase Storage) seguem por download público direto.
+    """
+    if EVOLUIR_PORTAL_HOST in (url or ""):
+        if evoluir_session is not None:
+            session, from_cache = evoluir_session, True
+        else:
+            session, from_cache = _get_evoluir_session_cached(db, user_id)
+
+        resp = session.get(url, timeout=30)
+
+        if resp.status_code in (401, 403, 419) and evoluir_session is None and from_cache:
+            # Sessão em cache expirou no portal: novo login e retry único.
+            _invalidate_evoluir_session_cache()
+            session, _ = _get_evoluir_session_cached(db, user_id)
+            resp = session.get(url, timeout=30)
+
+        if resp.status_code != 200:
+            raise ValueError(
+                f"Falha ao baixar arquivo do portal Evoluir ({resp.status_code}): {resp.text[:200]}"
+            )
+        mime_type = _resolve_mime(url, resp.headers.get("content-type", ""))
+        logger.info(f"Downloaded Evoluir portal file: {len(resp.content)} bytes, mime={mime_type}")
+        return resp.content, mime_type
+    return download_file_from_url(url)
 
 
 # ---------------------------------------------------------------------------
@@ -357,10 +432,120 @@ def queue_extraction(
     return _record_to_dict(record)
 
 
-def _process_extraction_bg(extraction_id: int):
+def _process_extraction_lote_bg(extraction_ids: list):
+    """Processa em sequência os registros de extração criados pelo lote.
+
+    Um login único do Evoluir serve a todo o lote (cache de sessão); se a
+    sessão cair no meio, a próxima extração refaz o login. Sequencial, com
+    intervalo entre itens, para não saturar a CPU compartilhada do plano free
+    do Render enquanto o lote roda (incidente 2026-09-04)."""
+    evoluir_session = None
+    for idx, extraction_id in enumerate(extraction_ids):
+        if idx > 0:
+            time.sleep(LOTE_INTERVALO_SEGUNDOS)
+        try:
+            _process_extraction_bg(extraction_id, evoluir_session=evoluir_session)
+        except Exception as e:
+            logger.error(f"Lote: falha ao processar extração id={extraction_id}: {e}")
+            if "portal Evoluir" in str(e):
+                # Sessão compartilhada pode ter expirado: descartar para a
+                # próxima extração refazer o login.
+                evoluir_session = None
+                _invalidate_evoluir_session_cache()
+                continue
+        # Reaproveitar a sessão que a extração logou no cache (se houver).
+        if evoluir_session is None:
+            with _evoluir_session_lock:
+                cached = _evoluir_session_cache["session"]
+            if cached is not None:
+                evoluir_session = cached
+
+
+def queue_extraction_lote(
+    db: Session,
+    user_id: int,
+    background_tasks,
+    id_paciente: Optional[str] = None,
+    reprocessar: bool = False,
+) -> dict:
+    """Agenda extração Gemini de TODOS os relatórios médicos pendentes do usuário.
+
+    Pendente = RM ativo com arquivo e id_relatorio ainda sem extração registrada
+    (dedup por id_relatorio). `reprocessar=True` inclui também os já extraídos.
+    Retorna contagens para feedback na UI.
+    """
+    from models import RelatorioMedico
+
+    query = db.query(RelatorioMedico).filter(
+        RelatorioMedico.user_id == user_id,
+        RelatorioMedico.is_active == True,  # noqa: E712
+        RelatorioMedico.url_arquivo.isnot(None),
+    )
+    if id_paciente:
+        query = query.filter(RelatorioMedico.id_paciente == id_paciente)
+
+    relatorios = query.all()
+
+    if not reprocessar:
+        ja_extraidos = {
+            row[0] for row in db.query(RelatorioMedicoExtracao.id_relatorio).filter(
+                RelatorioMedicoExtracao.user_id == user_id,
+                RelatorioMedicoExtracao.id_relatorio.isnot(None),
+            ).all()
+        }
+    else:
+        ja_extraidos = set()
+
+    agendados_ids = []
+    pulados_sem_arquivo = 0
+    pulados_ja_extraidos = 0
+
+    for rm in relatorios:
+        if not (rm.url_arquivo or "").strip():
+            pulados_sem_arquivo += 1
+            continue
+        # Sem id_relatorio não há chave de dedup: só entra em modo reprocessar,
+        # senão cada clique no lote criaria extrações duplicadas.
+        if rm.id_relatorio and rm.id_relatorio in ja_extraidos:
+            pulados_ja_extraidos += 1
+            continue
+        if not rm.id_relatorio and not reprocessar:
+            pulados_ja_extraidos += 1
+            continue
+
+        record = RelatorioMedicoExtracao(
+            user_id=user_id,
+            id_paciente=rm.id_paciente,
+            nome_paciente=rm.nome_paciente,
+            id_relatorio=rm.id_relatorio,
+            url_arquivo=rm.url_arquivo,
+            status_extracao="NAO_PROCESSADO"
+        )
+        db.add(record)
+        agendados_ids.append(record)
+
+    db.commit()
+
+    extraction_ids = [r.id for r in agendados_ids]
+    if extraction_ids:
+        background_tasks.add_task(_process_extraction_lote_bg, extraction_ids)
+
+    logger.info(
+        f"RM Extraction lote: user={user_id} agendados={len(extraction_ids)} "
+        f"pulados(ja extraidos)={pulados_ja_extraidos} pulados(sem arquivo)={pulados_sem_arquivo}"
+    )
+    return {
+        "agendados": len(extraction_ids),
+        "pulados_ja_extraidos": pulados_ja_extraidos,
+        "pulados_sem_arquivo": pulados_sem_arquivo,
+    }
+
+
+def _process_extraction_bg(extraction_id: int, evoluir_session=None):
     """
     Background task to process an extraction.
     Limits concurrency using a semaphore to avoid overloading the API.
+    `evoluir_session` permite reutilizar o login do Evoluir entre extrações do lote.
     """
     db = SessionLocal()
     try:
@@ -374,8 +559,10 @@ def _process_extraction_bg(extraction_id: int):
         # Limit concurrency
         with _gemini_semaphore:
             logger.info(f"Starting background extraction for id={extraction_id}")
-            # Step 1: Download file
-            file_bytes, mime_type = download_file_from_url(record.url_arquivo)
+            # Step 1: Download file (portal Evoluir exige sessão autenticada;
+            # com cache de sessão a transação do db NÃO fica aberta durante o download)
+            file_bytes, mime_type = download_rm_file(db, record.user_id, record.url_arquivo,
+                                                     evoluir_session=evoluir_session)
 
             # Step 2: Extract via Gemini
             gemini_result = extract_therapies_from_file(file_bytes, mime_type, record.id_paciente)
@@ -505,19 +692,38 @@ def delete_extraction(db: Session, extraction_id: int) -> bool:
 
 def resume_stuck_extractions(db: Session):
     """
-    On startup, find any extractions that were left in NAO_PROCESSADO or EM_PROCESSAMENTO
-    state due to a server crash, and spawn threads to resume them.
+    Retoma extrações órfãs de um crash/restart do servidor (incidente
+    2026-09-04: lote interrompido deixava registros presos em
+    NAO_PROCESSADO/EM_PROCESSAMENTO para sempre).
+
+    Só considera registros parados há mais de 10 min (não disputa com um lote
+    que acabou de começar) e processa em UMA thread sequencial — nunca uma
+    thread por registro, que multiplicaria memória/threads no plano free.
     """
     stuck_records = db.query(RelatorioMedicoExtracao).filter(
-        RelatorioMedicoExtracao.status_extracao.in_(["NAO_PROCESSADO", "EM_PROCESSAMENTO"])
+        RelatorioMedicoExtracao.status_extracao.in_(["NAO_PROCESSADO", "EM_PROCESSAMENTO"]),
+        RelatorioMedicoExtracao.updated_at < datetime.now(timezone.utc) - timedelta(minutes=10),
     ).all()
-    
-    if stuck_records:
-        logger.info(f"Resuming {len(stuck_records)} stuck extractions on startup...")
-        for r in stuck_records:
-            r.status_extracao = "NAO_PROCESSADO" # Reset to queue state
-            db.commit()
-            threading.Thread(target=_process_extraction_bg, args=(r.id,), daemon=True).start()
+
+    if not stuck_records:
+        return 0
+
+    ids = [r.id for r in stuck_records]
+    try:
+        db.query(RelatorioMedicoExtracao).filter(
+            RelatorioMedicoExtracao.id.in_(ids),
+            RelatorioMedicoExtracao.status_extracao == "EM_PROCESSAMENTO",
+        ).update({"status_extracao": "NAO_PROCESSADO"}, synchronize_session=False)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"resume_stuck_extractions: falha ao resetar statuses: {e}")
+
+    logger.info(f"Retomando {len(ids)} extrações presas em thread sequencial...")
+    threading.Thread(
+        target=_process_extraction_lote_bg, args=(ids,), daemon=True, name="rm-extracao-resume"
+    ).start()
+    return len(ids)
 
 # ---------------------------------------------------------------------------
 # Helpers

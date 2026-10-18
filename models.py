@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, DateTime, Time, ForeignKey, Text, Float, Boolean, JSON, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Date, DateTime, Time, ForeignKey, Text, Float, Boolean, JSON, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, foreign
 from sqlalchemy.sql import func
@@ -58,7 +58,9 @@ class User(Base):
 class Carteirinha(Base):
     __tablename__ = "carteirinhas"
     __table_args__ = (
-        UniqueConstraint('carteirinha', 'user_id', name='uq_carteirinha_user_id'),
+        # Migration 0110: unicidade por (carteirinha, convenio, user); NULL tratado como 0
+        # (mesma carteirinha pode existir em convênios distintos — itens sem relação entre si)
+        Index('uq_carteirinha_conv_user', 'carteirinha', text('COALESCE(id_convenio, 0)'), 'user_id', unique=True),
         {'extend_existing': True}
     )
 
@@ -158,6 +160,7 @@ class Solicitacao(Base):
     
     # Dados da guia
     guia = Column(Text)
+    guia_prestador = Column(Text, nullable=True)  # exigido pelos endpoints de observação do regulador IPASGO
     codigo_terapia = Column(Text)
     nome_terapia = Column(Text, nullable=True)
     qtde_solicitada = Column(Integer, default=0)
@@ -167,6 +170,9 @@ class Solicitacao(Base):
     senha = Column(Text, nullable=True)
     validade = Column(Date, nullable=True)
     status_solicitacao = Column(Text, default="Pendente")
+    # Histórico de observações da guia no regulador (IPASGO/OP11):
+    # [{data_hora, usuario, login, observacao, libera_pendente_doc, ...}]
+    historico_observacoes = Column(JSONB, nullable=True)
     
     # Dados do formulário
     id_profissional = Column(Text, nullable=True)
@@ -444,6 +450,7 @@ class AreaAtuacao(Base):
     id_area = Column(Integer, primary_key=True, index=True)
     nome = Column(Text, nullable=False)
     cbo = Column(Text)
+    abrev = Column(Text)
     status = Column(Text, default="ativo")
 
 class Conselho(Base):
@@ -758,6 +765,7 @@ class RelatorioMedico(Base):
     id_relatorio     = Column(Text, index=True)   # ref. lógica -> relatorios_medicos_extracao.id_relatorio
     url_arquivo      = Column(Text)
     data_relatorio   = Column(Date)
+    data_validade    = Column(Date)               # validade do RM (portal Evoluir, op8)
     nome_medico      = Column(Text)
     especialidade    = Column(Text)
     observacoes      = Column(Text)

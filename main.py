@@ -61,12 +61,15 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.get("/")
-def read_root():
+async def read_root():
     return {"message": "FyorGyn API is running"}
 
 @app.get("/health")
-def health_check():
+async def health_check():
     # Endpoint dedicado para o health check do Render (a raiz "/" ja responde tambem).
+    # async de proposito: endpoints sync (def) dependem do threadpool anyio, que
+    # ficou esgotado durante o incidente de 2026-09-02 e derrubou o health check
+    # (503). Sem I/O aqui, responde direto no event loop mesmo com pool cheio.
     return {"status": "ok"}
 
 async def run_cleanup_loop():
@@ -82,6 +85,12 @@ async def run_cleanup_loop():
             resumo = run_retention(db)
             if any(resumo.values()):
                 print(f"[RETENTION] {resumo}")
+            # Re-checagem de solicitações pendentes (guia 25939699): enfileira
+            # job de importação por tenant quando o status está stale — nunca lança.
+            from services.solicitacao_reconcile_service import run_reconcile_pending_solicitacoes
+            resumo_reconcile = run_reconcile_pending_solicitacoes(db)
+            if resumo_reconcile.get("jobs_criados"):
+                print(f"[RECONCILE] {resumo_reconcile}")
         except Exception as e:
             print(f"Cleanup Loop Error: {e}")
         finally:
@@ -133,6 +142,18 @@ async def startup_event():
     asyncio.create_task(run_cleanup_loop())
     asyncio.create_task(run_guias_sync_loop())
     asyncio.create_task(run_cron_loop())
+    # Retomada de extrações RM órfãs de crash/restart (lote Gemini interrompido
+    # ficava preso em NAO_PROCESSADO/EM_PROCESSAMENTO para sempre).
+    try:
+        from database import SessionLocal
+        from services.relatorio_rm_service import resume_stuck_extractions
+        db = SessionLocal()
+        try:
+            resume_stuck_extractions(db)
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"Startup resume_stuck_extractions falhou (não bloqueia o boot): {e}")
 
 from routes import (
     auth, carteirinhas, jobs, guias, logs, dashboard, debug_optimization,

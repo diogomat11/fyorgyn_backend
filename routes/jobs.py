@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Body, Query, UploadFile, File, Form, BackgroundTasks, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from dependencies import get_current_user
 from sqlalchemy.orm import Session, defer
 from database import get_db
@@ -414,6 +414,18 @@ def create_jobs(
                 detail="Para criar o job da OP11, informe ao menos um parâmetro: intervalo de datas, guia ou carteirinha."
             )
 
+    # Validação para OP15 do IPASGO (envio de justificativa/observação ao regulador)
+    if request.rotina in ['15', 'op15_enviar_justificativa']:
+        try:
+            p_dict = json.loads(request.params) if request.params else {}
+        except Exception:
+            p_dict = {}
+        if not p_dict.get("guia") or not (p_dict.get("observacao") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP15, informe 'guia' e 'observacao' (texto da justificativa)."
+            )
+
     if request.rotina and "fature" in request.rotina:
         request.rotina = request.rotina.replace("_fature", "").replace("fature_", "")
         try:
@@ -435,7 +447,41 @@ def create_jobs(
         target_convenio = request.id_convenio
     else:
         target_convenio = allowed_ids[0] if allowed_ids else None
-    
+
+    # ── Strategy de solicitação: a rotina canônica 'solicitar_autorizacao' é
+    # direcionada ao integrador do convênio via convenios.id_integrador (espaço
+    # W). Ex.: CAESAN (convênio 16 → integrador 102) → op1_autorizacao.
+    # Convênios sem strategy de solicitação seguem o fluxo legado abaixo. ──
+    if request.rotina == 'solicitar_autorizacao':
+        from services.solicitacao_strategy import resolver_strategy_do_convenio
+        strategy = resolver_strategy_do_convenio(db, target_convenio)
+        if strategy is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Convênio sem integrador de solicitação configurado para a rotina 'solicitar_autorizacao'."
+            )
+        if request.type != 'single' or not request.carteirinha_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="solicitar_autorizacao exige type='single' com uma carteirinha selecionada."
+            )
+
+        # Posse da carteirinha (mesma guarda do fluxo legado)
+        if not current_user.is_admin:
+            owned = db.query(Carteirinha).filter(
+                Carteirinha.id.in_(request.carteirinha_ids),
+                Carteirinha.user_id == current_user.id
+            ).count()
+            if owned != len(request.carteirinha_ids):
+                raise HTTPException(status_code=403, detail="Uma ou mais carteirinhas não pertencem ao seu usuário.")
+
+        strategy.criar_job_solicitacao(
+            current_user.id,
+            json.loads(request.params) if request.params else {},
+            carteirinha_id=request.carteirinha_ids[0],
+        )
+        return {"message": "Created/Queued jobs", "count": 1}
+
     if request.type == 'all':
         created_count = job_service.create_all_jobs(db, id_convenio=target_convenio, rotina=request.rotina, params=request.params, user_id=current_user.id)
             
@@ -444,18 +490,22 @@ def create_jobs(
             '3', 'op3_import_guias', 
             '6', 'op6_check_baixados', 
             '7', 'op7_fat_facplan', 
-            '11', 'op11_import_guias_api', 
+            '11', 'op11_import_guias_api',
             '12', 'op12_impressao_api',
             '13', 'op13_criar_lote',
-            '14', 'op14_cancelar_lote'
+            '14', 'op14_cancelar_lote',
+            '15', 'op15_enviar_justificativa'
         ]) or (target_convenio == 100 and request.rotina in [
             '1', 'op1', 'op1_importPacientes', 'op5_ImportCorpoClinico',
             'op6_baixarFaturados', 'op4_atualizarDataPTS',
-            '7', 'op7', 'op7_consultaDocs', 'OP_consultaDocs'
+            '7', 'op7', 'op7_consultaDocs', 'OP_consultaDocs',
+            '8', 'op8', 'op8_importRelatoriosMedicos'
         ]) or (target_convenio == 101 and request.rotina in [
             'op1_importar_agendamentos', 'op6_atualizar_rc'
         ]) or (target_convenio == 3 and request.rotina in [
             '4', 'op4_finalizados', 'finalizados', 'exames_finalizados',
+        ]) or (target_convenio == 16 and request.rotina in [
+            '2', 'op2_consultar_guia',
         ])
 
         if not request.carteirinha_ids:
@@ -744,6 +794,222 @@ async def import_fature_batch(
         print(f"Error invalidating cache in import_fature_batch: {e}")
     return {"message": "Lote importado com sucesso", "count": created_count}
 
+
+@router.post("/import/caesan-autorizacoes")
+async def import_caesan_autorizacoes(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """
+    Importa a planilha CAESAN (aba 'modelo_csv' do xlsx ou CSV equivalente) e cria
+    um job OP1 (op1_autorizacao) por linha — pelo mesmo caminho da solicitação
+    individual (SolicitacaoStrategy do integrador 102), com credenciais do tenant.
+
+    Colunas do modelo (case-insensitive):
+      ID Paciente | Nome do Paciente | CID | data_atendimento | Técnica |
+      PROFISSIONAL | Espc_Autorização | BASE_RC.ABREV | codigo | Total |
+      dia_semana | caminho | JUSTIFICATIVA
+
+    Técnica 'Terapias Convencionais' → tabela 22; 'Terapias Especiais' → tabela 00.
+    """
+    import io
+    import json  # noqa: F401  (paridade com as demais rotas de import)
+    from datetime import datetime, date
+
+    from dependencies import get_allowed_convenio_ids
+    from services.solicitacao_strategy import resolver_strategy_do_convenio
+    from services.job_service import _send_jobs_to_worker
+
+    ID_CONVENIO_CAESAN = 16
+
+    allowed_ids = get_allowed_convenio_ids(current_user)
+    if allowed_ids and ID_CONVENIO_CAESAN not in allowed_ids:
+        raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+
+    strategy = resolver_strategy_do_convenio(db, ID_CONVENIO_CAESAN)
+    if strategy is None:
+        raise HTTPException(status_code=400, detail="Integrador CAESAN não configurado/ativo.")
+
+    content = await file.read()
+    filename = (file.filename or "").lower()
+    try:
+        if filename.endswith(('.xlsx', '.xls')):
+            xls = pd.ExcelFile(BytesIO(content))
+            sheet = 'modelo_csv' if 'modelo_csv' in xls.sheet_names else xls.sheet_names[0]
+            df = xls.parse(sheet, dtype=str)
+        else:
+            try:
+                raw = content.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                raw = content.decode('latin1')
+            df = pd.read_csv(io.StringIO(raw), sep=None, engine='python', dtype=str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao ler arquivo (xlsx/csv): {str(e)}")
+
+    def find_col(*names):
+        for c in df.columns:
+            if str(c).strip().lower() in names:
+                return c
+        return None
+
+    col_idpac = find_col('id paciente', 'idpaciente', 'id_paciente')
+    col_carteira = find_col('carteira', 'carteirinha')
+    col_nome = find_col('nome do paciente', 'paciente', 'nome')
+    col_cid = find_col('cid')
+    col_data = find_col('data_atendimento', 'data atendimento')
+    col_tec = find_col('técnica', 'tecnica')
+    col_prof = find_col('profissional')
+    col_espec = find_col('espc_autorização', 'espc_autorizacao', 'especialidade')
+    col_abrev = find_col('base_rc.abrev', 'abrev')
+    col_cod = find_col('codigo', 'código')
+    col_qtde = find_col('total', 'quantidade', 'qtde')
+    col_caminho = find_col('caminho')
+    col_just = find_col('justificativa')
+
+    if not col_cod:
+        raise HTTPException(status_code=400, detail="Coluna 'codigo' não encontrada na planilha.")
+    if not (col_idpac or col_carteira):
+        raise HTTPException(status_code=400, detail="Coluna 'ID Paciente' (ou 'Carteira') não encontrada na planilha.")
+
+    def cell(row, col):
+        if col is None:
+            return ""
+        val = row.get(col)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return ""
+        s = str(val).strip()
+        return "" if s.lower() in ("nan", "none", "nat", "#n/a") else s
+
+    def fmt_data(val):
+        try:
+            if isinstance(val, (datetime, date)):
+                return val.strftime("%d/%m/%Y")
+            if val:
+                return pd.to_datetime(val).strftime("%d/%m/%Y")
+        except Exception:
+            pass
+        return str(val or "")
+
+    # Cache das carteirinhas do tenant no convênio CAESAN
+    carts = db.query(Carteirinha).filter(
+        Carteirinha.user_id == current_user.id,
+        Carteirinha.id_convenio == ID_CONVENIO_CAESAN
+    ).all()
+    by_idpac = {str(c.id_paciente).strip(): c for c in carts if c.id_paciente}
+    by_cart = {str(c.carteirinha).strip(): c for c in carts if c.carteirinha}
+
+    # Auto-resolução de profissional por área: a planilha-modelo frequentemente vem
+    # com PROFISSIONAL vazio — resolve via corpo clínico do tenant × áreas de
+    # atuação (match por nome da especialidade ou abreviação BASE_RC.ABREV).
+    import unicodedata
+
+    def _norm(txt):
+        txt = unicodedata.normalize('NFD', str(txt or '').upper().strip())
+        return "".join(c for c in txt if unicodedata.category(c) != 'Mn').strip()
+
+    from models import AreaAtuacao, CorpoClinico, CorpoClinicoArea
+    profs_cache = None
+
+    def _resolver_profissional_por_area(especialidade, abrev):
+        nonlocal profs_cache
+        if profs_cache is None:
+            rows = (
+                db.query(CorpoClinico, AreaAtuacao)
+                .outerjoin(CorpoClinicoArea, CorpoClinicoArea.corpo_clinico_id == CorpoClinico.id)
+                .outerjoin(AreaAtuacao, AreaAtuacao.id_area == CorpoClinicoArea.id_area)
+                .filter(
+                    CorpoClinico.user_id == current_user.id,
+                    CorpoClinico.tipo_profissional == 'profissional',
+                    CorpoClinico.status == 'ativo',
+                )
+                .all()
+            )
+            profs_cache = rows
+        esp_n = _norm(especialidade)
+        abrev_n = _norm(abrev)
+        nomes = {
+            p.nome for p, a in profs_cache
+            if (esp_n and _norm(a.nome) == esp_n) or (abrev_n and _norm(a.abrev) == abrev_n)
+        }
+        nomes |= {
+            p.nome for p, a in profs_cache
+            if esp_n and esp_n == _norm(p.area)
+        }
+        return sorted(nomes)
+
+    jobs_payload = []
+    errors = []
+    for idx, row in df.iterrows():
+        linha = idx + 2
+        idpac = cell(row, col_idpac)
+        carteira_str = cell(row, col_carteira)
+        cart = by_idpac.get(idpac) if idpac else None
+        if cart is None and carteira_str:
+            cart = by_cart.get(carteira_str)
+        if cart is None:
+            errors.append(f"Linha {linha}: paciente não localizado no convênio CAESAN (id_paciente='{idpac}').")
+            continue
+
+        codigo = cell(row, col_cod)
+        if not codigo:
+            errors.append(f"Linha {linha}: coluna 'codigo' vazia.")
+            continue
+
+        profissional = cell(row, col_prof)
+        especialidade = cell(row, col_espec)
+        abrev = cell(row, col_abrev)
+        if not profissional:
+            candidatos = _resolver_profissional_por_area(especialidade, abrev)
+            if len(candidatos) == 1:
+                profissional = candidatos[0]
+            elif len(candidatos) > 1:
+                errors.append(f"Linha {linha}: PROFISSIONAL vazio e múltiplos profissionais na área '{especialidade or abrev}' ({', '.join(candidatos[:3])}...). Informe a coluna PROFISSIONAL.")
+                continue
+            else:
+                errors.append(f"Linha {linha}: PROFISSIONAL vazio e nenhum profissional ativo do tenant na área '{especialidade or abrev}'.")
+                continue
+
+        params = {
+            "carteira": str(cart.carteirinha),
+            "id_paciente": idpac or (str(cart.id_paciente) if cart.id_paciente else None),
+            "paciente": cell(row, col_nome) or cart.paciente or "",
+            "cid": cell(row, col_cid) or cart.cid or "",
+            "data_atendimento": fmt_data(cell(row, col_data)),
+            "tecnica": cell(row, col_tec),
+            "nome_profissional": profissional,
+            "especialidade": especialidade,
+            "codigo": codigo,
+            "quantidade": cell(row, col_qtde) or "1",
+            "caminho_doc": cell(row, col_caminho),
+            "justificativa": cell(row, col_just),
+        }
+
+        try:
+            jobs_payload.append(strategy.montar_job(current_user.id, params, carteirinha_id=cart.id))
+        except HTTPException as ve:
+            errors.append(f"Linha {linha}: {ve.detail}")
+        except Exception as e:
+            errors.append(f"Linha {linha}: {e}")
+
+    if jobs_payload:
+        _send_jobs_to_worker(jobs_payload, db=db)
+        strategy._criar_solicitacoes_pendentes(current_user.id, jobs_payload[0], count=len(jobs_payload))
+
+    try:
+        from cache import cache
+        cache.invalidate_tenant(current_user.id)
+    except Exception as e:
+        print(f"Error invalidating cache in import_caesan_autorizacoes: {e}")
+
+    return {
+        "message": "Importação CAESAN processada",
+        "count": len(jobs_payload),
+        "errors": errors[:30],
+        "total_errors": len(errors),
+    }
+
+
 @router.get("/export/fature")
 def export_fature_jobs(
     id_convenio: int,
@@ -973,6 +1239,7 @@ def get_job_detail(id: int, db: Session = Depends(get_db), current_user = Depend
         "status": job.status,
         "attempts": job.attempts,
         "priority": job.priority,
+        "locked_by": job.locked_by,
         "result_data": job.result_data,
         "excel_url": (job.result_data or {}).get("excel_url") if isinstance(job.result_data, dict) else None,
         "created_at": localize_datetime(job.created_at),
@@ -1090,7 +1357,22 @@ def submit_job_result(
         if isinstance(payload, dict):
             rotina = payload.get("rotina", rotina)
             id_convenio = payload.get("id_convenio", id_convenio)
-            
+
+        # Resolver o user_id real em vez de hardcoded 1: com user errado, o sync
+        # gravava as guias em tenant errado e a re-sincronização pelo usuário
+        # real gerava duplicatas (o índice uq_guia_conv_ter_cart não tem user_id).
+        resolved_user_id = None
+        if isinstance(payload, dict):
+            resolved_user_id = payload.get("user_id")
+            if not resolved_user_id and payload.get("carteirinha_id"):
+                cart = db.query(Carteirinha).filter(
+                    Carteirinha.id == payload.get("carteirinha_id")
+                ).first()
+                resolved_user_id = cart.user_id if cart else None
+        if not resolved_user_id:
+            print(f"[WEBHOOK] Job {job_id} inexistente e sem user_id resolvível no payload "
+                  f"(nem user_id nem carteirinha_id): job criado com user_id nulo.")
+
         job = Job(
             id=job_id,
             id_convenio=id_convenio,
@@ -1098,24 +1380,93 @@ def submit_job_result(
             status="success",
             result_data=payload,
             result_consumed=False,
-            user_id=1,
+            user_id=resolved_user_id,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc)
         )
         db.add(job)
+        should_resync = True
     else:
+        # Só reabre o consumo se há resultado novo: reabrir incondicionalmente
+        # fazia o sync reprocessar payload já consumido (o dispatcher grava o
+        # resultado direto no banco ANTES do webhook — o loop de 15s costuma
+        # consumir primeiro; webhook atrasado reabria o mesmo job).
+        already_consumed = job.status == "success" and job.result_consumed
+        should_resync = (not already_consumed) or (job.result_data != payload)
+
         job.status = "success"
         job.result_data = payload
-        job.result_consumed = False
+        if should_resync:
+            job.result_consumed = False
         job.updated_at = datetime.now(timezone.utc)
-        
+
     db.commit()
-    
-    if job.status == "success":
+
+    if job.status == "success" and should_resync:
         from services.guias_sync_service import sync_completed_worker_jobs_bg
         background_tasks.add_task(sync_completed_worker_jobs_bg)
-        
+
     return {"status": "success", "message": "Result received and background sync initiated"}
+
+
+OP4_ROTINAS = ("4", "op4", "op4_finalizados", "finalizados", "exames_finalizados")
+
+
+@router.post("/{job_id}/result/partial")
+def submit_job_result_partial(
+    job_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Webhook de entrega PARCIAL (chunks) do worker durante jobs longos (OP4).
+
+    O worker envia lotes de guias conforme extrai (ex.: a cada 200 guias):
+      - persiste os itens no lote de forma idempotente (dedup por detalheId);
+      - mantém job.status='processing' e renova updated_at (heartbeat —
+        impede que recover_stuck_jobs/re-dispatch considere o job morto);
+      - devolve o id_lote resolvido para o worker reutilizar nos próximos
+        chunks e habilitar a retomada por existing_detalhe_ids.
+
+    Payload: {"data": [guias...], "params": {...params do job...}}
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        return JSONResponse(status_code=404, content={"detail": f"Job {job_id} não encontrado"})
+
+    if str(job.rotina or "").lower() not in OP4_ROTINAS:
+        return JSONResponse(status_code=400, content={
+            "detail": f"Entrega parcial não suportada para rotina '{job.rotina}' (apenas OP4)."
+        })
+
+    guias_list = payload.get("data") or []
+    if not isinstance(guias_list, list):
+        guias_list = [guias_list]
+
+    from services.guias_sync_service import _resolve_op4_lote, _upsert_op4_guias
+
+    params = job.params or {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except Exception:
+            params = {}
+    # params vindos no payload têm prioridade (worker pode carregar id_lote já resolvido)
+    payload_params = payload.get("params") or {}
+    if isinstance(payload_params, dict):
+        params.update(payload_params)
+
+    id_lote = _resolve_op4_lote(db, job, params)
+    job.params = params
+    job.status = "processing"
+    job.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    counts = {"jobs_processed": 0, "inserted": 0, "updated": 0, "skipped": 0}
+    inserted, skipped = _upsert_op4_guias(db, job, guias_list, counts, id_lote)
+
+    return {"status": "partial_ok", "job_id": job_id, "id_lote": id_lote,
+            "inserted": inserted, "skipped": skipped, "received": len(guias_list)}
 
 
 class WebhookPayload(BaseModel):
@@ -1143,6 +1494,16 @@ def receive_worker_webhook(
     job = db.query(Job).filter(Job.id == payload.job_id).first()
     
     if not job:
+        # Mesma resolução de user_id de submit_job_result: nunca inventar tenant.
+        p = payload.params or {}
+        resolved_user_id = p.get("user_id")
+        if not resolved_user_id and payload.carteirinha_id:
+            cart = db.query(Carteirinha).filter(Carteirinha.id == payload.carteirinha_id).first()
+            resolved_user_id = cart.user_id if cart else None
+        if not resolved_user_id and p.get("carteirinha_id"):
+            cart = db.query(Carteirinha).filter(Carteirinha.id == p.get("carteirinha_id")).first()
+            resolved_user_id = cart.user_id if cart else None
+
         job = Job(
             id=payload.job_id,
             status=payload.status,
@@ -1152,18 +1513,27 @@ def receive_worker_webhook(
             result_data=payload.result_data,
             error_message=payload.error_message,
             attempts=payload.attempts,
-            result_consumed=False
+            result_consumed=False,
+            user_id=resolved_user_id
         )
         db.add(job)
+        should_resync = payload.status == "success"
     else:
+        # Só reabre o consumo se há resultado novo (ver submit_job_result).
+        already_consumed = job.status == "success" and job.result_consumed
+        should_resync = payload.status == "success" and (
+            (not already_consumed) or (job.result_data != payload.result_data)
+        )
+
         job.status = payload.status
         job.result_data = payload.result_data
         job.error_message = payload.error_message
         job.attempts = payload.attempts
-        job.result_consumed = False
+        if should_resync:
+            job.result_consumed = False
     db.commit()
-    
-    if payload.status == "success":
+
+    if should_resync:
         from services.guias_sync_service import sync_completed_worker_jobs_bg
         background_tasks.add_task(sync_completed_worker_jobs_bg)
             

@@ -76,9 +76,45 @@ def _enrich_params_with_convenio_config(db: Session, id_convenio: Optional[int],
             p_dict["procedimentos_habilitados"] = procs
     return p_dict
 
-def _send_jobs_to_worker(jobs_payload: List[dict]) -> int:
+def _stamp_id_integrador(jobs_payload: List[dict], db: Session) -> None:
+    """
+    Envelope do hub: carimba params['id_integrador'] em cada job a partir de
+    convenios.id_integrador. É o hub quem ENVELOPA o integrador do job; a ponte
+    (backend_worker) garante o carimbo em paths diretos e o Local_worker o
+    consome para despachar o pacote do integrador (ex.: 102-caesan).
+    """
+    cache = {}
+    for job in jobs_payload:
+        p = job.get("params")
+        if not isinstance(p, dict) or p.get("id_integrador") or not job.get("id_convenio"):
+            continue
+        conv_id = job["id_convenio"]
+        if conv_id not in cache:
+            row = db.query(Convenio.id_integrador).filter(Convenio.id_convenio == conv_id).first()
+            cache[conv_id] = row[0] if row and row[0] else None
+        if cache[conv_id]:
+            p["id_integrador"] = cache[conv_id]
+
+
+def _send_jobs_to_worker(jobs_payload: List[dict], db: Optional[Session] = None) -> int:
     if not jobs_payload:
         return 0
+
+    # Envelope: todo job sai do hub já identificado com o seu integrador
+    if db is not None:
+        _stamp_id_integrador(jobs_payload, db)
+    else:
+        try:
+            from database import SessionLocal
+            _s = SessionLocal()
+            try:
+                _stamp_id_integrador(jobs_payload, _s)
+            finally:
+                _s.close()
+        except Exception as stamp_err:
+            # A ponte (backend_worker._create_job_db) completa o carimbo se ausente
+            print(f"[job_service] Aviso: id_integrador não carimbado no hub ({stamp_err}); ponte garantirá.")
+
     headers = {
         "Authorization": f"Bearer {BPO_API_KEY}",
         "Content-Type": "application/json"
@@ -117,6 +153,9 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
         p_dict["Paciente"] = p_dict.get("Paciente") or cart.paciente or ""
         p_dict["Carteira"] = p_dict.get("Carteira") or cart.carteirinha or ""
         p_dict["TarjaMagnetica"] = p_dict.get("TarjaMagnetica") or getattr(cart, "tarja_magnetica", "") or ""
+        # Evoluir: UUID do paciente no portal — ops por paciente (ex.: op8 relatórios médicos)
+        if getattr(cart, "id_paciente", None):
+            p_dict["id_paciente"] = p_dict.get("id_paciente") or str(cart.id_paciente).strip()
         
         # Enriquecer credenciais do convênio
         target_conv_id = id_convenio or cart.id_convenio

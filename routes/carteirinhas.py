@@ -205,45 +205,54 @@ async def upload_carteirinhas(
         
         # Dedup items in the CSV itself to avoid UniqueViolation on db.add()
         # Report duplicates with different patients
+        # Chave inclui o convênio (migration 0110): mesma carteirinha em
+        # convênios distintos são itens distintos, sem relação entre si.
         unique_carteirinhas = {}
         conflict_carteirinhas = set()
-        
+
         for item in carteirinhas_data:
             cart = item["carteirinha"]
-            
-            if cart in conflict_carteirinhas:
+            conv_key = (cart, item.get("id_convenio") or 0)
+
+            if conv_key in conflict_carteirinhas:
                 continue
-                
-            if cart in unique_carteirinhas:
-                existing_item = unique_carteirinhas[cart]
+
+            if conv_key in unique_carteirinhas:
+                existing_item = unique_carteirinhas[conv_key]
                 if str(existing_item.get("id_paciente")) != str(item.get("id_paciente")):
-                    warnings.append(f"Carteirinha duplicada para pacientes distintos: {cart} (Pacientes: {existing_item['paciente']} e {item['paciente']})")
-                    conflict_carteirinhas.add(cart)
-                    del unique_carteirinhas[cart]
+                    warnings.append(f"Carteirinha duplicada para pacientes distintos: {cart} (Convênio {item.get('id_convenio')} | Pacientes: {existing_item['paciente']} e {item['paciente']})")
+                    conflict_carteirinhas.add(conv_key)
+                    del unique_carteirinhas[conv_key]
                 # else: same patient, silently dedup
             else:
-                unique_carteirinhas[cart] = item
-                
+                unique_carteirinhas[conv_key] = item
+
         carteirinhas_data = list(unique_carteirinhas.values())
 
         if not carteirinhas_data and warnings:
              raise HTTPException(status_code=400, detail="Nenhuma carteirinha válida na importação.\n" + "\n".join(warnings[:15]))
              
         # Otimização: Carrega carteirinhas existentes em memória para evitar queries N+1
+        # Chave (carteirinha, convenio) — migration 0110: mesma carteirinha em
+        # convênios distintos é item distinto; convenio NULL tratado como 0.
         existing_carts = db.query(Carteirinha).filter(
             or_(Carteirinha.user_id == user.id, Carteirinha.user_id.is_(None))
         ).all()
-        existing_map = {c.carteirinha: c for c in existing_carts}
+        existing_map = {(c.carteirinha, c.id_convenio or 0): c for c in existing_carts}
 
         count_added = 0
         count_updated = 0
+        # (carteirinha_id, codigo_beneficiario, user_id) com código novo/alterado
+        # para o backfill de guias após o commit
+        pares_backfill = []
+        novas_carts = []
         
         for item in carteirinhas_data:
             derived_convenio = item.get('id_convenio') or target_convenio
             if derived_convenio not in valid_convenios:
                 derived_convenio = target_convenio # Fallback to form/default
 
-            existing = existing_map.get(item['carteirinha'])
+            existing = existing_map.get((item['carteirinha'], derived_convenio or 0))
             
             if existing:
                 # Se não for admin, verificar posse
@@ -266,6 +275,10 @@ async def upload_carteirinhas(
                 if existing.codigo_beneficiario != item['codigo_beneficiario']:
                    existing.codigo_beneficiario = item['codigo_beneficiario']
                    changed = True
+                   if item['codigo_beneficiario'] and existing.user_id:
+                       pares_backfill.append(
+                           (existing.id, item['codigo_beneficiario'], existing.user_id)
+                       )
                 if existing.status != item['status']:
                     existing.status = item['status']
                     changed = True
@@ -288,9 +301,25 @@ async def upload_carteirinhas(
                      user_id=user.id
                  )
                  db.add(new_cart)
+                 novas_carts.append(new_cart)
                  count_added += 1
-        
+
         db.commit()
+
+        # Backfill único para todo o lote: guias importadas antes de a
+        # carteirinha ter codigo_beneficiario ganham o vínculo agora
+        pares_backfill.extend(
+            (c.id, c.codigo_beneficiario, c.user_id)
+            for c in novas_carts if c.codigo_beneficiario and c.user_id
+        )
+        if pares_backfill:
+            try:
+                from services.guias_sync_service import backfill_carteirinha_em_guias
+                res = backfill_carteirinha_em_guias(db, pares_backfill)
+                if res.get("guias"):
+                    print(f"[BACKFILL] Upload de carteirinhas: {res['guias']} guia(s) re-vinculada(s)")
+            except Exception as e:
+                print(f"Erro no backfill de guias do upload: {e}")
         
         # Invalidação do cache
         try:
@@ -488,11 +517,16 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
     validate_carteirinha_format(item['carteirinha'])
     
     # Check if already exists for this user or is unowned (legacy)
-    existing = db.query(Carteirinha).filter(
+    # Migration 0110: quando o convênio é informado, a duplicidade é avaliada
+    # dentro do mesmo convênio — mesma carteirinha em convênio distinto é item novo.
+    existing_query = db.query(Carteirinha).filter(
         Carteirinha.carteirinha == item['carteirinha']
     ).filter(
         or_(Carteirinha.user_id == user.id, Carteirinha.user_id.is_(None))
-    ).first()
+    )
+    if item.get('id_convenio'):
+        existing_query = existing_query.filter(Carteirinha.id_convenio == item['id_convenio'])
+    existing = existing_query.first()
     if existing:
         if not user.is_admin:
             if existing.user_id is None:
@@ -504,6 +538,14 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
                 if 'status' in item: existing.status = item['status']
                 if item.get('id_convenio'): existing.id_convenio = item['id_convenio']
                 db.commit()
+                if existing.codigo_beneficiario:
+                    try:
+                        from services.guias_sync_service import backfill_carteirinha_em_guias
+                        backfill_carteirinha_em_guias(
+                            db, [(existing.id, existing.codigo_beneficiario, existing.user_id)]
+                        )
+                    except Exception as e:
+                        print(f"Erro no backfill de guias da carteirinha {existing.id}: {e}")
                 try:
                     from cache import cache
                     cache.invalidate_tenant(user.id)
@@ -530,13 +572,23 @@ def create_carteirinha(item: dict = Body(...), db: Session = Depends(get_db), us
     
     db.add(new_cart)
     db.commit()
+
+    if new_cart.codigo_beneficiario:
+        try:
+            from services.guias_sync_service import backfill_carteirinha_em_guias
+            backfill_carteirinha_em_guias(
+                db, [(new_cart.id, new_cart.codigo_beneficiario, new_cart.user_id)]
+            )
+        except Exception as e:
+            print(f"Erro no backfill de guias da carteirinha {new_cart.id}: {e}")
+
     try:
         from cache import cache
         cache.invalidate_tenant(user.id)
     except Exception as e:
         print(f"Error invalidating cache: {e}")
     db.refresh(new_cart)
-    
+
     return new_cart
 
 @router.put("/{carteirinha_id}")
@@ -566,8 +618,22 @@ def update_carteirinha(carteirinha_id: int, item: dict = Body(...), db: Session 
         cart.id_convenio = item['id_convenio']
     if 'status' in item:
         cart.status = item['status']
-        
+
     db.commit()
+
+    # Cadastrar/corrigir o codigo_beneficiario re-vincula guias importadas
+    # antes do código existir (carteirinha_id NULL em base_guias)
+    if 'codigo_beneficiario' in item and cart.codigo_beneficiario and cart.user_id:
+        try:
+            from services.guias_sync_service import backfill_carteirinha_em_guias
+            res = backfill_carteirinha_em_guias(
+                db, [(cart.id, cart.codigo_beneficiario, cart.user_id)]
+            )
+            if res.get("guias"):
+                print(f"[BACKFILL] Carteirinha {cart.id}: {res['guias']} guia(s) re-vinculada(s)")
+        except Exception as e:
+            print(f"Erro no backfill de guias da carteirinha {cart.id}: {e}")
+
     try:
         from cache import cache
         cache.invalidate_tenant(user.id)

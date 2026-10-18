@@ -9,6 +9,7 @@ from typing import Optional
 from pydantic import BaseModel
 from datetime import date, datetime
 from services import storage_service
+from media_utils import infer_media_type, inline_filename
 import uuid
 import json
 import os
@@ -167,8 +168,8 @@ def view_document_content(
                 content = f.read()
             return Response(
                 content=content,
-                media_type="application/pdf",
-                headers={"Content-Disposition": f"inline; filename=doc_{id}.pdf"}
+                media_type=infer_media_type(url),
+                headers={"Content-Disposition": f"inline; filename={inline_filename('doc', id, url)}"}
             )
 
     # 2. Portal Evoluir (sistemaevoluir.com.br) - Baixa autenticado
@@ -180,8 +181,8 @@ def view_document_content(
             if r.status_code == 200:
                 return Response(
                     content=r.content,
-                    media_type="application/pdf",
-                    headers={"Content-Disposition": f"inline; filename=doc_{id}.pdf"}
+                    media_type=infer_media_type(url, upstream_content_type=r.headers.get("Content-Type")),
+                    headers={"Content-Disposition": f"inline; filename={inline_filename('doc', id, url)}"}
                 )
             else:
                 raise HTTPException(status_code=502, detail=f"Erro ao obter PDF do portal Evoluir ({r.status_code}).")
@@ -195,8 +196,8 @@ def view_document_content(
             content_type = r.headers.get("Content-Type", "application/pdf")
             return Response(
                 content=r.content,
-                media_type=content_type,
-                headers={"Content-Disposition": f"inline; filename=doc_{id}.pdf"}
+                media_type=infer_media_type(url, upstream_content_type=content_type),
+                headers={"Content-Disposition": f"inline; filename={inline_filename('doc', id, url)}"}
             )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Erro ao buscar arquivo externo: {str(e)}")

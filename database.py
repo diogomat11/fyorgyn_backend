@@ -38,7 +38,12 @@ engine = create_engine(
         "keepalives": 1,
         "keepalives_idle": 30,
         "keepalives_interval": 10,
-        "keepalives_count": 5
+        "keepalives_count": 5,
+        # Lock-wait no índice único de base_guias derrubava threads presas por
+        # tempo indeterminado e esgotava o threadpool (503 de 2026-09-02): com
+        # lock_timeout o runner falha rápido e o job vai para quarentena em
+        # segundos em vez de congelar o backend.
+        "options": "-c lock_timeout=5000",
     }
 )
 

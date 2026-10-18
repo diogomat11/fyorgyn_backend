@@ -10,7 +10,8 @@ from datetime import datetime, timezone, timedelta, date
 
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy import text
+from sqlalchemy import text, func
+from sqlalchemy.exc import IntegrityError
 from models import BaseGuia, Log
 
 
@@ -318,6 +319,105 @@ def is_authorized_status(status_val: str, id_convenio: int) -> bool:
     return "autorizad" in status_lower
 
 
+def _apply_guia_update(existing: BaseGuia, record: dict, user_id: int) -> None:
+    """Aplica os campos do record do worker sobre uma linha já existente de base_guias."""
+    for key_attr in ["senha", "status_guia", "data_autorizacao", "data_solicitacao",
+                     "validade", "qtde_solicitada", "sessoes_autorizadas",
+                     "nome_terapia", "guia_prestador", "codigo_beneficiario",
+                     "cod_prestador", "timestamp_captura"]:
+        if record.get(key_attr) is not None:
+            setattr(existing, key_attr, record[key_attr])
+    if record.get("carteirinha_id") is not None:
+        existing.carteirinha_id = record["carteirinha_id"]
+    if user_id:
+        # Apenas adota/reafirma o tenant quando há um user_id real: job sem
+        # user_id resolvido não pode limpar nem roubar a linha de outro tenant.
+        existing.user_id = user_id
+    existing.updated_at = datetime.now(timezone.utc)
+
+
+def _reselect_guia_por_chave_indice(db: Session, record: dict):
+    """
+    Re-busca em base_guias pela chave EXATA do índice único uq_guia_conv_ter_cart
+    (guia, COALESCE(id_convenio,0), COALESCE(codigo_terapia,''), COALESCE(carteirinha_id,0)),
+    sem filtro de user_id. Usado no fallback de IntegrityError: outro runner/writer
+    gravou a mesma chave entre o pré-check e o flush.
+    """
+    norm_ter = str(record.get("codigo_terapia")).strip() if record.get("codigo_terapia") else ""
+    return db.query(BaseGuia).filter(
+        BaseGuia.guia == record["guia"],
+        func.coalesce(BaseGuia.id_convenio, 0) == (record.get("id_convenio") or 0),
+        func.coalesce(BaseGuia.codigo_terapia, '') == norm_ter,
+        func.coalesce(BaseGuia.carteirinha_id, 0) == (record.get("carteirinha_id") or 0),
+    ).first()
+
+
+def backfill_carteirinha_em_guias(db: Session, pares: list) -> dict:
+    """
+    Re-vincula guias/solicitações órfãs quando o codigo_beneficiario de uma
+    carteirinha é cadastrado ou corrigido.
+
+    Guias importadas antes de a carteirinha ter o código ficam com
+    carteirinha_id NULL: aparecem sem nome do paciente na aba Guias e somem
+    no filtro por paciente, até que uma reimportação cubra aquela guia. Ao
+    criar/editar o código na carteirinha, este backfill resolve
+    retroativamente as linhas do mesmo tenant.
+
+    pares: lista de (carteirinha_id, codigo_beneficiario, user_id).
+    Nunca lança; falhas são apenas logadas (o cadastro da carteirinha não
+    pode falhar por causa do backfill).
+    """
+    counts = {"guias": 0, "solicitacoes": 0}
+    try:
+        limpos = []
+        for cid, cod, uid in pares or []:
+            cod_str = str(cod).strip() if cod else ""
+            if cod_str and cid and uid:
+                limpos.append((int(cid), cod_str, int(uid)))
+        if not limpos:
+            return counts
+
+        values_sql = ", ".join(
+            f"(CAST(:c{i} AS int), CAST(:d{i} AS text), CAST(:u{i} AS int))"
+            for i in range(len(limpos))
+        )
+        bind = {}
+        for i, (cid, cod, uid) in enumerate(limpos):
+            bind[f"c{i}"] = cid
+            bind[f"d{i}"] = cod
+            bind[f"u{i}"] = uid
+
+        res = db.execute(text(f"""
+            UPDATE public.base_guias AS g
+               SET carteirinha_id = v.cid, updated_at = now()
+              FROM (VALUES {values_sql}) AS v(cid, cod, uid)
+             WHERE g.carteirinha_id IS NULL
+               AND g.user_id = v.uid
+               AND g.codigo_beneficiario = v.cod
+        """), bind)
+        counts["guias"] = res.rowcount or 0
+
+        # solicitacoes não tem codigo_beneficiario: vincula pelas guias que
+        # já apontam para a carteirinha (base_guia_id -> base_guias)
+        res2 = db.execute(text(f"""
+            UPDATE public.solicitacoes AS s
+               SET carteirinha_id = v.cid, updated_at = now()
+              FROM public.base_guias AS b, (VALUES {values_sql}) AS v(cid, cod, uid)
+             WHERE s.base_guia_id = b.id
+               AND b.carteirinha_id = v.cid
+               AND s.carteirinha_id IS NULL
+        """), bind)
+        counts["solicitacoes"] = res2.rowcount or 0
+        db.commit()
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        print(f"[BACKFILL_CARTEIRINHA] Erro: {e}")
+    return counts
+
+
 
 def bulk_upsert_guias_from_json(
     db: Session,
@@ -395,6 +495,7 @@ def bulk_upsert_guias_from_json(
             "carteirinha_id": current_cid,
             "guia": guia_num,
             "guia_prestador": item.get("guia_prestador"),
+            "historico_observacoes": item.get("historico_observacoes"),
             "codigo_terapia": codigo_terapia_val,
             "nome_terapia": item.get("nome_terapia"),
             "senha": str(item.get("senha", "")).strip() if item.get("senha") else None,
@@ -426,6 +527,9 @@ def bulk_upsert_guias_from_json(
     
     for r in records:
         if is_authorized_status(r["status_guia"], id_convenio):
+            # historico_observacoes existe apenas em solicitacoes; a guia
+            # autorizada sai da fila e não persiste a coluna (BaseGuia não a tem)
+            r.pop("historico_observacoes", None)
             authorized_records.append(r)
         else:
             non_authorized_records.append(r)
@@ -437,13 +541,17 @@ def bulk_upsert_guias_from_json(
     if authorized_records:
         guia_list = list({r["guia"] for r in authorized_records})
         convenio_list = list({r["id_convenio"] for r in authorized_records})
-        
+
+        # Pré-check SEM filtro de user_id: o índice único uq_guia_conv_ter_cart é
+        # global (não inclui user_id). Se filtrar por user, uma linha de outro
+        # tenant com a mesma guia não é vista e o INSERT abaixo viola o índice
+        # (causa-raiz das quarentenas de 2026-09). A guarda de tenant no loop
+        # (existing.user_id != user_id -> skip) decide o que fazer com cada linha.
         existing_guias = db.query(BaseGuia).filter(
-            BaseGuia.user_id == user_id,
             BaseGuia.guia.in_(guia_list),
             BaseGuia.id_convenio.in_(convenio_list)
         ).all()
-        
+
         existing_map = {}
         for eg in existing_guias:
             norm_guia = str(eg.guia).strip()
@@ -452,40 +560,56 @@ def bulk_upsert_guias_from_json(
             key = (norm_guia, norm_conv, norm_ter)
             if key not in existing_map or (eg.carteirinha_id and not existing_map[key].carteirinha_id):
                 existing_map[key] = eg
-                
+
         for record in authorized_records:
             norm_guia = record["guia"]
             norm_conv = record["id_convenio"]
             norm_ter = str(record["codigo_terapia"]).strip() if record["codigo_terapia"] else ""
-            
+
             key = (norm_guia, norm_conv, norm_ter)
             existing = existing_map.get(key)
-            
+
             if existing:
                 if existing.user_id and existing.user_id != user_id:
                     skipped += 1
                     continue
-                
+
                 # Update
-                for key_attr in ["senha", "status_guia", "data_autorizacao", "data_solicitacao",
-                                 "validade", "qtde_solicitada", "sessoes_autorizadas",
-                                 "nome_terapia", "guia_prestador", "codigo_beneficiario",
-                                 "cod_prestador", "timestamp_captura"]:
-                    if record.get(key_attr) is not None:
-                        setattr(existing, key_attr, record[key_attr])
-                if record.get("carteirinha_id") is not None:
-                    existing.carteirinha_id = record["carteirinha_id"]
-                existing.user_id = user_id
-                existing.updated_at = datetime.now(timezone.utc)
+                _apply_guia_update(existing, record, user_id)
                 count_updated += 1
             else:
                 new_guia = BaseGuia(**record)
                 new_guia.created_at = datetime.now(timezone.utc)
                 new_guia.updated_at = datetime.now(timezone.utc)
+                # Savepoint ANTES do add: begin_nested() tira um snapshot da sessão
+                # com flush implícito dos objetos pendentes — se o INSERT entrar no
+                # snapshot, ele roda FORA do SAVEPOINT e não pode ser revertido.
+                nested = db.begin_nested()
                 db.add(new_guia)
-                db.flush()
-                existing_map[key] = new_guia
-                count_inserted += 1
+                try:
+                    db.flush()
+                    nested.commit()
+                    existing_map[key] = new_guia
+                    count_inserted += 1
+                except IntegrityError:
+                    # Corrida: outro runner/writer gravou a mesma chave entre o
+                    # pré-check e o flush. Desfaz só este INSERT (savepoint), adota
+                    # a linha existente e segue pelo caminho de update — o job não
+                    # pode mais morrer por UniqueViolation (incidente job #10791).
+                    # (o rollback do savepoint já expurga new_guia da sessão)
+                    nested.rollback()
+                    raced = _reselect_guia_por_chave_indice(db, record)
+                    if raced:
+                        if raced.user_id and raced.user_id != user_id:
+                            skipped += 1
+                        else:
+                            _apply_guia_update(raced, record, user_id)
+                            existing_map[key] = raced
+                            count_updated += 1
+                    else:
+                        # Constraint diversa (não é a chave do índice): reprovar
+                        # o registro sem derrubar o job inteiro.
+                        skipped += 1
                 
             # Atualizar status em solicitações caso exista e vincular base_guia_id
             from models import Solicitacao
@@ -505,6 +629,34 @@ def bulk_upsert_guias_from_json(
                     Solicitacao.codigo_terapia == record["codigo_terapia"],
                     Solicitacao.user_id == user_id
                 ).first()
+
+            if not sol:
+                # Fallback tolerante (guia 25939699): o portal pode reportar
+                # codigo_terapia/carteirinha diferentes entre a listagem de
+                # solicitações e a de guias autorizadas; sem este fallback a
+                # solicitação ficava órfã para sempre ('Aguardando...' na aba
+                # Solicitações com a guia autorizada na aba Guias). Só adota
+                # quando existe exatamente UMA candidata pendente para a guia
+                # cujo procedimento NÃO está no mesmo lote como pendente.
+                terapias_pendentes_no_lote = {
+                    (r["guia"], r["id_convenio"],
+                     str(r["codigo_terapia"]).strip() if r["codigo_terapia"] else "")
+                    for r in non_authorized_records
+                }
+                candidatas = db.query(Solicitacao).filter(
+                    Solicitacao.guia == norm_guia,
+                    Solicitacao.id_convenio == norm_conv,
+                    Solicitacao.user_id == user_id,
+                    Solicitacao.base_guia_id.is_(None),
+                    ~Solicitacao.status_solicitacao.ilike('%autorizad%')
+                ).all()
+                candidatas = [
+                    c for c in candidatas
+                    if (norm_guia, norm_conv,
+                        str(c.codigo_terapia).strip() if c.codigo_terapia else "")
+                    not in terapias_pendentes_no_lote
+                ]
+                sol = candidatas[0] if len(candidatas) == 1 else None
                 
             if sol:
                 conflict_sol = db.query(Solicitacao).filter(
@@ -592,7 +744,8 @@ def bulk_upsert_guias_from_json(
                 if conflict_sol:
                     conflict_sol.job_id = job_id or conflict_sol.job_id
                     for key_attr in ["senha", "validade", "qtde_solicitada", "sessoes_autorizadas",
-                                     "nome_terapia", "codigo_beneficiario", "data_solicitacao", "data_autorizacao"]:
+                                     "nome_terapia", "codigo_beneficiario", "data_solicitacao", "data_autorizacao",
+                                     "guia_prestador", "historico_observacoes"]:
                         if record.get(key_attr) is not None:
                             setattr(conflict_sol, key_attr, record[key_attr])
                     conflict_sol.status_solicitacao = record["status_guia"]
@@ -602,7 +755,8 @@ def bulk_upsert_guias_from_json(
                     # Update
                     existing_sol.guia = record["guia"]
                     for key_attr in ["senha", "validade", "qtde_solicitada", "sessoes_autorizadas",
-                                     "nome_terapia", "codigo_beneficiario", "data_solicitacao", "data_autorizacao"]:
+                                     "nome_terapia", "codigo_beneficiario", "data_solicitacao", "data_autorizacao",
+                                     "guia_prestador", "historico_observacoes"]:
                         if record.get(key_attr) is not None:
                             setattr(existing_sol, key_attr, record[key_attr])
                     existing_sol.status_solicitacao = record["status_guia"]
@@ -611,12 +765,16 @@ def bulk_upsert_guias_from_json(
                     existing_sol.user_id = user_id
                     existing_sol.updated_at = datetime.now(timezone.utc)
             else:
-                # Criar nova solicitação
+                # Criar nova solicitação (savepoint antes do add, ver bloco de
+                # base_guias acima: begin_nested() daria flush implícito).
+                nested_sol = db.begin_nested()
                 new_sol = Solicitacao(
                     user_id=user_id,
                     carteirinha_id=record["carteirinha_id"],
                     id_convenio=record["id_convenio"],
                     guia=record["guia"],
+                    guia_prestador=record.get("guia_prestador"),
+                    historico_observacoes=record.get("historico_observacoes"),
                     codigo_terapia=record["codigo_terapia"],
                     nome_terapia=record["nome_terapia"],
                     qtde_solicitada=record["qtde_solicitada"],
@@ -629,17 +787,51 @@ def bulk_upsert_guias_from_json(
                     job_id=job_id
                 )
                 db.add(new_sol)
-                db.flush()
-                existing_sol_map[key] = new_sol
+                try:
+                    db.flush()
+                    nested_sol.commit()
+                    existing_sol_map[key] = new_sol
+                except IntegrityError:
+                    # Mesma corrida protegida em base_guias: adotar a linha
+                    # existente e atualizar em vez de derrubar o job.
+                    # (o rollback do savepoint já expurga new_sol da sessão)
+                    nested_sol.rollback()
+                    raced_sol = db.query(Solicitacao).filter(
+                        Solicitacao.guia == record["guia"],
+                        Solicitacao.id_convenio == record["id_convenio"],
+                        Solicitacao.codigo_terapia == record["codigo_terapia"],
+                        Solicitacao.carteirinha_id == record["carteirinha_id"],
+                        Solicitacao.user_id == user_id
+                    ).first()
+                    if raced_sol:
+                        for key_attr in ["senha", "validade", "qtde_solicitada", "sessoes_autorizadas",
+                                         "nome_terapia", "codigo_beneficiario", "data_solicitacao", "data_autorizacao",
+                                         "guia_prestador", "historico_observacoes"]:
+                            if record.get(key_attr) is not None:
+                                setattr(raced_sol, key_attr, record[key_attr])
+                        raced_sol.status_solicitacao = record["status_guia"]
+                        raced_sol.updated_at = datetime.now(timezone.utc)
+                        existing_sol_map[key] = raced_sol
+                    else:
+                        skipped += 1
                 
-            # Remover de base_guias se existir lá por engano
+            # Remover de base_guias se existir lá por engano — EXCETO se o mesmo
+            # lote traz a guia como autorizada: o portal lista uma linha por
+            # procedimento e a mesma guia pode conviver com status distintos;
+            # a linha irmã pendente não pode apagar a linha autorizada.
             existing_base = db.query(BaseGuia).filter(
                 BaseGuia.guia == norm_guia,
                 BaseGuia.id_convenio == norm_conv,
                 BaseGuia.codigo_terapia == record["codigo_terapia"],
                 BaseGuia.user_id == user_id
             ).first()
-            if existing_base:
+            autorizada_no_lote = any(
+                r["guia"] == norm_guia
+                and r["id_convenio"] == norm_conv
+                and (str(r["codigo_terapia"]).strip() if r["codigo_terapia"] else "") == norm_ter
+                for r in authorized_records
+            )
+            if existing_base and not autorizada_no_lote:
                 db.delete(existing_base)
                 
     db.commit()
@@ -666,13 +858,14 @@ def bulk_insert_carteirinhas(
 ) -> dict:
     """
     Bulk insert de carteirinhas ignorando duplicatas.
-    Usa INSERT ... ON CONFLICT DO NOTHING na constraint (carteirinha, user_id).
-    
+    Usa INSERT ... ON CONFLICT DO NOTHING no índice único
+    (carteirinha, COALESCE(id_convenio,0), user_id) — migration 0110.
+
     Args:
         db: Sessão SQLAlchemy
         records: Lista de dicts com dados das carteirinhas
         user_id: ID do usuário (tenant)
-    
+
     Returns:
         dict com contadores
     """
@@ -700,10 +893,14 @@ def bulk_insert_carteirinhas(
     if not normalized:
         return {"total": 0, "inserted": 0, "skipped": 0}
     
-    # INSERT ON CONFLICT DO NOTHING
+    # INSERT ON CONFLICT DO NOTHING — inferência pelo índice expressão da 0110
     stmt = pg_insert(Carteirinha).values(normalized)
     stmt = stmt.on_conflict_do_nothing(
-        constraint="uq_carteirinha_user_id"
+        index_elements=[
+            text("carteirinha"),
+            text("COALESCE(id_convenio, 0)"),
+            text("user_id"),
+        ]
     )
     
     result = db.execute(stmt)
@@ -1121,6 +1318,90 @@ def _consume_evoluir(db: Session, job, synced_counts: dict) -> None:
                         )
                         db.add(new_prof)
                         synced_counts["inserted"] += 1
+        elif "op8" in rotina or "importrelatoriosmedicos" in rotina:
+            # OP8: relatórios médicos do portal Evoluir -> public.relatorios_medicos
+            # (listados no modal /docs/relatorios-medicos e enviáveis ao Gemini).
+            import unicodedata as _ud
+            from models import RelatorioMedico, Carteirinha as _Cart
+
+            def _norm_rm_nome(nome):
+                if not nome:
+                    return ""
+                nome = "".join(c for c in _ud.normalize("NFD", str(nome).upper())
+                               if _ud.category(c) != "Mn")
+                return " ".join(nome.split())
+
+            # Em modo "todos" a linha do portal não traz id_paciente: resolve pelo
+            # nome normalizado contra as carteirinhas do tenant (id_paciente Evoluir).
+            _pac_by_nome = None
+
+            def _resolver_id_paciente(nome, fallback_id):
+                if fallback_id:
+                    return fallback_id
+                nonlocal _pac_by_nome
+                if _pac_by_nome is None:
+                    _pac_by_nome = {}
+                    for cart in db.query(_Cart).filter(
+                        _Cart.id_paciente.isnot(None),
+                        _Cart.user_id == job.user_id
+                    ).all():
+                        _pac_by_nome.setdefault(_norm_rm_nome(cart.paciente), cart.id_paciente)
+                return _pac_by_nome.get(_norm_rm_nome(nome))
+
+            def _parse_rm_date(val):
+                if not val:
+                    return None
+                try:
+                    return datetime.strptime(str(val).strip()[:10], "%Y-%m-%d").date()
+                except Exception:
+                    return None
+
+            for r in results_list:
+                id_rel = str(r.get("id_relatorio", "")).strip()
+                if not id_rel:
+                    continue
+
+                id_pac_val = _resolver_id_paciente(r.get("nome_paciente"), r.get("id_paciente"))
+                if not id_pac_val:
+                    synced_counts.setdefault("rm_sem_paciente", 0)
+                    synced_counts["rm_sem_paciente"] += 1
+                    continue
+
+                data_rel = _parse_rm_date(r.get("data"))
+                data_val = _parse_rm_date(r.get("data_validade"))
+                obs_val = f"Plano: {r['plano']}" if r.get("plano") else None
+
+                existing_rm = db.query(RelatorioMedico).filter(
+                    RelatorioMedico.user_id == job.user_id,
+                    RelatorioMedico.id_paciente == id_pac_val,
+                    RelatorioMedico.id_relatorio == id_rel
+                ).first()
+
+                if not existing_rm:
+                    db.add(RelatorioMedico(
+                        user_id=job.user_id,
+                        id_paciente=id_pac_val,
+                        nome_paciente=r.get("nome_paciente"),
+                        id_relatorio=id_rel,
+                        url_arquivo=r.get("url_arquivo"),
+                        data_relatorio=data_rel,
+                        data_validade=data_val,
+                        nome_medico=r.get("nome_medico"),
+                        observacoes=obs_val
+                    ))
+                    synced_counts["inserted"] += 1
+                else:
+                    existing_rm.nome_paciente = r.get("nome_paciente") or existing_rm.nome_paciente
+                    existing_rm.url_arquivo = r.get("url_arquivo") or existing_rm.url_arquivo
+                    existing_rm.nome_medico = r.get("nome_medico") or existing_rm.nome_medico
+                    if data_rel:
+                        existing_rm.data_relatorio = data_rel
+                    if data_val:
+                        existing_rm.data_validade = data_val
+                    if obs_val and not existing_rm.observacoes:
+                        existing_rm.observacoes = obs_val
+                    synced_counts["updated"] += 1
+
         elif "op7" in rotina or "consultadocs" in rotina:
             # OP_consultaDocs gera arquivo Excel e insere excel_url no result_data do Job.
             pass
@@ -1249,17 +1530,18 @@ def _consume_aba_clmf(db: Session, job, synced_counts: dict) -> None:
 
 
 def _quarantine_job(db: Session, job_id: int, motivo: str) -> None:
-    """Marca como consumido um job cujo processamento falhou (quarentena).
+    """Registra em log de ERROR um job cujo processamento falhou (quarentena).
 
-    Sem isso, um job com problema prende o lote: a exceção rolava back as marcas
-    de consumo de todos e o loop de sync re-transportava o lote inteiro a cada
-    ciclo (causa-raiz do consumo de egress de 2026-08). O result_data é
-    preservado no banco para análise posterior."""
+    Desde o claim atômico (_claim_job_for_sync), o job já chega marcado como
+    consumido ANTES do processamento — o job com problema não prende o lote e
+    não é reprocessado pelo loop (sem isso, a exceção rolava back as marcas de
+    consumo de todos e o loop re-transportava o lote inteiro a cada ciclo,
+    causa-raiz do consumo de egress de 2026-08). O result_data é preservado no
+    banco para análise/reprocesso manual."""
     from models import Job, Log
     try:
         job = db.query(Job).filter(Job.id == job_id).first()
-        if job and not job.result_consumed:
-            job.result_consumed = True
+        if job:
             db.add(Log(
                 job_id=job.id,
                 user_id=job.user_id,
@@ -1273,10 +1555,30 @@ def _quarantine_job(db: Session, job_id: int, motivo: str) -> None:
         print(f"[SYNC] Falha ao quarentenar job {job_id}: {e}")
 
 
+# Rotinas cujo resultado NÃO é importação de guias: impressão (OP12 IPASGO,
+# OP5 demais convênios). O consumidor genérico tratava o payload de impressão
+# como import e criava linhas fantasma em base_guias — sem terapia, prestador
+# nem datas (caso guia 26260116 / job 19073).
+ROTINAS_NAO_IMPORTAVEIS = {"5", "12", "op5_imprimir_guia", "op12_imprimir_guia"}
+
+
+def _rotina_nao_importavel(rotina) -> bool:
+    r = str(rotina or "").lower().strip()
+    return r in ROTINAS_NAO_IMPORTAVEIS or r.startswith(("op5_", "op12_"))
+
+
 def _process_single_job(db: Session, job, synced_counts: dict) -> None:
     """Dispatch de consumo de um ÚNICO job (extraído 1:1 do antigo loop único)."""
     if not job.result_data:
         job.result_consumed = True
+        return
+
+    # Impressão de guia: o payload descreve a guia impressa, não é import —
+    # consumir aqui criaria linhas duplicadas/fantasma em base_guias.
+    if _rotina_nao_importavel(job.rotina):
+        print(f"[SYNC] Job {job.id} rotina '{job.rotina}' (impressão): resultado ignorado na importação de guias.")
+        job.result_consumed = True
+        synced_counts["skipped"] += 1
         return
 
     # Se for rotina OP4 (Exames Finalizados) da Unimed Goiânia / Geral
@@ -1698,6 +2000,33 @@ def _process_single_job(db: Session, job, synced_counts: dict) -> None:
 SYNC_BATCH_LIMIT = int(os.getenv("SYNC_BATCH_LIMIT", "100"))
 
 
+def _claim_job_for_sync(db: Session, job_id: int) -> bool:
+    """Claim atômico de um job para consumo: marca result_consumed ANTES de processar.
+
+    Vários runners selecionam a mesma fila sem lock de linha (loop de 15s,
+    BackgroundTask de cada webhook recebido, sync manual, outra instância
+    durante deploy): o UPDATE condicional garante que só UM conquista cada job
+    — era a causa-raiz das quarentenas por UniqueViolation (job #10791: dois
+    runners, dois logs de quarentena com 33ms de diferença) e do esgotamento
+    do threadpool (503). Advisory locks de sessão não são confiáveis no pooler
+    Supabase em modo transação (porta 6543); o claim via UPDATE é o mecanismo
+    seguro neste ambiente.
+
+    Se o processamento falhar após o claim, o job vai para quarentena
+    (semântica terminal preservada) e o result_data continua no banco.
+    """
+    from models import Job
+    from sqlalchemy import update
+    rowcount = db.execute(
+        update(Job)
+        .where(Job.id == job_id, Job.result_consumed == False)  # noqa: E712
+        .values(result_consumed=True)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    db.commit()
+    return bool(rowcount)
+
+
 def sync_completed_worker_jobs(db: Session) -> dict:
     """
     Consome resultados de jobs concluídos com sucesso e sincroniza com a base de guias.
@@ -1706,6 +2035,10 @@ def sync_completed_worker_jobs(db: Session) -> dict:
     params/result_data), ordena por updated_at e limita por ciclo; cada job é
     carregado e processado isoladamente com commit incremental e quarentena em
     caso de erro — a falha de um job nunca mais prende o lote inteiro.
+
+    Exclusão mútua (2026-09-02): cada job é reivindicado atomicamente via
+    _claim_job_for_sync antes do processamento; runners concorrentes
+    pulam jobs já conquistados.
     """
     from models import Job
 
@@ -1720,16 +2053,17 @@ def sync_completed_worker_jobs(db: Session) -> dict:
     users_to_invalidate = set()
 
     for row in rows:
+        if not _claim_job_for_sync(db, row.id):
+            # Outro runner (webhook bg / loop / instância) conquistou este job.
+            continue
         job = db.query(Job).filter(Job.id == row.id).first()
         if not job:
             continue
         try:
             if not job.result_data:
-                job.result_consumed = True
                 db.commit()
             else:
                 _process_single_job(db, job, synced_counts)
-                job.result_consumed = True
                 db.commit()
             synced_counts["jobs_processed"] += 1
             if job.user_id:
@@ -2262,71 +2596,57 @@ def _upsert_agendamento(db: Session, item: dict, id_carteirinha: int | None, car
     synced_counts["updated"] += 1
 
 
-def _sync_goiania_op4(db: Session, job, synced_counts: dict = None) -> tuple:
+def _resolve_op4_lote(db: Session, job, params: dict) -> int:
     """
-    Processa os resultados do job OP4 da Unimed Goiânia (Exames Finalizados):
-    1. Garante a existência do LoteConvenio correspondente (cria um se não houver id_lote no job).
-    2. Extrai cada guia e série do JSON de resposta.
-    3. Normaliza carteirinha (remove partes com nome do beneficiário).
-    4. Insere em faturamento_lotes com detalheId = int(cd_guia + str(seq)) (idempotente/sem duplicatas).
+    Obtém (ou cria) o LoteConvenio do job OP4 e devolve o id_lote.
+    Reescrito de _sync_goiania_op4 para ser reutilizado pela entrega
+    parcial em chunks (POST /api/jobs/{id}/result/partial).
     """
-    from models import LoteConvenio, FaturamentoLote
+    from models import LoteConvenio
+
+    id_lote = params.get("id_lote") or params.get("id_lote_interno")
+    if id_lote:
+        return id_lote
+
+    cod_prestador = str(params.get("cod_prestador") or params.get("codigoPrestador") or "2209525").strip()
+    data_ini_str = str(params.get("data_ini") or "").strip()
+    data_fim_str = str(params.get("data_fim") or "").strip()
+
+    dt_ini = _parse_date(data_ini_str)
+    dt_fim = _parse_date(data_fim_str)
+
+    lote = db.query(LoteConvenio).filter(
+        LoteConvenio.id_convenio == (job.id_convenio or 3),
+        LoteConvenio.user_id == job.user_id,
+        LoteConvenio.cod_prestador == cod_prestador,
+        LoteConvenio.data_fim == dt_fim
+    ).first()
+
+    if not lote:
+        lote = LoteConvenio(
+            id_convenio=job.id_convenio or 3,
+            user_id=job.user_id,
+            cod_prestador=cod_prestador,
+            status="Aberto",
+            data_inicio=dt_ini,
+            data_fim=dt_fim,
+        )
+        db.add(lote)
+        db.flush()
+
+    params["id_lote"] = lote.id_lote
+    return lote.id_lote
+
+
+def _upsert_op4_guias(db: Session, job, guias_list: list, synced_counts: dict, id_lote: int) -> tuple:
+    """
+    Insere (idempotente, dedup por detalheId = int(cd_guia + seq)) as guias
+    OP4 em faturamento_lotes. Extraído de _sync_goiania_op4 para reuso na
+    entrega parcial em chunks — chunks repetidos não duplicam itens.
+    """
+    from models import FaturamentoLote
     from sqlalchemy.exc import IntegrityError
 
-    if synced_counts is None:
-        synced_counts = {"jobs_processed": 0, "inserted": 0, "updated": 0, "skipped": 0}
-
-    params = job.params or {}
-    if isinstance(params, str):
-        try:
-            params = json.loads(params)
-        except Exception:
-            params = {}
-
-    result_data = job.result_data or {}
-    guias_list = []
-    if isinstance(result_data, dict):
-        guias_list = result_data.get("data", [])
-    elif isinstance(result_data, list):
-        guias_list = result_data
-
-    if not guias_list:
-        return (0, 0)
-
-    # 1. Obter ou criar LoteConvenio
-    id_lote = params.get("id_lote") or params.get("id_lote_interno")
-    if not id_lote:
-        cod_prestador = str(params.get("cod_prestador") or params.get("codigoPrestador") or "2209525").strip()
-        data_ini_str = str(params.get("data_ini") or "").strip()
-        data_fim_str = str(params.get("data_fim") or "").strip()
-
-        dt_ini = _parse_date(data_ini_str)
-        dt_fim = _parse_date(data_fim_str)
-
-        lote = db.query(LoteConvenio).filter(
-            LoteConvenio.id_convenio == (job.id_convenio or 3),
-            LoteConvenio.user_id == job.user_id,
-            LoteConvenio.cod_prestador == cod_prestador,
-            LoteConvenio.data_fim == dt_fim
-        ).first()
-
-        if not lote:
-            lote = LoteConvenio(
-                id_convenio=job.id_convenio or 3,
-                user_id=job.user_id,
-                cod_prestador=cod_prestador,
-                status="Aberto",
-                data_inicio=dt_ini,
-                data_fim=dt_fim,
-            )
-            db.add(lote)
-            db.flush()
-
-        id_lote = lote.id_lote
-        params["id_lote"] = id_lote
-        job.params = params
-
-    # 2. Inserir itens em faturamento_lotes com deduplicação rigorosa
     seen_in_payload = set()
 
     for guia in guias_list:
@@ -2427,6 +2747,42 @@ def _sync_goiania_op4(db: Session, job, synced_counts: dict = None) -> tuple:
                 db.rollback()
 
     return (synced_counts["inserted"], synced_counts["skipped"])
+
+
+def _sync_goiania_op4(db: Session, job, synced_counts: dict = None) -> tuple:
+    """
+    Processa os resultados do job OP4 da Unimed Goiânia (Exames Finalizados):
+    1. Garante a existência do LoteConvenio correspondente (cria um se não houver id_lote no job).
+    2. Extrai cada guia e série do JSON de resposta.
+    3. Normaliza carteirinha (remove partes com nome do beneficiário).
+    4. Insere em faturamento_lotes com detalheId = int(cd_guia + str(seq)) (idempotente/sem duplicatas).
+    """
+    if synced_counts is None:
+        synced_counts = {"jobs_processed": 0, "inserted": 0, "updated": 0, "skipped": 0}
+
+    params = job.params or {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except Exception:
+            params = {}
+
+    result_data = job.result_data or {}
+    guias_list = []
+    if isinstance(result_data, dict):
+        guias_list = result_data.get("data", [])
+    elif isinstance(result_data, list):
+        guias_list = result_data
+
+    if not guias_list:
+        return (0, 0)
+
+    # 1. Obter ou criar LoteConvenio (persiste id_lote de volta no job.params)
+    id_lote = _resolve_op4_lote(db, job, params)
+    job.params = params
+
+    # 2. Inserir itens (idempotente por detalheId) — reuso do upsert de chunks
+    return _upsert_op4_guias(db, job, guias_list, synced_counts, id_lote)
 
 
 

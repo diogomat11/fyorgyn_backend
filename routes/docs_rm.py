@@ -8,6 +8,7 @@ from typing import Optional
 from pydantic import BaseModel
 from datetime import date, datetime
 from services import storage_service
+from media_utils import infer_media_type, inline_filename
 import uuid
 import os
 import requests
@@ -112,6 +113,7 @@ def list_relatorios_medicos(
                 "id_relatorio": r.id_relatorio,
                 "url_arquivo": r.url_arquivo,
                 "data_relatorio": r.data_relatorio.isoformat() if r.data_relatorio else None,
+                "data_validade": r.data_validade.isoformat() if r.data_validade else None,
                 "nome_medico": r.nome_medico,
                 "especialidade": r.especialidade,
                 "observacoes": r.observacoes,
@@ -158,8 +160,8 @@ def view_document_content_rm(
                 content = f.read()
             return Response(
                 content=content,
-                media_type="application/pdf",
-                headers={"Content-Disposition": f"inline; filename=rm_{id}.pdf"}
+                media_type=infer_media_type(url),
+                headers={"Content-Disposition": f"inline; filename={inline_filename('rm', id, url)}"}
             )
 
     # 2. Portal Evoluir (se aplicável)
@@ -171,8 +173,8 @@ def view_document_content_rm(
             if r.status_code == 200:
                 return Response(
                     content=r.content,
-                    media_type="application/pdf",
-                    headers={"Content-Disposition": f"inline; filename=rm_{id}.pdf"}
+                    media_type=infer_media_type(url, upstream_content_type=r.headers.get("Content-Type")),
+                    headers={"Content-Disposition": f"inline; filename={inline_filename('rm', id, url)}"}
                 )
             else:
                 raise HTTPException(status_code=502, detail=f"Erro ao obter PDF do portal Evoluir ({r.status_code}).")
@@ -186,8 +188,8 @@ def view_document_content_rm(
             content_type = r.headers.get("Content-Type", "application/pdf")
             return Response(
                 content=r.content,
-                media_type=content_type,
-                headers={"Content-Disposition": f"inline; filename=rm_{id}.pdf"}
+                media_type=infer_media_type(url, upstream_content_type=content_type),
+                headers={"Content-Disposition": f"inline; filename={inline_filename('rm', id, url)}"}
             )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Erro ao buscar arquivo externo: {str(e)}")
