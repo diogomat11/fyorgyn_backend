@@ -190,6 +190,36 @@ def create_jobs(
                 detail=f"Credenciais não cadastradas para o convênio '{conv_name}'. Cadastre as credenciais em Credenciais Portais antes de criar o Job."
             )
 
+    # ── Regra do lote por período (Unimed — plano lote_strategy): job OP4 deve
+    #    permear APENAS UM lote. O backend valida o intervalo e vincula
+    #    automaticamente params.id_lote ao lote correspondente. ──
+    if str(request.rotina or "").lower() in OP4_ROTINAS and target_convenio_id:
+        from services.lote_strategy import get_lote_strategy
+        _strategy = get_lote_strategy(db, target_convenio_id)
+        if type(_strategy).__name__ == "UnimedPeriodoLoteStrategy":
+            from datetime import datetime as _dt
+            from services.lote_strategy.unimed_periodo import validar_intervalo_em_lote_unico
+            try:
+                _p = json.loads(request.params) if request.params else {}
+            except Exception:
+                _p = {}
+            if not isinstance(_p, dict):
+                _p = {}
+            _d_ini = str(_p.get("data_ini") or "").strip()
+            _d_fim = str(_p.get("data_fim") or "").strip()
+            if not _d_ini or not _d_fim:
+                raise HTTPException(status_code=400,
+                                    detail="Informe data_ini e data_fim (DD/MM/YYYY) para a OP4.")
+            try:
+                _dt_ini = _dt.strptime(_d_ini, "%d/%m/%Y").date()
+                _dt_fim = _dt.strptime(_d_fim, "%d/%m/%Y").date()
+            except Exception:
+                raise HTTPException(status_code=400, detail="Datas inválidas: use DD/MM/YYYY.")
+            _lote = validar_intervalo_em_lote_unico(
+                db, target_convenio_id, get_effective_user_id(current_user), _dt_ini, _dt_fim)
+            _p["id_lote"] = _lote.id_lote
+            request.params = json.dumps(_p)
+
     # Interceptar e baixar URLs do Evoluir
     if request.params:
         try:
@@ -1588,29 +1618,26 @@ def create_goiania_op4_job(
             detail="Credenciais da Unimed Goiânia não configuradas para este usuário."
         )
 
-    # ── Criar ou reutilizar LoteConvenio ──
-    id_lote = request.id_lote
-    if not id_lote:
-        from models import LoteConvenio
-        from datetime import datetime as _dt
-        dt_ini = dt_fim = None
-        try:
-            if request.data_ini: dt_ini = _dt.strptime(request.data_ini, "%d/%m/%Y").date()
-            if request.data_fim: dt_fim = _dt.strptime(request.data_fim, "%d/%m/%Y").date()
-        except Exception:
-            pass
+    # ── Regra do lote por período (2026-10-18): o intervalo do job deve permear
+    #    APENAS UM lote. A validação retorna o lote correspondente e o job é
+    #    vinculado a ele (params.id_lote) automaticamente. ──
+    from datetime import datetime as _dt
+    try:
+        dt_ini = _dt.strptime(request.data_ini, "%d/%m/%Y").date()
+        dt_fim = _dt.strptime(request.data_fim, "%d/%m/%Y").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Datas inválidas: use DD/MM/YYYY.")
 
-        novo_lote = LoteConvenio(
-            id_convenio=ID_CONVENIO,
-            user_id=current_user.id,
-            cod_prestador=uconv.cod_prestador or "",
-            status="Aberto",
-            data_inicio=dt_ini,
-            data_fim=dt_fim,
+    from services.lote_strategy.unimed_periodo import validar_intervalo_em_lote_unico
+    lote_match = validar_intervalo_em_lote_unico(db, ID_CONVENIO, current_user.id, dt_ini, dt_fim)
+
+    if request.id_lote and request.id_lote != lote_match.id_lote:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"id_lote informado ({request.id_lote}) não corresponde ao lote "
+                    f"do intervalo (Nº {lote_match.id_lote}).")
         )
-        db.add(novo_lote)
-        db.flush()
-        id_lote = novo_lote.id_lote
+    id_lote = lote_match.id_lote
 
     webhook_url = os.getenv(
         "MY_WEBHOOK_URL",

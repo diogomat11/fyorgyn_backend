@@ -48,6 +48,64 @@ def calcular_auto_periodo(dia_inicio: int, dia_fim: int, ref: date):
     return None
 
 
+def validar_intervalo_em_lote_unico(db, id_convenio: int, user_id: int,
+                                     data_ini: date, data_fim: date):
+    """
+    Regra (2026-10-18): job OP4 deve permear APENAS UM lote.
+
+    - Nenhum lote ativo intercepta o intervalo → 400 (criar lote que contenha
+      o período);
+    - Intervalo intercepta mais de um lote → 400 (intervalo inválido);
+    - Intercepta um lote mas extrapola os limites → 400 (ajustar ao lote).
+
+    Sucesso: retorna o LoteConvenio correspondente para o backend vincular
+    automaticamente params.id_lote ao job.
+    """
+    from fastapi import HTTPException
+    from models import LoteConvenio
+
+    def _fmt(d):
+        return d.strftime("%d/%m/%Y") if d else "?"
+
+    candidatos = db.query(LoteConvenio).filter(
+        LoteConvenio.id_convenio == id_convenio,
+        LoteConvenio.user_id == user_id,
+        LoteConvenio.status != "Cancelado",
+        LoteConvenio.data_inicio.isnot(None),
+        LoteConvenio.data_fim.isnot(None),
+        LoteConvenio.data_inicio <= data_fim,
+        LoteConvenio.data_fim >= data_ini,
+    ).all()
+
+    if not candidatos:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Nenhum lote ativo corresponde ao intervalo "
+                    f"{_fmt(data_ini)} a {_fmt(data_fim)}. Crie primeiro um lote "
+                    f"que contenha esse período.")
+        )
+    if len(candidatos) > 1:
+        lista = "; ".join(
+            f"Nº {l.id_lote} ({_fmt(l.data_inicio)} a {_fmt(l.data_fim)})"
+            for l in candidatos
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Intervalo desejado é inválido: permeia mais de um lote "
+                    f"({lista}). O intervalo deve permear apenas um lote.")
+        )
+
+    lote = candidatos[0]
+    if data_ini < lote.data_inicio or data_fim > lote.data_fim:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Intervalo extrapola os limites do lote Nº {lote.id_lote} "
+                    f"({_fmt(lote.data_inicio)} a {_fmt(lote.data_fim)}). "
+                    f"Ajuste o intervalo para dentro do lote.")
+        )
+    return lote
+
+
 class UnimedPeriodoLoteStrategy(LoteStrategy):
 
     tipo_formulario = "periodo"
@@ -94,23 +152,16 @@ class UnimedPeriodoLoteStrategy(LoteStrategy):
             user_id=current_user.id,
         )
         db.add(novo_lote)
-        db.flush()
+        db.commit()
 
-        # OP4 com filtro = período do lote (o worker entrega os chunks neste lote
-        # via params.id_lote — pipeline de entrega parcial)
-        from routes.jobs import create_goiania_op4_job, CreateGoianiaOp4Request
-        op4_req = CreateGoianiaOp4Request(
-            data_ini=data_inicio.strftime("%d/%m/%Y"),
-            data_fim=data_fim.strftime("%d/%m/%Y"),
-            guia="",
-            id_lote=novo_lote.id_lote,
-        )
-        create_goiania_op4_job(op4_req, db=db, current_user=current_user,
-                               id_convenio=request.id_convenio)
-
+        # Decisão (2026-10-18): a criação do lote NÃO dispara job automático.
+        # O job OP4 nasce pelo ícone de sincronização do lote (intervalo = período
+        # do lote) ou pelo módulo Importações — ambos validados a permear apenas
+        # um lote (validar_intervalo_em_lote_unico).
         return {
             "message": f"Lote criado (período {data_inicio.strftime('%d/%m/%Y')} a "
-                       f"{data_fim.strftime('%d/%m/%Y')}). Job OP4 enviado ao worker.",
+                       f"{data_fim.strftime('%d/%m/%Y')}). Use a sincronização do lote "
+                       f"ou Importações para importar as guias.",
             "id_lote": novo_lote.id_lote,
         }
 

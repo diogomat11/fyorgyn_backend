@@ -67,23 +67,21 @@ def test_unimed_livre_exige_data_inicio():
     assert e.value.status_code == 400
 
 
-def test_unimed_mensal_fixo_deriva_data_inicio(monkeypatch):
-    """data_fim 17/10 com janela 18→17 deriva data_inicio 18/09 e dispara a OP4
-    com filtro = período (fim do hardcode 01/01/2026)."""
+def test_unimed_criar_lote_nao_dispara_job(monkeypatch):
+    """Decisão (2026-10-18): criar lote Unimed NÃO cria job OP4 automático —
+    o job nasce pela sincronização do lote ou pelo módulo Importações."""
     s = _strategy_com_convenio("mensal_fixo", 18, 17)
 
-    capturado = {}
-
-    def _fake_op4(request, db=None, current_user=None, id_convenio=None):
-        capturado.update(data_ini=request.data_ini, data_fim=request.data_fim,
-                         id_lote=request.id_lote, id_convenio=id_convenio)
-
     import routes.jobs as jobs_mod
-    monkeypatch.setattr(jobs_mod, "create_goiania_op4_job", _fake_op4)
+    def _fail_op4(*a, **kw):
+        raise AssertionError("criar_lote não deve disparar job OP4")
+    monkeypatch.setattr(jobs_mod, "create_goiania_op4_job", _fail_op4)
 
+    criado = {}
     class _Db:
         def add(self, o):
             o.id_lote = 9901
+            criado["lote"] = o
         def flush(self):
             pass
         def commit(self):
@@ -93,11 +91,11 @@ def test_unimed_mensal_fixo_deriva_data_inicio(monkeypatch):
                           data_fim=date(2026, 10, 17), data_inicio=None)
     ret = s.criar_lote(_Db(), _user(), req)
 
-    assert capturado["data_ini"] == "18/09/2026"
-    assert capturado["data_fim"] == "17/10/2026"
-    assert capturado["id_lote"] == 9901
-    assert capturado["id_convenio"] == 3
+    assert criado["lote"].data_inicio == date(2026, 9, 18)
+    assert criado["lote"].data_fim == date(2026, 10, 17)
+    assert criado["lote"].status == "Aberto"
     assert "18/09/2026" in ret["message"]
+    assert "sincronização" in ret["message"].lower()
 
 
 def test_unimed_periodo_invertido_400(monkeypatch):
@@ -177,6 +175,59 @@ def test_item_data_anterior_permanece_no_lote(db_rollback):
     assert item is not None, "item com data anterior deve ser inserido"
     assert item.id_lote == 65, "item deve pertencer ao lote do período"
     assert item.dataRealizacao == date(2026, 9, 15), "data original da sessão preservada"
+
+
+@needs_db
+def test_validador_intervalo_lote_unico(db_rollback):
+    """
+    Regra (2026-10-18): job OP4 deve permear APENAS UM lote.
+    Cenários com lotes 18/09/2027→17/10/2027 (A) e 18/10/2027→17/11/2027 (B) — 2027 para não colidir com lotes reais de 2026 do mesmo usuário:
+    sub-intervalo de A ok; intervalo cruzando A e B → 400; extrapolando A → 400;
+    sem lote → 400; lote cancelado é ignorado.
+    """
+    from fastapi import HTTPException
+    from models import LoteConvenio
+    from services.lote_strategy.unimed_periodo import validar_intervalo_em_lote_unico
+
+    def _novo_lote(ini, fim, status="Aberto"):
+        l = LoteConvenio(id_convenio=3, user_id=1, cod_prestador="TESTE",
+                         data_inicio=ini, data_fim=fim, status=status)
+        db_rollback.add(l)
+        return l
+
+    lote_a = _novo_lote(date(2027, 9, 18), date(2027, 10, 17))
+    lote_b = _novo_lote(date(2027, 10, 18), date(2027, 11, 17))
+    db_rollback.flush()
+
+    # Sub-intervalo contido em A → ok, retorna A
+    r = validar_intervalo_em_lote_unico(db_rollback, 3, 1, date(2027, 9, 20), date(2027, 9, 25))
+    assert r.id_lote == lote_a.id_lote
+
+    # Intervalo exato do lote → ok
+    r = validar_intervalo_em_lote_unico(db_rollback, 3, 1, date(2027, 9, 18), date(2027, 10, 17))
+    assert r.id_lote == lote_a.id_lote
+
+    # Cruza A e B → inválido
+    with pytest.raises(HTTPException) as e:
+        validar_intervalo_em_lote_unico(db_rollback, 3, 1, date(2027, 10, 1), date(2027, 10, 20))
+    assert e.value.status_code == 400 and "mais de um lote" in e.value.detail
+
+    # Extrapola o início de A → inválido
+    with pytest.raises(HTTPException) as e:
+        validar_intervalo_em_lote_unico(db_rollback, 3, 1, date(2027, 9, 5), date(2027, 9, 25))
+    assert e.value.status_code == 400 and "extrapola" in e.value.detail
+
+    # Nenhum lote no intervalo → inválido
+    with pytest.raises(HTTPException) as e:
+        validar_intervalo_em_lote_unico(db_rollback, 3, 1, date(2027, 8, 1), date(2027, 8, 30))
+    assert e.value.status_code == 400 and "Nenhum lote" in e.value.detail
+
+    # Lote cancelado é ignorado
+    lote_a.status = "Cancelado"
+    db_rollback.flush()
+    with pytest.raises(HTTPException) as e:
+        validar_intervalo_em_lote_unico(db_rollback, 3, 1, date(2027, 9, 20), date(2027, 9, 25))
+    assert e.value.status_code == 400 and "Nenhum lote" in e.value.detail
 
 
 @needs_db
