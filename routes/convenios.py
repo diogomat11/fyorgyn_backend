@@ -31,6 +31,10 @@ class ConvenioUpdate(BaseModel):
     timeout_captura: Optional[bool] = None
     prazo_pei_dias: Optional[int] = Field(default=None, ge=30, le=365)
     guias_multiprestador: Optional[bool] = None
+    # Período do lote (plano lote_strategy): 'mensal_fixo' | 'livre' | None (legado)
+    lote_periodo_tipo: Optional[str] = None
+    lote_dia_inicio: Optional[int] = Field(default=None, ge=1, le=31)
+    lote_dia_fim: Optional[int] = Field(default=None, ge=1, le=31)
 
 class ConvenioOperacaoResponse(BaseModel):
     id: int
@@ -49,6 +53,9 @@ class ConvenioResponse(ConvenioBase):
     prazo_pei_dias: Optional[int] = 180
     pei_automatico: Optional[bool] = False
     guias_multiprestador: Optional[bool] = False
+    lote_periodo_tipo: Optional[str] = None
+    lote_dia_inicio: Optional[int] = None
+    lote_dia_fim: Optional[int] = None
     operacoes: List[ConvenioOperacaoResponse] = Field(default=[], validation_alias="operacoes_rel")
     
     class Config:
@@ -265,7 +272,17 @@ def update_convenio(id_convenio: int, conv: ConvenioUpdate, db: Session = Depend
     if conv.timeout_captura is not None: db_conv.timeout_captura = conv.timeout_captura
     if conv.prazo_pei_dias is not None: db_conv.prazo_pei_dias = conv.prazo_pei_dias
     if conv.guias_multiprestador is not None: db_conv.guias_multiprestador = conv.guias_multiprestador
-    
+
+    # Período do lote (plano lote_strategy)
+    if conv.lote_periodo_tipo is not None:
+        if conv.lote_periodo_tipo not in ("mensal_fixo", "livre"):
+            raise HTTPException(status_code=400, detail="lote_periodo_tipo deve ser 'mensal_fixo' ou 'livre'.")
+        if conv.lote_periodo_tipo == "mensal_fixo" and not (conv.lote_dia_inicio and conv.lote_dia_fim):
+            raise HTTPException(status_code=400, detail="Período mensal fixo exige lote_dia_inicio e lote_dia_fim (1-31).")
+        db_conv.lote_periodo_tipo = conv.lote_periodo_tipo
+    if conv.lote_dia_inicio is not None: db_conv.lote_dia_inicio = conv.lote_dia_inicio
+    if conv.lote_dia_fim is not None: db_conv.lote_dia_fim = conv.lote_dia_fim
+
     db.commit()
     db.refresh(db_conv)
     return db_conv
@@ -303,6 +320,9 @@ def list_convenios_integrador_mapping(db: Session = Depends(get_db), current_use
             "pei_automatico": bool(c.pei_automatico),
             "prazo_pei_dias": c.prazo_pei_dias or 180,
             "guias_multiprestador": bool(c.guias_multiprestador),
+            "lote_periodo_tipo": c.lote_periodo_tipo,
+            "lote_dia_inicio": c.lote_dia_inicio,
+            "lote_dia_fim": c.lote_dia_fim,
             "operacoes_habilitadas": c.operacoes_habilitadas or [],
             "operacoes_disponiveis": available_ops
         })

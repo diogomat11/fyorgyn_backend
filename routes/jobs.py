@@ -1556,9 +1556,11 @@ def create_goiania_op4_job(
     request: CreateGoianiaOp4Request,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user),
+    id_convenio: Optional[int] = None,
 ):
     """
-    Cria um job OP4 (Exames Finalizados) para a Unimed Goiânia (id_convenio=3).
+    Cria um job OP4 (Exames Finalizados) para convênios do integrador Unimed
+    Goiânia (id_convenio=3 e Intercâmbio id_convenio=21; default 3).
 
     - Enriquece os params com credenciais do usuário (login, senha_criptografada, cod_prestador).
     - Injeta webhook_url para callback ao Backend Hub.
@@ -1569,7 +1571,7 @@ def create_goiania_op4_job(
     from dependencies import get_allowed_convenio_ids
     from services.job_service import _send_jobs_to_worker
 
-    ID_CONVENIO = 3
+    ID_CONVENIO = id_convenio or 3
 
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids and ID_CONVENIO not in allowed_ids:

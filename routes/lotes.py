@@ -16,6 +16,7 @@ class CreateLoteRequest(BaseModel):
     id_convenio: int
     cod_prestador: str
     data_fim: date
+    data_inicio: Optional[date] = None  # strategies de período (Unimed); mensal_fixo deriva sozinho
 
 class CancelLoteRequest(BaseModel):
     cod_prestador: str
@@ -59,57 +60,35 @@ def create_lote(
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids and request.id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
-        
-    rotina_target = "4" if request.id_convenio == 3 else "13"
-    status_inicial = "Aberto" if request.id_convenio == 3 else "Processando"
 
-    # We create a placeholder Lote in DB so UI can show it's pending/aberto
-    novo_lote = LoteConvenio(
-        id_convenio=request.id_convenio,
-        cod_prestador=request.cod_prestador,
-        data_fim=request.data_fim,
-        status=status_inicial,
-        numero_lote=None, # Will be updated by Worker if applicable
-        user_id=current_user.id
-    )
-    db.add(novo_lote)
-    db.flush() # get id_lote
-    
-    if request.id_convenio == 3:
-        # Para Unimed Goiânia, envia o job OP4 via _send_jobs_to_worker
-        from routes.jobs import create_goiania_op4_job, CreateGoianiaOp4Request
-        from models import UserConvenio
-        uconv = db.query(UserConvenio).filter(
-            UserConvenio.user_id == current_user.id,
-            UserConvenio.id_convenio == 3
-        ).first()
+    # Strategy de lote por convênio (plano lote_strategy): número (IPASGO,
+    # comportamento atual) × período (Unimed Goiânia/Intercâmbio — OP4 filtra
+    # exatamente o período do lote e vincula todos os itens do filtro).
+    from services.lote_strategy import get_lote_strategy
+    strategy = get_lote_strategy(db, request.id_convenio)
+    return strategy.criar_lote(db, current_user, request)
 
-        data_ini_str = "01/01/2026"
-        data_fim_str = request.data_fim.strftime("%d/%m/%Y")
-        
-        op4_req = CreateGoianiaOp4Request(
-            data_ini=data_ini_str,
-            data_fim=data_fim_str,
-            guia="",
-            id_lote=novo_lote.id_lote
-        )
-        create_goiania_op4_job(op4_req, db=db, current_user=current_user)
-    else:
-        new_job = Job(
-            id_convenio=request.id_convenio,
-            rotina="13", # OP13_criar_lote
-            status="pending",
-            params=json.dumps({
-                "cod_prestador": request.cod_prestador,
-                "data_fim": request.data_fim.strftime("%d/%m/%Y"),
-                "id_lote_interno": novo_lote.id_lote # Worker can update this row
-            }),
-            user_id=current_user.id
-        )
-        db.add(new_job)
-        db.commit()
-    
-    return {"message": "Lote criado. Job enviado ao worker.", "id_lote": novo_lote.id_lote}
+
+@router.get("/form-config")
+def lote_form_config(
+    id_convenio: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Configuração do formulário de criação de lote para o convênio
+    (tipo de formato + auto-período quando mensal_fixo)."""
+    allowed_ids = get_allowed_convenio_ids(current_user)
+    if allowed_ids and id_convenio not in allowed_ids:
+        raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
+
+    from models import Convenio
+    convenio = db.query(Convenio).filter(Convenio.id_convenio == id_convenio).first()
+    if not convenio:
+        raise HTTPException(status_code=404, detail="Convênio não encontrado.")
+
+    from services.lote_strategy import get_lote_strategy
+    strategy = get_lote_strategy(db, id_convenio)
+    return strategy.form_config(db, convenio)
 
 @router.post("/{id_lote}/cancelar")
 def cancelar_lote(

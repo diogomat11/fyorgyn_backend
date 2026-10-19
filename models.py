@@ -291,6 +291,12 @@ class Convenio(Base):
     guias_multiprestador = Column(Boolean, default=False)  # TRUE: saldo da guia compartilhado entre prestadores (ex. Unimed Goiania)
     registro_ans = Column(Text, nullable=True)
     modo_execucao = Column(Text, default="automatico") # 'automatico' ou 'manual'
+    # Período do lote por convênio (plano lote_strategy): 'mensal_fixo' = janela
+    # fixa dia_inicio→dia_fim auto-preenchida na criação; 'livre' = usuário escolhe;
+    # NULL = strategy legado (formato número/IPASGO, apenas data_fim).
+    lote_periodo_tipo = Column(Text, nullable=True)
+    lote_dia_inicio = Column(Integer, nullable=True)
+    lote_dia_fim = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
