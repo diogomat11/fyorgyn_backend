@@ -18,6 +18,9 @@ from abc import ABC, abstractmethod
 class LoteStrategy(ABC):
 
     tipo_formulario = "numero"  # sobrescrito pelas concretas
+    # Rotina de sincronização de lote (ícone Sincronizar): None = convênio sem
+    # rotina de sincronização (botão desabilitado no frontend).
+    rotina_sync = None
 
     @abstractmethod
     def criar_lote(self, db, current_user, request) -> dict:
@@ -32,6 +35,7 @@ class LoteStrategy(ABC):
             "id_convenio": getattr(convenio, "id_convenio", None),
             "nome": getattr(convenio, "nome", None),
             "tipo_formulario": self.tipo_formulario,
+            "rotina_sync": self.rotina_sync,
             "lote_periodo_tipo": getattr(convenio, "lote_periodo_tipo", None),
             "lote_dia_inicio": getattr(convenio, "lote_dia_inicio", None),
             "lote_dia_fim": getattr(convenio, "lote_dia_fim", None),

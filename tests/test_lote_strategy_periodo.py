@@ -144,6 +144,7 @@ def test_form_config_conv3_auto_periodo(db_rollback):
     conv = db_rollback.query(Convenio).filter(Convenio.id_convenio == 3).first()
     cfg = get_lote_strategy(db_rollback, 3).form_config(db_rollback, conv)
     assert cfg["tipo_formulario"] == "periodo"
+    assert cfg["rotina_sync"] == "4"
     assert cfg["lote_periodo_tipo"] == "mensal_fixo"
     assert cfg["auto_periodo"] and "data_ini" in cfg["auto_periodo"]
 

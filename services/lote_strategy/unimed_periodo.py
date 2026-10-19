@@ -109,6 +109,7 @@ def validar_intervalo_em_lote_unico(db, id_convenio: int, user_id: int,
 class UnimedPeriodoLoteStrategy(LoteStrategy):
 
     tipo_formulario = "periodo"
+    rotina_sync = "4"  # OP4: importa Exames Finalizados do período do lote
 
     def _convenio(self, db, id_convenio):
         from models import Convenio

@@ -13,6 +13,7 @@ from .base import LoteStrategy
 class IpasgoLoteStrategy(LoteStrategy):
 
     tipo_formulario = "numero"
+    rotina_sync = "6"  # OP6: atualização de itens do lote no portal
 
     def criar_lote(self, db, current_user, request) -> dict:
         from models import LoteConvenio, Job
