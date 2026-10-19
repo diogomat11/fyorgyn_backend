@@ -1496,7 +1496,8 @@ def submit_job_result_partial(
     inserted, skipped = _upsert_op4_guias(db, job, guias_list, counts, id_lote)
 
     return {"status": "partial_ok", "job_id": job_id, "id_lote": id_lote,
-            "inserted": inserted, "skipped": skipped, "received": len(guias_list)}
+            "inserted": inserted, "skipped": skipped,
+            "reabsorvidos": counts.get("updated", 0), "received": len(guias_list)}
 
 
 class WebhookPayload(BaseModel):

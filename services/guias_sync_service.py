@@ -2644,10 +2644,11 @@ def _upsert_op4_guias(db: Session, job, guias_list: list, synced_counts: dict, i
     OP4 em faturamento_lotes. Extraído de _sync_goiania_op4 para reuso na
     entrega parcial em chunks — chunks repetidos não duplicam itens.
     """
-    from models import FaturamentoLote
+    from models import FaturamentoLote, LoteConvenio
     from sqlalchemy.exc import IntegrityError
 
     seen_in_payload = set()
+    _status_lote_cache = {}  # id_lote -> status (evita N queries na reabsorção)
 
     for guia in guias_list:
         if not isinstance(guia, dict):
@@ -2683,11 +2684,25 @@ def _upsert_op4_guias(db: Session, job, guias_list: list, synced_counts: dict, i
                 continue
             seen_in_payload.add(detalhe_id)
 
-            # Deduplicação 2: Pular se já existe no banco de dados
-            existing = db.query(FaturamentoLote.id).filter(
+            # Deduplicação 2: detalheId é único GLOBAL. Item já presente em lote
+            # ATIVO → pular (idempotência). Item preso em lote CANCELADO →
+            # REABSORVER: mover para o lote desta importação e desbloquear
+            # (regra 2026-10-19: todos os itens do filtro da OP4 pertencem ao
+            # lote do período — cancelamento não pode "roubar" itens do lote novo).
+            existing = db.query(FaturamentoLote).filter(
                 FaturamentoLote.detalheId == detalhe_id
             ).first()
-            if existing:
+            if existing is not None:
+                if existing.id_lote and existing.id_lote != id_lote:
+                    if existing.id_lote not in _status_lote_cache:
+                        _st = db.query(LoteConvenio.status).filter(
+                            LoteConvenio.id_lote == existing.id_lote).first()
+                        _status_lote_cache[existing.id_lote] = _st[0] if _st else None
+                    if _status_lote_cache[existing.id_lote] == "Cancelado":
+                        existing.id_lote = id_lote
+                        existing.StatusConciliacao = "Não Conciliado"
+                        synced_counts["updated"] += 1
+                        continue
                 synced_counts["skipped"] += 1
                 continue
 

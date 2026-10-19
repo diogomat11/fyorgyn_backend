@@ -302,3 +302,73 @@ def test_cancelar_lote_ipasgo_mantem_op14(db_rollback):
     job = db_rollback.query(Job).filter(
         Job.rotina == "14", Job.id_convenio == 6).order_by(Job.id.desc()).first()
     assert job is not None, "IPASGO deve seguir criando job OP14"
+
+
+# ── Reabsorção de itens de lotes cancelados (2026-10-19) ─────────────────────
+
+@needs_db
+def test_upsert_reabsorve_item_de_lote_cancelado(db_rollback):
+    """Item que ficou preso em lote CANCELADO volta ao lote ativo da importação
+    (cenário real do lote 80: chunk 1 inteiro foi 'pulado' contra o lote 66)."""
+    from models import LoteConvenio, FaturamentoLote, Job
+    from services.guias_sync_service import _upsert_op4_guias
+
+    cancelado = LoteConvenio(id_convenio=3, user_id=1, cod_prestador="TESTE",
+                             data_inicio=date(2027, 9, 18), data_fim=date(2027, 10, 17),
+                             status="Cancelado")
+    ativo = LoteConvenio(id_convenio=3, user_id=1, cod_prestador="TESTE",
+                         data_inicio=date(2027, 9, 18), data_fim=date(2027, 10, 17),
+                         status="Aberto")
+    db_rollback.add_all([cancelado, ativo])
+    db_rollback.flush()
+    preso = FaturamentoLote(detalheId=990012341, id_lote=cancelado.id_lote, user_id=1,
+                            StatusConciliacao="bloqueado", StatusConferencia=0)
+    db_rollback.add(preso)
+    db_rollback.flush()
+
+    job = db_rollback.query(Job).filter(Job.id == 19152).first()
+    counts = {"jobs_processed": 0, "inserted": 0, "updated": 0, "skipped": 0}
+    chunk = [{
+        "cd_guia": "99001234", "guia": "99RB01", "carteirinha": "222",
+        "cod_procedimento": "2250005103",
+        "series": [{"seq": 1, "data": "20/09/2027"}],
+    }]
+    _upsert_op4_guias(db_rollback, job, chunk, counts, id_lote=ativo.id_lote)
+
+    assert counts["updated"] == 1 and counts["inserted"] == 0
+    db_rollback.refresh(preso)
+    assert preso.id_lote == ativo.id_lote, "item deve migrar para o lote ativo"
+    assert preso.StatusConciliacao == "Não Conciliado", "item reabsorvido desbloqueia"
+
+
+@needs_db
+def test_upsert_nao_rouba_item_de_lote_ativo(db_rollback):
+    """Item em lote ATIVO permanece no lote dele (idempotência preservada)."""
+    from models import LoteConvenio, FaturamentoLote, Job
+    from services.guias_sync_service import _upsert_op4_guias
+
+    dono = LoteConvenio(id_convenio=3, user_id=1, cod_prestador="TESTE",
+                        data_inicio=date(2027, 9, 18), data_fim=date(2027, 10, 17),
+                        status="Aberto")
+    outro = LoteConvenio(id_convenio=3, user_id=1, cod_prestador="TESTE",
+                         data_inicio=date(2027, 10, 18), data_fim=date(2027, 11, 17),
+                         status="Aberto")
+    db_rollback.add_all([dono, outro])
+    db_rollback.flush()
+    item = FaturamentoLote(detalheId=990015671, id_lote=dono.id_lote, user_id=1,
+                           StatusConciliacao="Não Conciliado", StatusConferencia=0)
+    db_rollback.add(item)
+    db_rollback.flush()
+
+    job = db_rollback.query(Job).filter(Job.id == 19152).first()
+    counts = {"jobs_processed": 0, "inserted": 0, "updated": 0, "skipped": 0}
+    chunk = [{
+        "cd_guia": "99001567", "guia": "99RB02", "carteirinha": "333",
+        "cod_procedimento": "2250005103",
+        "series": [{"seq": 1, "data": "20/09/2027"}],
+    }]
+    _upsert_op4_guias(db_rollback, job, chunk, counts, id_lote=outro.id_lote)
+
+    assert counts["skipped"] == 1 and counts["updated"] == 0
+    db_rollback.refresh(item)
+    assert item.id_lote == dono.id_lote, "item de lote ativo não migra"
