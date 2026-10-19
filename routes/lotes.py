@@ -100,19 +100,26 @@ def cancelar_lote(
     lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == id_lote).first()
     if not lote:
         raise HTTPException(status_code=404, detail="Lote não encontrado")
-        
+
     if not current_user.is_admin and lote.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
-        
+
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids and lote.id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão.")
-        
-    if not lote.numero_lote:
+
+    # Strategy de lote: períodos (Unimed, sem numero_lote) cancelam LOCALMENTE
+    # (reversão de itens/conciliações, sem job no portal); números (IPASGO)
+    # mantêm o fluxo OP14 via worker.
+    from services.lote_strategy import get_lote_strategy
+    strategy = get_lote_strategy(db, lote.id_convenio)
+    cancelamento_local = (type(strategy).__name__ == "UnimedPeriodoLoteStrategy")
+
+    if not cancelamento_local and not lote.numero_lote:
         raise HTTPException(status_code=400, detail="Lote ainda não possui numero_lote gerado (ainda processando?)")
-        
-    lote.status = "Cancelando"
-    
+
+    lote.status = "Cancelado" if cancelamento_local else "Cancelando"
+
     # Block operations on dependent items + reverse conciliation
     items = db.query(FaturamentoLote).filter(FaturamentoLote.id_lote == lote.id_lote).all()
     for item in items:
@@ -127,7 +134,11 @@ def cancelar_lote(
                 lai.id_faturamento_lote = None
             item.agendamento_id = None
         item.StatusConciliacao = "bloqueado"
-    
+
+    if cancelamento_local:
+        db.commit()
+        return {"message": "Lote cancelado localmente. Itens bloqueados e conciliações revertidas."}
+
     import json
     new_job = Job(
         id_convenio=lote.id_convenio,
@@ -142,7 +153,7 @@ def cancelar_lote(
     )
     db.add(new_job)
     db.commit()
-    
+
     return {"message": "Cancelamento solicitado. Itens bloqueados."}
 
 @router.get("/{id_lote}/faturamentos")

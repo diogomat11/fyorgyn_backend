@@ -232,7 +232,6 @@ def test_validador_intervalo_lote_unico(db_rollback):
 
 @needs_db
 def test_ipasgo_strategy_exige_apenas_data_fim(db_rollback):
-    """R2.2: formato IPASGO inalterado — sem data_inicio, OP13 e status Processando."""
     from services.lote_strategy.ipasgo import IpasgoLoteStrategy
     from models import LoteConvenio, Job
 
@@ -247,3 +246,58 @@ def test_ipasgo_strategy_exige_apenas_data_fim(db_rollback):
     job = db_rollback.query(Job).filter(
         Job.id_convenio == 6, Job.rotina == "13").order_by(Job.id.desc()).first()
     assert job is not None, "OP13 enfileirada como hoje"
+
+
+# ── Cancelamento de lote (2026-10-18, rev. 3) ────────────────────────────────
+
+def _user_admin(id=1):
+    return SimpleNamespace(id=id, is_admin=False, convenio_rel=[], id_convenio=None)
+
+
+@needs_db
+def test_cancelar_lote_unimed_local_sem_job(db_rollback):
+    """Cancelar lote Unimed (período, sem numero_lote) é AÇÃO LOCAL: bloqueia
+    itens, reverte conciliações, status final 'Cancelado' — NENHUM job OP14."""
+    from models import LoteConvenio, FaturamentoLote, Job
+    from routes.lotes import cancelar_lote
+
+    lote = LoteConvenio(id_convenio=3, user_id=1, cod_prestador="TESTE",
+                        data_inicio=date(2027, 9, 18), data_fim=date(2027, 10, 17),
+                        status="Aberto", numero_lote=None)
+    db_rollback.add(lote)
+    db_rollback.flush()
+    item = FaturamentoLote(detalheId=990009991, id_lote=lote.id_lote, user_id=1,
+                           StatusConciliacao="Conciliado", StatusConferencia=0)
+    db_rollback.add(item)
+    db_rollback.flush()
+
+    req = SimpleNamespace(cod_prestador="TESTE")
+    ret = cancelar_lote(lote.id_lote, req, db_rollback, _user_admin())
+
+    assert "localmente" in ret["message"]
+    assert lote.status == "Cancelado"
+    assert item.StatusConciliacao == "bloqueado"
+    jobs_op14 = db_rollback.query(Job).filter(Job.rotina == "14").all()
+    assert not any(j.params and str(lote.id_lote) in str(j.params) for j in jobs_op14), \
+        "cancelamento Unimed não deve criar job OP14"
+
+
+@needs_db
+def test_cancelar_lote_ipasgo_mantem_op14(db_rollback):
+    """Cancelar lote IPASGO (número) mantém o fluxo atual: OP14 + status Cancelando."""
+    from models import LoteConvenio, Job
+    from routes.lotes import cancelar_lote
+
+    lote = LoteConvenio(id_convenio=6, user_id=1, cod_prestador="TESTE",
+                        data_fim=date(2027, 10, 17), status="Aberto", numero_lote=98765)
+    db_rollback.add(lote)
+    db_rollback.flush()
+
+    req = SimpleNamespace(cod_prestador="TESTE")
+    ret = cancelar_lote(lote.id_lote, req, db_rollback, _user_admin())
+
+    assert ret["message"] == "Cancelamento solicitado. Itens bloqueados."
+    assert lote.status == "Cancelando"
+    job = db_rollback.query(Job).filter(
+        Job.rotina == "14", Job.id_convenio == 6).order_by(Job.id.desc()).first()
+    assert job is not None, "IPASGO deve seguir criando job OP14"
