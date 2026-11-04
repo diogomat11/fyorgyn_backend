@@ -456,6 +456,74 @@ def create_jobs(
                 detail="Para criar o job da OP15, informe 'guia' e 'observacao' (texto da justificativa)."
             )
 
+    # Validação para OP10 do IPASGO (importar recurso de glosa por protocolo)
+    if request.rotina in ['10', 'op10_recurso_glosa']:
+        try:
+            p_dict = json.loads(request.params) if request.params else {}
+        except Exception:
+            p_dict = {}
+        if not str(p_dict.get("protocolo") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP10, informe 'protocolo' (capa/protocolo do lote no portal)."
+            )
+        if not p_dict.get("id_lote_interno"):
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP10, informe 'id_lote_interno' (lote em Lotes - Convênios)."
+            )
+
+    # Validação para OP16 do IPASGO (envio de justificativas de recurso de glosa)
+    if request.rotina in ['16', 'op16_enviar_recurso_glosa']:
+        try:
+            p_dict = json.loads(request.params) if request.params else {}
+        except Exception:
+            p_dict = {}
+        if not str(p_dict.get("protocolo") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP16, informe 'protocolo' (capa do lote no portal)."
+            )
+        servicos = p_dict.get("servicos")
+        if not isinstance(servicos, list) or not servicos:
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP16, informe 'servicos' (itens com justificativa vinculada)."
+            )
+
+    # Validação para OP17 do IPASGO (importar faturáveis do ConferenciaFaturamento)
+    if request.rotina in ['17', 'op17_importar_conferencia']:
+        try:
+            p_dict = json.loads(request.params) if request.params else {}
+        except Exception:
+            p_dict = {}
+        if not str(p_dict.get("protocolo") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP17, informe 'protocolo' (capa do lote no novo portal de Conferência)."
+            )
+        # id_lote_interno é opcional: sem ele, o consumer cria o lote local
+        # automaticamente a partir do protocolo/número trazidos do portal.
+
+    # Validação para OP18 do IPASGO (confirmar item/data no ConferenciaFaturamento)
+    if request.rotina in ['18', 'op18_conferir_faturamento']:
+        try:
+            p_dict = json.loads(request.params) if request.params else {}
+        except Exception:
+            p_dict = {}
+        if not str(p_dict.get("protocolo") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP18, informe 'protocolo' (capa do lote no portal)."
+            )
+        itens = p_dict.get("itens")
+        unitario = p_dict.get("idServico") and p_dict.get("status")
+        if not unitario and not (isinstance(itens, list) and itens):
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP18, informe 'idServico'+'status' (unitário) ou 'itens' (lote)."
+            )
+
     if request.rotina and "fature" in request.rotina:
         request.rotina = request.rotina.replace("_fature", "").replace("fature_", "")
         try:
@@ -517,14 +585,18 @@ def create_jobs(
             
     elif request.type in ['single', 'multiple']:
         is_standalone = (target_convenio == 6 and request.rotina in [
-            '3', 'op3_import_guias', 
-            '6', 'op6_check_baixados', 
-            '7', 'op7_fat_facplan', 
+            '3', 'op3_import_guias',
             '11', 'op11_import_guias_api',
             '12', 'op12_impressao_api',
             '13', 'op13_criar_lote',
             '14', 'op14_cancelar_lote',
-            '15', 'op15_enviar_justificativa'
+            '15', 'op15_enviar_justificativa',
+            '10', 'op10_recurso_glosa',
+            '16', 'op16_enviar_recurso_glosa',
+            '17', 'op17_importar_conferencia',
+            '18', 'op18_conferir_faturamento'
+            # OP6/OP7 (rotinas '6'/'7') INATIVAS: endpoints LoadDetalhes e
+            # ModificarDetalhe substituídos pelo módulo ConferenciaFaturamento (OPs 17/18).
         ]) or (target_convenio == 100 and request.rotina in [
             '1', 'op1', 'op1_importPacientes', 'op5_ImportCorpoClinico',
             'op6_baixarFaturados', 'op4_atualizarDataPTS',
@@ -536,6 +608,10 @@ def create_jobs(
             '4', 'op4_finalizados', 'finalizados', 'exames_finalizados',
         ]) or (target_convenio == 16 and request.rotina in [
             '2', 'op2_consultar_guia',
+        ]) or (target_convenio == 1 and request.rotina in [
+            # Login Bradesco: operação de sessão — não exige carteirinha
+            # ('0_fature' chega aqui já normalizado para '0' + contexto fature)
+            '0', 'op0_login', '0_fature', 'op0_login_fature',
         ])
 
         if not request.carteirinha_ids:
@@ -683,26 +759,25 @@ def create_jobs(
         print(f"Error invalidating cache in create_jobs: {e}")
     return {"message": f"Created/Queued jobs", "count": created_count}
 
-@router.post("/import/fature-batch")
-async def import_fature_batch(
-    file: UploadFile = File(...),
-    id_convenio: int = Form(...),
-    dataInicio: str = Form(None),
-    dataFim: str = Form(None),
-    regAns: str = Form(None),
-    login: str = Form(None),
-    password: str = Form(None),
-    cod_prestador: str = Form(None),
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+def _import_fature_batch_sync(
+    content: bytes,
+    id_convenio: int,
+    dataInicio: Optional[str],
+    dataFim: Optional[str],
+    regAns: Optional[str],
+    login: Optional[str],
+    password: Optional[str],
+    cod_prestador: Optional[str],
+    db: Session,
+    current_user
 ):
+    """Corpo síncrono do upload Fature (pandas + POST na ponte com timeout longo)."""
     from dependencies import get_allowed_convenio_ids
     import json
-    
+
     allowed_ids = get_allowed_convenio_ids(current_user)
     if allowed_ids and id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão para este convênio.")
-    content = await file.read()
     try:
         df = pd.read_excel(BytesIO(content))
     except Exception as e:
@@ -825,13 +900,35 @@ async def import_fature_batch(
     return {"message": "Lote importado com sucesso", "count": created_count}
 
 
-@router.post("/import/caesan-autorizacoes")
-async def import_caesan_autorizacoes(
+@router.post("/import/fature-batch")
+async def import_fature_batch(
     file: UploadFile = File(...),
+    id_convenio: int = Form(...),
+    dataInicio: str = Form(None),
+    dataFim: str = Form(None),
+    regAns: str = Form(None),
+    login: str = Form(None),
+    password: str = Form(None),
+    cod_prestador: str = Form(None),
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
+    content = await file.read()
+    # Corpo bloqueante (pandas + requests p/ backend_worker, timeout de até
+    # 300s): direto no event loop congelava o backend inteiro durante o lote
+    # (polling de jobs, MFA e heartbeats pendurados). Roda na threadpool.
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(
+        _import_fature_batch_sync,
+        content, id_convenio, dataInicio, dataFim, regAns, login, password, cod_prestador,
+        db, current_user
+    )
+
+
+def _import_caesan_sync(content: bytes, filename: str, db: Session, current_user):
     """
+    Corpo síncrono da importação CAESAN (pandas + consultas + POST na ponte).
+
     Importa a planilha CAESAN (aba 'modelo_csv' do xlsx ou CSV equivalente) e cria
     um job OP1 (op1_autorizacao) por linha — pelo mesmo caminho da solicitação
     individual (SolicitacaoStrategy do integrador 102), com credenciais do tenant.
@@ -861,8 +958,6 @@ async def import_caesan_autorizacoes(
     if strategy is None:
         raise HTTPException(status_code=400, detail="Integrador CAESAN não configurado/ativo.")
 
-    content = await file.read()
-    filename = (file.filename or "").lower()
     try:
         if filename.endswith(('.xlsx', '.xls')):
             xls = pd.ExcelFile(BytesIO(content))
@@ -1040,6 +1135,20 @@ async def import_caesan_autorizacoes(
     }
 
 
+@router.post("/import/caesan-autorizacoes")
+async def import_caesan_autorizacoes(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    content = await file.read()
+    filename = (file.filename or "").lower()
+    # Mesma razão do fature-batch: corpo bloqueante roda na threadpool para
+    # não congelar o event loop do backend durante a importação.
+    from starlette.concurrency import run_in_threadpool
+    return await run_in_threadpool(_import_caesan_sync, content, filename, db, current_user)
+
+
 @router.get("/export/fature")
 def export_fature_jobs(
     id_convenio: int,
@@ -1053,11 +1162,28 @@ def export_fature_jobs(
     if allowed_ids and id_convenio not in allowed_ids:
         raise HTTPException(status_code=403, detail="Sem permissão.")
 
-    query = db.query(Job).filter(Job.id_convenio == id_convenio)
+    # result_data (JSONB com a resposta completa do worker) não é usado na
+    # exportação: com defer evita transferir MBs desnecessários do banco remoto.
+    query = db.query(Job).options(defer(Job.result_data)).filter(Job.id_convenio == id_convenio)
     if not current_user.is_admin:
         query = query.filter(Job.user_id == current_user.id)
     jobs = query.order_by(Job.created_at.desc()).all()
-    
+
+    # Batch dos logs "Worker JSON Response" em UMA query: a versão anterior
+    # consultava log por job (N+1) e, com milhares de jobs no banco remoto
+    # (~70ms de round-trip cada), a exportação passava dos minutos e estourava
+    # o timeout do frontend sem gerar o Excel.
+    success_job_ids = [j.id for j in jobs if j.status == 'success']
+    wjr_logs_map = {}
+    if success_job_ids:
+        wjr_logs = db.query(Log).filter(
+            Log.job_id.in_(success_job_ids),
+            Log.level == "INFO",
+            Log.message.like("Worker JSON Response:%")
+        ).all()
+        for log in sorted(wjr_logs, key=lambda x: x.created_at):
+            wjr_logs_map[log.job_id] = log.message
+
     data = []
     for j in jobs:
         params_dict = {}
@@ -1068,21 +1194,17 @@ def export_fature_jobs(
                 params_dict = json.loads(j.params or '{}')
             except:
                 pass
-        
+
         guia = params_dict.get('guia') or params_dict.get('numero_guia') or ''
         paciente = params_dict.get('paciente', '')
-        
+
         status_guia_api = ""
         if j.status == 'success':
-            log_entry = db.query(Log).filter(
-                Log.job_id == j.id,
-                Log.level == "INFO",
-                Log.message.like("Worker JSON Response:%")
-            ).order_by(Log.created_at.desc()).first()
-            
-            if log_entry:
+            log_message = wjr_logs_map.get(j.id)
+
+            if log_message:
                 try:
-                    msg = log_entry.message.replace("Worker JSON Response:", "").strip()
+                    msg = log_message.replace("Worker JSON Response:", "").strip()
                     resp_data = json.loads(msg)
                     results = resp_data.get("data", [])
                     if results and isinstance(results, list):
@@ -1091,7 +1213,7 @@ def export_fature_jobs(
                         sg = str(item.get("status_guia") or "")
                         desc_lower = desc.lower()
                         sg_lower = sg.lower()
-                        
+
                         if any(x in desc_lower or x in sg_lower for x in ["não", "nao", "no"]):
                             status_guia_api = "Não Localizada"
                         elif desc:
@@ -1187,12 +1309,16 @@ def list_jobs(
     
     if status:
         query = query.filter(Job.status == status)
-        
+
+    # Datas do filtro são do fuso local do usuário (São Paulo) e created_at é UTC —
+    # converter a janela para UTC (comparar a data crua deixava jobs de 21h-23h59
+    # locais fora do dia correto do filtro, enquanto a listagem os exibia no dia
+    # certo por vir localizada).
+    from timezone_utils import data_local_para_utc_inicio, data_local_para_utc_fim_exclusivo
     if created_at_start:
-        query = query.filter(Job.created_at >= created_at_start)
+        query = query.filter(Job.created_at >= data_local_para_utc_inicio(created_at_start))
     if created_at_end:
-        end_dt = datetime.combine(created_at_end, datetime.min.time()) + timedelta(days=1)
-        query = query.filter(Job.created_at < end_dt)
+        query = query.filter(Job.created_at < data_local_para_utc_fim_exclusivo(created_at_end))
     
     # Order by priority desc, created_at asc
     total = query.count()
@@ -1437,6 +1563,165 @@ def submit_job_result(
         background_tasks.add_task(sync_completed_worker_jobs_bg)
 
     return {"status": "success", "message": "Result received and background sync initiated"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MFA Bradesco (Faturi) — código interativo (docs/plano_mfa_bradesco.md §7)
+# Canal: worker grava/lê direto no worker.jobs (fonte da verdade); estes endpoints
+# servem ao frontend do DONO do job (JWT) e ao worker (webhook best-effort).
+# Segurança (D9): mfa_code jamais é retornado por API nem logado.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MFA_MAX_CYCLES = 2  # ciclos de novo pedido (código inválido faz o portal re-pedir)
+
+
+class MfaRequiredRequest(BaseModel):
+    """Webhook worker→hub: tela de código MFA detectada (best-effort, telemetria)."""
+    expires_at: Optional[datetime] = None
+    cycle: int = 1
+
+
+class MfaSubmitRequest(BaseModel):
+    """Frontend→hub: código digitado pelo usuário (4 a 8 dígitos)."""
+    codigo: str
+
+
+def mfa_estado(job: Job, now_utc: Optional[datetime] = None) -> dict:
+    """Estado MFA derivado das colunas (função pura — testável sem banco).
+
+    Estados: none | required (aguardando usuário) | provided (aguardando worker)
+             | expired | cancelled | done (consumido e sem novo ciclo)
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if job.mfa_required_at is None and job.mfa_consumed_at is None:
+        return {"estado": "none", "expires_at": None, "cycle": 0, "max_cycles": MFA_MAX_CYCLES}
+    if job.mfa_cancelled:
+        return {"estado": "cancelled", "expires_at": None, "cycle": max(job.mfa_attempts or 0, 1), "max_cycles": MFA_MAX_CYCLES}
+    # done ANTES de provided: o consumo marca mfa_consumed_at sem apagar o código
+    # (o UPDATE...RETURNING devolve o valor pós-update — apagar ali devolveria
+    # NULL sempre; o código é limpo depois pelo worker via limpar_estado).
+    if job.mfa_consumed_at is not None:
+        return {"estado": "done", "expires_at": None, "cycle": max(job.mfa_attempts or 0, 1), "max_cycles": MFA_MAX_CYCLES}
+    if job.mfa_code is not None:
+        return {"estado": "provided", "expires_at": None, "cycle": max(job.mfa_attempts or 0, 1), "max_cycles": MFA_MAX_CYCLES}
+    if job.mfa_expires_at is not None and job.mfa_expires_at <= now_utc:
+        return {"estado": "expired", "expires_at": job.mfa_expires_at, "cycle": max(job.mfa_attempts or 0, 1), "max_cycles": MFA_MAX_CYCLES}
+    return {
+        "estado": "required",
+        "expires_at": job.mfa_expires_at,
+        "cycle": (job.mfa_attempts or 0) + 1,
+        "max_cycles": MFA_MAX_CYCLES,
+    }
+
+
+def _get_owned_mfa_job(job_id: int, current_user, db: Session) -> Job:
+    """Job do convênio Bradesco pertencente ao tenant do usuário (ou admin). Outro tenant → 404 (não vaza existência)."""
+    from dependencies import get_effective_user_id
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    effective_id = get_effective_user_id(current_user)
+    if job.user_id != effective_id and not current_user.is_admin:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    return job
+
+
+@router.get("/mfa/pending")
+def mfa_pending(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Jobs do tenant aguardando código MFA (poll do watcher global do frontend).
+
+    Base do modal: retorna a primeira pendência em "required" (aguardando
+    digitação) — jamais expõe o código.
+    """
+    from dependencies import get_effective_user_id
+    effective_id = get_effective_user_id(current_user)
+    jobs = db.query(Job).filter(
+        Job.user_id == effective_id,
+        Job.status == "processing",
+        Job.mfa_required_at.isnot(None),
+        Job.mfa_cancelled.isnot(True),
+    ).order_by(Job.id.asc()).all()
+    pendentes = []
+    for job in jobs:
+        est = mfa_estado(job)
+        if est["estado"] not in ("required", "provided"):
+            continue
+        guia = None
+        try:
+            p = job.params if isinstance(job.params, dict) else json.loads(job.params or "{}")
+            guia = p.get("guia")
+        except Exception:
+            pass
+        pendentes.append({
+            "job_id": job.id,
+            "estado": est["estado"],
+            "expires_at": est["expires_at"],
+            "cycle": est["cycle"],
+            "rotina": job.rotina,
+            "guia": guia,
+        })
+    return {"pendentes": pendentes}
+
+
+@router.post("/{job_id}/mfa/required")
+def mfa_required(job_id: int, payload: MfaRequiredRequest, db: Session = Depends(get_db)):
+    """Webhook do worker: tela de código MFA detectada (best-effort — o banco é a fonte da verdade)."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    db.add(Log(
+        job_id=job_id, user_id=job.user_id, level="INFO",
+        message=f"[MFA] Código solicitado ao usuário (ciclo {payload.cycle})"
+    ))
+    db.commit()
+    return {"status": "success"}
+
+
+@router.post("/{job_id}/mfa")
+def mfa_submit(job_id: int, payload: MfaSubmitRequest, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Recebe o código MFA digitado pelo DONO do job e o deixa em trânsito para o worker."""
+    job = _get_owned_mfa_job(job_id, current_user, db)
+    codigo = (payload.codigo or "").strip()
+    if not codigo.isdigit() or not (4 <= len(codigo) <= 8):
+        raise HTTPException(status_code=400, detail="Código inválido — informe de 4 a 8 dígitos")
+    if job.status != "processing":
+        raise HTTPException(status_code=400, detail="Job não está em execução")
+    if job.mfa_cancelled:
+        raise HTTPException(status_code=400, detail="Solicitação de código já cancelada")
+    if job.mfa_required_at is None:
+        raise HTTPException(status_code=400, detail="Este job não está aguardando código de verificação")
+    if job.mfa_expires_at is not None and job.mfa_expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Tempo esgotado para informar o código — execute a operação novamente")
+    if job.mfa_consumed_at is not None:
+        raise HTTPException(status_code=400, detail="Código já em processamento pelo robô")
+    job.mfa_code = codigo
+    job.mfa_submitted_at = datetime.now(timezone.utc)
+    db.commit()
+    db.add(Log(job_id=job_id, user_id=job.user_id, level="INFO", message="[MFA] Código recebido do usuário"))
+    db.commit()
+    return {"status": "success", "message": "Código recebido"}
+
+
+@router.post("/{job_id}/mfa/cancel")
+def mfa_cancel(job_id: int, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Usuário cancela a digitação — o worker aborta o login em até 3s."""
+    job = _get_owned_mfa_job(job_id, current_user, db)
+    if job.mfa_required_at is None:
+        raise HTTPException(status_code=400, detail="Este job não está aguardando código de verificação")
+    job.mfa_cancelled = True
+    db.commit()
+    db.add(Log(job_id=job_id, user_id=job.user_id, level="INFO", message="[MFA] Digitação cancelada pelo usuário"))
+    db.commit()
+    return {"status": "success", "message": "Solicitação cancelada"}
+
+
+@router.get("/{job_id}/mfa")
+def mfa_status(job_id: int, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Poll do modal (3s): estado MFA do job — jamais expõe o código."""
+    job = _get_owned_mfa_job(job_id, current_user, db)
+    estado = mfa_estado(job)
+    estado.update({"job_id": job.id, "status": job.status})
+    return estado
 
 
 OP4_ROTINAS = ("4", "op4", "op4_finalizados", "finalizados", "exames_finalizados")

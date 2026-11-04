@@ -206,6 +206,31 @@ def list_faturamentos_por_lote(
     
     return {"data": data, "total": total}
 
+class ProtocoloLoteRequest(BaseModel):
+    protocolo: str
+
+@router.put("/{id_lote}/protocolo")
+def update_lote_protocolo(
+    id_lote: int,
+    request: ProtocoloLoteRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Grava o protocolo/capa do lote no portal (ex.: ConferenciaFaturamento IPASGO)."""
+    protocolo = request.protocolo.strip()
+    if not protocolo or not protocolo.isdigit():
+        raise HTTPException(status_code=400, detail="Informe o protocolo numérico do lote no portal.")
+
+    lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == id_lote).first()
+    if not lote:
+        raise HTTPException(status_code=404, detail="Lote não encontrado.")
+    if not current_user.is_admin and lote.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Sem permissão para este lote.")
+
+    lote.protocolo = protocolo
+    db.commit()
+    return {"id_lote": lote.id_lote, "protocolo": lote.protocolo}
+
 class UpdateLoteItemRequest(BaseModel):
     status_conferencia: Optional[int] = None
     auto_envio: Optional[bool] = False
@@ -236,24 +261,43 @@ def update_lote_item(
             
     if request.status_conferencia is not None:
         item.StatusConferencia = request.status_conferencia
-        
-    # Se auto_envio for True e for IPASGO
+        # Espelha o status legado (67/78/82) na letra do novo portal (A/P/R)
+        item.status_conferencia = {67: "A", 78: "P", 82: "R"}.get(request.status_conferencia)
+
+    # Auto envio ao portal (IPASGO): job OP18 no módulo ConferenciaFaturamento.
+    # Item Inapto (sem data de realização) não é enviável ao portal.
     if request.auto_envio and lote.id_convenio == 6:
+        if item.status_conferencia == "I":
+            raise HTTPException(
+                status_code=400,
+                detail="Item Inapto (sem data de realização) não pode ser enviado ao portal.",
+            )
+        protocolo = (lote.protocolo or "").strip()
+        if not protocolo:
+            raise HTTPException(
+                status_code=400,
+                detail="Lote sem protocolo informado. Grave o protocolo (capa) do lote antes de enviar ao portal.",
+            )
         import json
+        status_portal = {67: "Aceito", 82: "Recusado", 78: "Pendente"}.get(
+            item.StatusConferencia, "Aceito"
+        )
         new_job = Job(
             carteirinha_id=None,
             id_convenio=6,
-            rotina="7",
+            rotina="18",  # OP18: ConferirItem + EditarDataRealizacao (novo portal)
             params=json.dumps({
-                "detalheId": item.detalheId,
-                "status": item.StatusConferencia,
+                "protocolo": protocolo,
+                "codigoPrestador": lote.cod_prestador,
+                "idServico": item.detalheId,
+                "idDetalhe": None,
+                "status": status_portal,
                 "dataRealizacao": item.dataRealizacao.strftime("%d/%m/%Y") if item.dataRealizacao else None,
-                "valorProcedimento": item.ValorProcedimento or ""
             }),
             status="pending",
             user_id=current_user.id
         )
         db.add(new_job)
-        
+
     db.commit()
     return {"message": "Item atualizado com sucesso."}

@@ -13,7 +13,8 @@ from .base import LoteStrategy
 class IpasgoLoteStrategy(LoteStrategy):
 
     tipo_formulario = "numero"
-    rotina_sync = "6"  # OP6: atualização de itens do lote no portal
+    rotina_sync = "17"  # OP17: importa faturáveis do novo módulo ConferenciaFaturamento
+    requer_protocolo = True  # novo portal endereça a conferência por protocolo (capa)
 
     def criar_lote(self, db, current_user, request) -> dict:
         from models import LoteConvenio, Job

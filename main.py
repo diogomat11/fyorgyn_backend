@@ -91,6 +91,13 @@ async def run_cleanup_loop():
             resumo_reconcile = run_reconcile_pending_solicitacoes(db)
             if resumo_reconcile.get("jobs_criados"):
                 print(f"[RECONCILE] {resumo_reconcile}")
+            # Jobs 'processing' órfãos (incidente 2026-10-23): frota morta deixava
+            # locks sem dono — o recover do dispatcher só roda com a frota viva.
+            # O hub recupera quando o job está stale E o slot não heartbeata.
+            from services.cleanup_service import reclaim_orphaned_processing_jobs
+            resumo_reclaim = reclaim_orphaned_processing_jobs(db)
+            if resumo_reclaim.get("reclaimed_pending") or resumo_reclaim.get("reclaimed_error"):
+                print(f"[RECLAIM] {resumo_reclaim}")
         except Exception as e:
             print(f"Cleanup Loop Error: {e}")
         finally:
@@ -160,7 +167,7 @@ from routes import (
     workers, pei, convenios, prio_rules, metrics, agendamentos, server_configs,
     lotes, conciliacao, protocolo, relatorios_rm, motivos_faltas, workflows,
     unidades, crm, integradores, comprovante, workflow_trigger, crons,
-    docs_rm, docs_clinicos
+    docs_rm, docs_clinicos, recurso_glosa
 )
 
 # ── Rate Limiter Middleware ──
@@ -224,6 +231,7 @@ app.include_router(conciliacao.router, prefix="/api")
 app.include_router(protocolo.router, prefix="/api")
 app.include_router(relatorios_rm.router, prefix="/api")
 app.include_router(motivos_faltas.router, prefix="/api")
+app.include_router(recurso_glosa.router, prefix="/api")
 app.include_router(workflows.router, prefix="/api")
 app.include_router(unidades.router, prefix="/api")
 app.include_router(crm.router, prefix="/api")

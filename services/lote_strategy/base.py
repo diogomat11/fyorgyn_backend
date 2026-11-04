@@ -21,6 +21,9 @@ class LoteStrategy(ABC):
     # Rotina de sincronização de lote (ícone Sincronizar): None = convênio sem
     # rotina de sincronização (botão desabilitado no frontend).
     rotina_sync = None
+    # Convênios cujo portal endereça o lote por protocolo/capa (ex.: IPASGO
+    # ConferenciaFaturamento) — frontend exibe coluna Protocolo editável.
+    requer_protocolo = False
 
     @abstractmethod
     def criar_lote(self, db, current_user, request) -> dict:
@@ -36,6 +39,7 @@ class LoteStrategy(ABC):
             "nome": getattr(convenio, "nome", None),
             "tipo_formulario": self.tipo_formulario,
             "rotina_sync": self.rotina_sync,
+            "requer_protocolo": self.requer_protocolo,
             "lote_periodo_tipo": getattr(convenio, "lote_periodo_tipo", None),
             "lote_dia_inicio": getattr(convenio, "lote_dia_inicio", None),
             "lote_dia_fim": getattr(convenio, "lote_dia_fim", None),

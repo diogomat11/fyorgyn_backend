@@ -4,6 +4,7 @@ Convênio canônico: 16 (public.convenios 'CAESAN', relação 1:N via id_integra
 Normaliza os params do form/planilha para as chaves strict da OP1 do 102-caesan.
 """
 from fastapi import HTTPException
+from datetime import datetime, date
 
 from .base import SolicitacaoStrategy
 
@@ -61,6 +62,25 @@ class CaesanSolicitacaoStrategy(SolicitacaoStrategy):
             quantidade = int(float(p.get("quantidade") or p.get("qtde") or p.get("qtde_solicitada") or 1))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="CAESAN: parâmetro 'quantidade' inválido.")
+
+        # O portal CAESAN LIMPA data de atendimento no passado no blur
+        # (verificarData) — a solicitação não é gravada. Rejeita antes de gastar
+        # execução no portal.
+        from datetime import date
+        data_atend = p.get("data_atendimento") or p.get("data_solicitacao") or p.get("dataSolicitacao")
+        if data_atend:
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    d = datetime.strptime(str(data_atend).split(" ")[0], fmt).date()
+                    if d < date.today():
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"CAESAN: data_atendimento ({d.strftime('%d/%m/%Y')}) está no passado — "
+                                   "o portal limpa datas passadas (verificarData) e a solicitação não é gravada.",
+                        )
+                    break
+                except ValueError:
+                    continue
 
         p.update({
             "carteira": carteira,

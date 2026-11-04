@@ -17,3 +17,15 @@ def localize_datetime(dt):
         return dt.replace(tzinfo=timezone.utc).astimezone(TZ_SP)
     return dt
 
+
+def data_local_para_utc_inicio(d: date) -> datetime:
+    """00:00 do fuso de São Paulo convertido para UTC (início inclusivo de filtro
+    de data da UI — created_at é gravado em UTC; comparar a data crua deslocava
+    jobs de 21h-23h59 locais para o dia seguinte do filtro)."""
+    return datetime.combine(d, datetime.min.time(), tzinfo=TZ_SP).astimezone(timezone.utc)
+
+
+def data_local_para_utc_fim_exclusivo(d: date) -> datetime:
+    """Limite exclusivo de fim de dia do fuso de São Paulo convertido para UTC."""
+    return data_local_para_utc_inicio(d) + timedelta(days=1)
+

@@ -23,14 +23,26 @@ def heartbeat(data: HeartbeatSchema, db: Session = Depends(get_db)):
     Endpoint for workers to send heartbeat.
     Returns instructions (commands).
     """
-    result = worker_service.register_heartbeat(
-        db, 
-        hostname=data.hostname, 
-        status=data.status, 
-        current_job_id=data.current_job_id, 
-        meta=data.meta
-    )
-    return result
+    from sqlalchemy.exc import OperationalError
+
+    # O pooler do Supabase derruba conexões ocasionalmente ("SSL connection
+    # has been closed unexpectedly"): retry único com rollback — NullPool abre
+    # conexão nova na tentativa seguinte e o heartbeat é idempotente (upsert
+    # por hostname). Sem isso o Local_worker via o heartbeat falhar e marcava
+    # o servidor offline sem necessidade.
+    for attempt in range(2):
+        try:
+            return worker_service.register_heartbeat(
+                db,
+                hostname=data.hostname,
+                status=data.status,
+                current_job_id=data.current_job_id,
+                meta=data.meta
+            )
+        except OperationalError:
+            if attempt == 1:
+                raise
+            db.rollback()
 
 from dependencies import get_current_user
 

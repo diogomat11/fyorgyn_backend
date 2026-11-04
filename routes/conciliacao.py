@@ -325,6 +325,7 @@ def reverter_conciliacao(
             fat.agendamento_id = None
             fat.dataRealizacao = None
             fat.StatusConferencia = 78  # Não Conferido
+            fat.status_conferencia = "P"
             fat.StatusConciliacao = "pendente"
             itens_faturamento_revertidos.append(fat)
             
@@ -339,20 +340,22 @@ def reverter_conciliacao(
     # Limpar vínculo no lote de agendamento
     lote_ag.id_lote_convenio = None
     
-    # Criar Job OP7 de reversão se auto_envio for True e for IPASGO
+    # Criar Job OP18 de reversão se auto_envio for True e for IPASGO
     if request.auto_envio and lote_conv and lote_conv.id_convenio == 6 and itens_faturamento_revertidos:
         import json
         new_job = Job(
             carteirinha_id=None,
             id_convenio=6,
-            rotina="7",
+            rotina="18",  # OP18: ConferirItem (novo portal ConferenciaFaturamento)
             params=json.dumps({
+                "protocolo": (lote_conv.protocolo or "").strip(),
+                "codigoPrestador": lote_conv.cod_prestador,
                 "itens": [
                     {
-                        "detalheId": fat.detalheId,
-                        "status": 78,  # Retorna para Não Conferido no portal
+                        "idServico": fat.detalheId,
+                        "idDetalhe": None,
+                        "status": "Pendente",  # Retorna para Pendente no portal
                         "dataRealizacao": None,
-                        "valorProcedimento": fat.ValorProcedimento or ""
                     } for fat in itens_faturamento_revertidos
                 ]
             }),
@@ -475,6 +478,7 @@ def conciliar_lote(
             fat.agendamento_id = ag.id_agendamento
             fat.dataRealizacao = ag.data
             fat.StatusConferencia = 67
+            fat.status_conferencia = "A"
             fat.StatusConciliacao = "Conciliado"
             
             lai.status_conciliacao = "Conciliado"
@@ -489,20 +493,22 @@ def conciliar_lote(
         LoteAgendamentoItem.status_conciliacao != "Conciliado"
     ).count()
     
-    # Criar Job OP7 se auto_envio for True e for IPASGO
+    # Criar Job OP18 se auto_envio for True e for IPASGO
     if request.auto_envio and lote_conv.id_convenio == 6 and itens_conciliados:
         import json
         new_job = Job(
             carteirinha_id=None,
             id_convenio=6,
-            rotina="7",
+            rotina="18",  # OP18: ConferirItem + EditarDataRealizacao (novo portal)
             params=json.dumps({
+                "protocolo": (lote_conv.protocolo or "").strip(),
+                "codigoPrestador": lote_conv.cod_prestador,
                 "itens": [
                     {
-                        "detalheId": fat.detalheId,
-                        "status": 67,
+                        "idServico": fat.detalheId,
+                        "idDetalhe": None,
+                        "status": "Aceito",
                         "dataRealizacao": fat.dataRealizacao.strftime("%d/%m/%Y") if fat.dataRealizacao else None,
-                        "valorProcedimento": fat.ValorProcedimento or ""
                     } for fat in itens_conciliados
                 ]
             }),
@@ -552,8 +558,9 @@ def conciliar_manual(
     fat.agendamento_id = ag.id_agendamento
     fat.dataRealizacao = request.data_realizacao if request.data_realizacao else ag.data
     fat.StatusConferencia = 67
+    fat.status_conferencia = "A"
     fat.StatusConciliacao = "Conciliado"
-    
+
     # Atualizar item do lote de agendamento se existir
     lai = db.query(LoteAgendamentoItem).filter(
         LoteAgendamentoItem.id_agendamento == ag.id_agendamento
@@ -561,8 +568,8 @@ def conciliar_manual(
     if lai:
         lai.status_conciliacao = "Conciliado"
         lai.id_faturamento_lote = fat.id
-    
-    # Criar Job OP7 se auto_envio for True e for IPASGO
+
+    # Criar Job OP18 se auto_envio for True e for IPASGO
     if request.auto_envio:
         lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == fat.id_lote).first()
         if lote and lote.id_convenio == 6:
@@ -570,12 +577,14 @@ def conciliar_manual(
             new_job = Job(
                 carteirinha_id=None,
                 id_convenio=6,
-                rotina="7",
+                rotina="18",  # OP18: ConferirItem + EditarDataRealizacao (novo portal)
                 params=json.dumps({
-                    "detalheId": fat.detalheId,
-                    "status": 67,
+                    "protocolo": (lote.protocolo or "").strip(),
+                    "codigoPrestador": lote.cod_prestador,
+                    "idServico": fat.detalheId,
+                    "idDetalhe": None,
+                    "status": "Aceito",
                     "dataRealizacao": fat.dataRealizacao.strftime("%d/%m/%Y") if fat.dataRealizacao else None,
-                    "valorProcedimento": fat.ValorProcedimento or ""
                 }),
                 status="pending",
                 user_id=current_user.id
@@ -632,6 +641,7 @@ def editar_item(
                 fat.agendamento_id = ag.id_agendamento
                 fat.dataRealizacao = ag.data
                 fat.StatusConferencia = 67
+                fat.status_conferencia = "A"
                 fat.StatusConciliacao = "Conciliado"
                 conciliado = True
                 # Atualizar item do lote de agendamento
@@ -651,7 +661,7 @@ def editar_item(
             if guia_obj:
                 status_ver = compute_status_verificacao(ag.data, guia_obj)
     
-    # Criar Job OP7 se auto_envio for True e for IPASGO
+    # Criar Job OP18 se auto_envio for True e for IPASGO
     if conciliado and request.auto_envio:
         lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == fat.id_lote).first()
         if lote and lote.id_convenio == 6:
@@ -659,12 +669,14 @@ def editar_item(
             new_job = Job(
                 carteirinha_id=None,
                 id_convenio=6,
-                rotina="7",
+                rotina="18",  # OP18: ConferirItem + EditarDataRealizacao (novo portal)
                 params=json.dumps({
-                    "detalheId": fat.detalheId,
-                    "status": 67,
+                    "protocolo": (lote.protocolo or "").strip(),
+                    "codigoPrestador": lote.cod_prestador,
+                    "idServico": fat.detalheId,
+                    "idDetalhe": None,
+                    "status": "Aceito",
                     "dataRealizacao": fat.dataRealizacao.strftime("%d/%m/%Y") if fat.dataRealizacao else None,
-                    "valorProcedimento": fat.ValorProcedimento or ""
                 }),
                 status="pending",
                 user_id=current_user.id
@@ -809,16 +821,17 @@ def conciliar_manual_por_agendamento(
     fat.agendamento_id = ag.id_agendamento
     fat.dataRealizacao = request.data_realizacao if request.data_realizacao else ag.data
     fat.StatusConferencia = 67
+    fat.status_conferencia = "A"
     fat.StatusConciliacao = "Conciliado"
-    
+
     lai = db.query(LoteAgendamentoItem).filter(
         LoteAgendamentoItem.id_agendamento == ag.id_agendamento
     ).first()
     if lai:
         lai.status_conciliacao = "Conciliado"
         lai.id_faturamento_lote = fat.id
-    
-    # Criar Job OP7 se auto_envio for True e for IPASGO
+
+    # Criar Job OP18 se auto_envio for True e for IPASGO
     if request.auto_envio:
         lote = db.query(LoteConvenio).filter(LoteConvenio.id_lote == fat.id_lote).first()
         if lote and lote.id_convenio == 6:
@@ -826,12 +839,14 @@ def conciliar_manual_por_agendamento(
             new_job = Job(
                 carteirinha_id=None,
                 id_convenio=6,
-                rotina="7",
+                rotina="18",  # OP18: ConferirItem + EditarDataRealizacao (novo portal)
                 params=json.dumps({
-                    "detalheId": fat.detalheId,
-                    "status": 67,
+                    "protocolo": (lote.protocolo or "").strip(),
+                    "codigoPrestador": lote.cod_prestador,
+                    "idServico": fat.detalheId,
+                    "idDetalhe": None,
+                    "status": "Aceito",
                     "dataRealizacao": fat.dataRealizacao.strftime("%d/%m/%Y") if fat.dataRealizacao else None,
-                    "valorProcedimento": fat.ValorProcedimento or ""
                 }),
                 status="pending",
                 user_id=current_user.id
@@ -887,23 +902,26 @@ def delete_lote_agendamento(
                 fat.agendamento_id = None
                 fat.dataRealizacao = None
                 fat.StatusConferencia = 78  # Não Conferido
+                fat.status_conferencia = "P"
                 fat.StatusConciliacao = "pendente"
                 itens_faturamento_revertidos.append(fat)
 
-        # Enfileirar Job OP7 de reversão se auto_envio for True e for IPASGO
+        # Enfileirar Job OP18 de reversão se auto_envio for True e for IPASGO
         if auto_envio and lote_conv and lote_conv.id_convenio == 6 and itens_faturamento_revertidos:
             import json
             new_job = Job(
                 carteirinha_id=None,
                 id_convenio=6,
-                rotina="7",
+                rotina="18",  # OP18: ConferirItem (novo portal ConferenciaFaturamento)
                 params=json.dumps({
+                    "protocolo": (lote_conv.protocolo or "").strip(),
+                    "codigoPrestador": lote_conv.cod_prestador,
                     "itens": [
                         {
-                            "detalheId": fat.detalheId,
-                            "status": 78,
+                            "idServico": fat.detalheId,
+                            "idDetalhe": None,
+                            "status": "Pendente",  # Retorna para Pendente no portal
                             "dataRealizacao": None,
-                            "valorProcedimento": fat.ValorProcedimento or ""
                         } for fat in itens_faturamento_revertidos
                     ]
                 }),

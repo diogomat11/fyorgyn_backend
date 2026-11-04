@@ -17,13 +17,18 @@ DB_HOST = os.getenv("SUPABASE_DB_HOST", "db.ourddwzetcbdjnbvamgj.supabase.co")
 DB_PORT = os.getenv("SUPABASE_DB_PORT", "5432")
 DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
 
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
 
-# Prefer DATABASE_URL when explicitly set: enables the Supabase POOLER (IPv4),
-# using port 6543 (transaction mode) with NullPool to prevent connection exhaustion.
+# Prefer DATABASE_URL when explicitly set. A reescrita de porta 5432→6543 só
+# se aplica ao POOLER (modo transação): URLs diretos (db.<ref>.supabase.co:5432)
+# devem ser honrados como estão — reescrever a porta de um host direto apontava
+# para um endpoint inexistente.
 _DATABASE_URL_ENV = os.getenv("DATABASE_URL", "").strip()
 if _DATABASE_URL_ENV:
-    SQLALCHEMY_DATABASE_URL = _DATABASE_URL_ENV.replace(":5432", ":6543")
+    if "pooler.supabase.com" in _DATABASE_URL_ENV:
+        SQLALCHEMY_DATABASE_URL = _DATABASE_URL_ENV.replace(":5432", ":6543")
+    else:
+        SQLALCHEMY_DATABASE_URL = _DATABASE_URL_ENV
 elif DB_HOST and "supabase.co" in DB_HOST and DB_PASSWORD:
     SQLALCHEMY_DATABASE_URL = f"postgresql://postgres:{DB_PASSWORD}@{DB_HOST}:5432/{DB_NAME}"
 else:
@@ -32,7 +37,17 @@ else:
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     use_native_hstore=False,
-    poolclass=NullPool,
+    # Pool limitado com pre_ping substitui o NullPool: NullPool abria conexão
+    # nova (TCP+SSL) por request — na rede degradada cada handshake era uma
+    # chance a mais de "SSL connection has been closed unexpectedly", além do
+    # custo de ~600ms por request. O pool reutiliza conexões saudáveis e o
+    # pre_ping descarta as mortas antes de usar.
+    poolclass=QueuePool,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,
+    pool_recycle=300,
+    pool_pre_ping=True,
     connect_args={
         "prepare_threshold": None,
         "keepalives": 1,

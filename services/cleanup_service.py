@@ -1,14 +1,97 @@
 
 from sqlalchemy.orm import Session
-from models import Carteirinha, Job
+from models import Carteirinha, Job, Worker, Log
 from datetime import datetime, timezone, timedelta
 import logging
 import json
+import os
 
 from services import storage_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Reclaim de jobs órfãos (incidente 2026-10-23): frota morta deixava jobs em
+# 'processing' com lock sem dono — o recover_stuck_jobs do dispatcher só roda
+# COM a frota viva (limiar de 180min). O hub é o coordenador (os heartbeats
+# dos slots chegam nele), então é ele quem recupera quando a frota some.
+RECLAIM_STALE_MINUTES = int(os.environ.get("RECLAIM_STALE_MINUTES", "30") or 30)
+RECLAIM_HEARTBEAT_FRESH_MINUTES = int(os.environ.get("RECLAIM_HEARTBEAT_FRESH_MINUTES", "10") or 10)
+
+
+def _porta_do_slot(locked_by):
+    """Extrai a porta do locked_by (ex.: 'http://127.0.0.1:9000' → '9000')."""
+    if not isinstance(locked_by, str) or ":" not in locked_by:
+        return None
+    porta = locked_by.rsplit(":", 1)[-1].strip("/ ")
+    return porta if porta.isdigit() else None
+
+
+def _heartbeat_fresh(heartbeat, now=None, fresh_minutes: int = RECLAIM_HEARTBEAT_FRESH_MINUTES) -> bool:
+    """True se o heartbeat do slot é recente (slot presumido vivo). Puro — testável."""
+    if heartbeat is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    hb = heartbeat if heartbeat.tzinfo else heartbeat.replace(tzinfo=timezone.utc)
+    return (now - hb) <= timedelta(minutes=fresh_minutes)
+
+
+def reclaim_orphaned_processing_jobs(db: Session) -> dict:
+    """
+    Recupera jobs 'processing' órfãos: sem update há > RECLAIM_STALE_MINUTES E
+    cujo slot (locked_by → porta → worker.workers.hostname 'Sama-<porta>') não
+    heartbeata há > RECLAIM_HEARTBEAT_FRESH_MINUTES. Jobs longos renovam
+    updated_at em chunks (OP4 ~2h40m), então staleness do job + heartbeat morto
+    é prova suficiente de órfão. Worker vivo → job intocado (o dispatcher
+    continua dono do caso 'worker vivo, job lento').
+    """
+    now = datetime.now(timezone.utc)
+    threshold = now - timedelta(minutes=RECLAIM_STALE_MINUTES)
+    resumo = {"reclaimed_pending": 0, "reclaimed_error": 0, "skipped_worker_vivo": 0}
+    try:
+        jobs = db.query(Job).filter(
+            Job.status == "processing",
+            Job.updated_at < threshold
+        ).all()
+
+        for job in jobs:
+            porta = _porta_do_slot(job.locked_by)
+            slot_vivo = False
+            if porta:
+                worker = db.query(Worker).filter(
+                    Worker.hostname.ilike(f"%-{porta}")
+                ).first()
+                if worker is not None:
+                    slot_vivo = _heartbeat_fresh(worker.last_heartbeat, now)
+            if slot_vivo:
+                resumo["skipped_worker_vivo"] += 1
+                continue
+
+            esgotou = (job.attempts or 0) >= (job.max_attempts or 3)
+            slot_antigo = job.locked_by
+            job.status = "error" if esgotou else "pending"
+            job.locked_by = None
+            job.updated_at = now
+            if esgotou:
+                job.error_message = f"Worker morreu sem finalizar (reclaim do hub: slot {slot_antigo} sem heartbeat)"
+                resumo["reclaimed_error"] += 1
+            else:
+                resumo["reclaimed_pending"] += 1
+            db.add(Log(
+                job_id=job.id, user_id=job.user_id, level="WARNING",
+                message=f"[RECLAIM] Job órfão recuperado pelo hub (slot {slot_antigo} sem heartbeat): -> {job.status}"
+            ))
+
+        if resumo["reclaimed_pending"] or resumo["reclaimed_error"]:
+            db.commit()
+            logger.warning(f"[RECLAIM] {resumo}")
+    except Exception as e:
+        logger.error(f"Reclaim de jobs órfãos falhou: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    return resumo
 
 def delete_expired_patients(db: Session):
     """

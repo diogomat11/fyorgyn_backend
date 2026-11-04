@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, DateTime, Time, ForeignKey, Text, Float, Boolean, JSON, UniqueConstraint, Index, text
+from sqlalchemy import Column, Integer, String, Date, DateTime, Time, ForeignKey, Text, Float, Boolean, JSON, UniqueConstraint, Index, text, BigInteger
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, foreign
 from sqlalchemy.sql import func
@@ -107,6 +107,15 @@ class Job(Base):
     timeout = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    # MFA Bradesco (Faturi) — estado em trânsito do código (migration 0113).
+    # mfa_code é apagado após consumo; jamais logar/expo (plano_mfa_bradesco D9).
+    mfa_required_at = Column(DateTime(timezone=True), nullable=True)
+    mfa_expires_at = Column(DateTime(timezone=True), nullable=True)
+    mfa_code = Column(Text, nullable=True)
+    mfa_submitted_at = Column(DateTime(timezone=True), nullable=True)
+    mfa_consumed_at = Column(DateTime(timezone=True), nullable=True)
+    mfa_cancelled = Column(Boolean, default=False)
+    mfa_attempts = Column(Integer, default=0)
 
     carteirinha_rel = relationship("Carteirinha", primaryjoin="Job.carteirinha_id == Carteirinha.id", back_populates="jobs")
     convenio_rel = relationship(lambda: Convenio)
@@ -616,6 +625,7 @@ class FaturamentoLote(Base):
     dataRealizacao = Column(Date)
     Guia = Column(Text)
     StatusConferencia = Column(Integer)
+    status_conferencia = Column(Text)  # Novo portal ConferenciaFaturamento: A/P/R/I (I=Inapto, sem data); espelha StatusConferencia
     ValorProcedimento = Column(Float)
     cod_procedimento_fat = Column(Text, nullable=True)
     agendamento_id = Column(Integer, ForeignKey("agendamentos.id_agendamento", ondelete="SET NULL"), nullable=True, index=True)
@@ -632,11 +642,12 @@ class LoteConvenio(Base):
     numero_lote = Column(Integer, index=True)
     cod_prestador = Column(Text)
     status = Column(Text, default="Aberto") # Aberto, Enviado, Cancelado
+    protocolo = Column(Text)  # Protocolo/capa do lote no portal (módulo RecursoGlosa, OPs 10/16)
     data_inicio = Column(Date, nullable=True)
     data_fim = Column(Date, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    
+
     convenio_rel = relationship("Convenio")
 
 class LoteAgendamento(Base):
@@ -665,6 +676,60 @@ class LoteAgendamentoItem(Base):
     status_conciliacao = Column(Text, default="Não Conciliado")
     id_faturamento_lote = Column(Integer, ForeignKey("faturamento_lotes.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class JustificativaGlosa(Base):
+    __tablename__ = "justificativas_glosa"
+    __table_args__ = {'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    descricao = Column(Text, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    status = Column(Text, default="Ativo")
+
+class RecursoGlosaItem(Base):
+    __tablename__ = "recurso_glosa_itens"
+    __table_args__ = (
+        UniqueConstraint('id_lote', 'chave', name='uq_recurso_glosa_lote_chave'),
+        {'extend_existing': True}
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_lote = Column(Integer, ForeignKey("lotes_convenio.id_lote", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    protocolo = Column(Text)
+
+    # Identificadores do portal (payload do envio na OP16)
+    chave = Column(BigInteger, nullable=False)
+    chave_ut_serv = Column(BigInteger)
+    quantidade_glosada = Column(Integer)
+    valor_unitario_glosado = Column(Float)
+    valor_recurso = Column(Float)
+
+    # Segurado/beneficiário
+    codigo_segurado = Column(Text, index=True)
+    nome_segurado = Column(Text)
+    carteirinha_id = Column(Integer, ForeignKey("carteirinhas.id", ondelete="SET NULL"), index=True)
+
+    # Guia e procedimento (guia sem zeros à esquerda; codigo_amb sem '.' e '-')
+    guia = Column(Text, index=True)
+    base_guia_id = Column(Integer, ForeignKey("base_guias.id", ondelete="SET NULL"))
+    codigo_amb = Column(Text)
+    descricao_servico = Column(Text)
+
+    # Fatura correspondente no lote (filtro por data via dataRealizacao)
+    id_faturamento_lote = Column(Integer, ForeignKey("faturamento_lotes.id", ondelete="SET NULL"))
+
+    # Justificativas: texto atual no portal x texto aplicado pelo usuário
+    justificativa_portal = Column(Text)
+    justificativa_id = Column(Integer, ForeignKey("justificativas_glosa.id", ondelete="SET NULL"))
+    justificativa_texto = Column(Text)
+
+    # Pendente | Justificativa Definida | Enviado
+    status = Column(Text, default="Pendente", index=True)
+    data_envio = Column(DateTime(timezone=True))
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 class ProtocoloLote(Base):
     """Batch (lote) of PDF files for extraction processing."""

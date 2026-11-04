@@ -1603,6 +1603,28 @@ def _process_single_job(db: Session, job, synced_counts: dict) -> None:
         rotina = str(job.rotina).lower()
         res_data = job.result_data
 
+        # Recurso de Glosa: consumo delegado ao serviço dedicado (OPs 10/16)
+        if rotina in ["10", "op10", "op10_recurso_glosa"] and res_data:
+            from services.recurso_glosa_service import upsert_itens_recurso_glosa
+            upsert_itens_recurso_glosa(db, job, res_data, synced_counts)
+            return
+
+        if rotina in ["16", "op16", "op16_enviar_recurso_glosa"] and res_data:
+            from services.recurso_glosa_service import marcar_itens_enviados
+            marcar_itens_enviados(db, job, res_data, synced_counts)
+            return
+
+        # Conferência de Faturamento (novo modal): consumo delegado ao serviço dedicado
+        if rotina in ["17", "op17", "op17_importar_conferencia"] and res_data:
+            from services.faturamento_conferencia_service import upsert_itens_conferencia
+            upsert_itens_conferencia(db, job, res_data, synced_counts)
+            return
+
+        if rotina in ["18", "op18", "op18_conferir_faturamento"] and res_data:
+            from services.faturamento_conferencia_service import marcar_itens_conferidos
+            marcar_itens_conferidos(db, job, res_data, synced_counts)
+            return
+
         if (rotina in ["6", "op6", "op6_check_baixados"]) and res_data:
             p_params = json.loads(job.params) if isinstance(job.params, str) else (job.params or {})
             numero_lote = p_params.get("numero_lote", p_params.get("loteId"))
@@ -1824,17 +1846,29 @@ def _process_single_job(db: Session, job, synced_counts: dict) -> None:
                     if lote_obj:
                         lote_obj.numero_lote = lote_id_api
                         lote_obj.status = "Aberto"
+                        # Protocolo do novo portal (se o LoadLotes já o expuser)
+                        protocolo_pronto = res_data.get("protocolo")
+                        if protocolo_pronto and not lote_obj.protocolo:
+                            lote_obj.protocolo = str(protocolo_pronto)
                         db.commit()
 
-                op6_params = {
-                    "codigoPrestador": cod_prestador,
+                # Importação pelo novo módulo ConferenciaFaturamento (OP17):
+                # exige protocolo (capa). Sem protocolo conhecido, o job falha
+                # com mensagem clara e o usuário informa na tela de lotes.
+                protocolo_job = res_data.get("protocolo")
+                if not protocolo_job and id_lote_interno:
+                    lote_obj = db.query(LoteConvenio).filter_by(id_lote=id_lote_interno).first()
+                    protocolo_job = (lote_obj.protocolo if lote_obj else None) or ""
+                op17_params = {
+                    "protocolo": str(protocolo_job or ""),
                     "numero_lote": lote_id_api,
+                    "codigoPrestador": cod_prestador,
                     "id_lote_interno": id_lote_interno
                 }
                 new_job = JobModel(
                     id_convenio=job.id_convenio,
-                    rotina="6",
-                    params=json.dumps(op6_params),
+                    rotina="17",
+                    params=json.dumps(op17_params),
                     status="pending",
                     priority=10,
                     user_id=job.user_id

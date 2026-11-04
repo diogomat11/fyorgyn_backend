@@ -121,7 +121,11 @@ def _send_jobs_to_worker(jobs_payload: List[dict], db: Optional[Session] = None)
     }
     url = f"{BACKEND_WORKER_URL}/api/v1/jobs/batch"
     try:
-        response = requests.post(url, json={"jobs": jobs_payload}, headers=headers, timeout=20)
+        # Timeout proporcional ao lote: lotes grandes (ex.: 1.4k guias do Fature)
+        # levam bem mais que 20s para serem gravados pela ponte — timeout fixo
+        # devolvia 502 ao frontend com os jobs sendo criados (incidente do PO).
+        batch_timeout = min(20 + len(jobs_payload), 300)
+        response = requests.post(url, json={"jobs": jobs_payload}, headers=headers, timeout=batch_timeout)
         if response.status_code == 201:
             return len(response.json())
         else:

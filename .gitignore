@@ -69,3 +69,6 @@ uploads/
 # Debug / artefatos pesados
 *.html
 graphify-out/
+
+# Exports
+exports/
