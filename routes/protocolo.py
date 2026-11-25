@@ -352,12 +352,22 @@ def download_zip(
     part_suffix = f"_{part:02d}" if len(zip_parts) > 1 else ""
     filename = f"LOTE_{lote_id:03d}{part_suffix}.zip"
 
+    # Iterar um BytesIO direto no StreamingResponse entrega o binário em
+    # "linhas" (readline), gerando milhares de chunks minúsculos — um ZIP de
+    # 85MB chegava a levar >2min para transferir mesmo em localhost. Ler em
+    # blocos de 1MB restaura a velocidade esperada.
+    zip_buffer.seek(0)
+    stream = iter(lambda: zip_buffer.read(1024 * 1024), b"")
+
     return StreamingResponse(
-        zip_buffer,
+        stream,
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Total-Parts": str(len(zip_parts)),
+            # ZIP já é comprimido: com este header o GZipMiddleware repassa o
+            # corpo sem tentar recomprimir (CPU desperdiçada, ganho ~0%)
+            "Content-Encoding": "identity",
         },
     )
 

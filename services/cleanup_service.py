@@ -1,5 +1,6 @@
 
 from sqlalchemy.orm import Session
+from sqlalchemy import cast, Text
 from models import Carteirinha, Job, Worker, Log
 from datetime import datetime, timezone, timedelta
 import logging
@@ -107,6 +108,8 @@ def delete_expired_patients(db: Session):
         ).all()
 
         count = len(expired_patients)
+        db.commit()  # fecha a transação da leitura — sem 'idle in transaction'
+                     # durante o resto do ciclo (Supavisor mata conexão ociosa)
         if count > 0:
             logger.info(f"Cleanup: Found {count} expired temporary patients. Deleting...")
 
@@ -134,6 +137,20 @@ def _is_anexo_url(val) -> bool:
     return val.startswith("/uploads/anexos/") or ("supabase" in val and "/anexos/" in val)
 
 
+# Janela de varredura do cleanup de anexos por job (dias). O ciclo roda a cada
+# 10min: sem janela ele recarregava TODOS os jobs finalizados >24h (milhares,
+# crescendo para sempre) e re-deletava os mesmos anexos por HTTP — ~80s por
+# ciclo. Anexos mais antigos que a janela já são cobertos pelo sweep de orfãos
+# (cleanup_orphan_anexos, 48h), então a janela só perde a garantia "24h" para
+# jobs finalizados entre a janela e o sweep — inexistentes na prática.
+ANEXOS_JOB_WINDOW_DAYS = int(os.environ.get("ANEXOS_JOB_WINDOW_DAYS", "3") or 3)
+
+# Jobs cujos anexos já foram removidos por ESTE processo (id -> updated_at).
+# Evita re-deletar (DELETE 404 no Storage) o mesmo job a cada ciclo enquanto
+# ele permanece na janela. Memória limitada pela própria janela.
+_ANEXOS_LIMPOS = {}
+
+
 def cleanup_expired_attachments(db: Session):
     """
     Remove anexos de jobs concluidos ha mais de 24h (Supabase Storage bucket
@@ -143,16 +160,35 @@ def cleanup_expired_attachments(db: Session):
 
     # 1. Anexos associados a jobs finalizados ha mais de 24 horas
     try:
-        cutoff = datetime.utcnow() - timedelta(hours=24)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        window_start = now - timedelta(days=ANEXOS_JOB_WINDOW_DAYS)
+        # Poda o registro dos já limpos que saíram da janela
+        for jid, upd in list(_ANEXOS_LIMPOS.items()):
+            upd_aware = upd if upd.tzinfo else upd.replace(tzinfo=timezone.utc)
+            if upd_aware < window_start:
+                del _ANEXOS_LIMPOS[jid]
         completed_jobs = db.query(Job).filter(
             Job.status.in_(["success", "error"]),
-            Job.updated_at < cutoff
+            Job.updated_at < cutoff,
+            Job.updated_at >= window_start,
+            # Prefilter: só jobs cujo params menciona anexo (JSONB cast text)
+            Job.params.isnot(None),
+            cast(Job.params, Text).like('%"anexo%'),
         ).all()
+        # Fecha a transação da leitura ANTES dos DELETEs HTTP no Storage —
+        # manter a sessão 'idle in transaction' durante I/O lento faz o
+        # Supavisor matar a conexão (incidente 2026-11-21).
+        db.commit()
 
         removed_count = 0
         for job in completed_jobs:
-            if not job.params:
+            if not job.params or job.id in _ANEXOS_LIMPOS:
                 continue
+
+            # Marca antes de processar: DELETE é idempotente, então um crash
+            # no meio só adia a remoção para o sweep de orfãos (48h).
+            _ANEXOS_LIMPOS[job.id] = job.updated_at
 
             try:
                 params = json.loads(job.params) if isinstance(job.params, str) else job.params

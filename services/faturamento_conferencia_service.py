@@ -100,10 +100,16 @@ def upsert_itens_conferencia(db: Session, job, res_data: dict, synced_counts: di
             db.commit()
             return
         datas = [d for d in (_para_data(i.get("dataRealizacao")) for i in itens) if d]
+        cod_prestador = (
+            p_params.get("codigoPrestador")
+            or p_params.get("cod_prestador")
+            or ""
+        )
         lote = LoteConvenio(
             id_convenio=6,
             numero_lote=numero_lote,
             protocolo=protocolo or None,
+            cod_prestador=str(cod_prestador).strip() or None,
             status="Aberto",
             user_id=job.user_id,
             data_inicio=min(datas) if datas else None,
@@ -170,6 +176,8 @@ def upsert_itens_conferencia(db: Session, job, res_data: dict, synced_counts: di
             existente.Guia = str(item.get("guia") or existente.Guia or "")
             existente.StatusConferencia = inteiro
             existente.status_conferencia = letra
+            if "tem_anexo" in item and item.get("tem_anexo") is not None:
+                existente.tem_anexo = bool(item.get("tem_anexo"))
             existente.ValorProcedimento = item.get("ValorProcedimento", existente.ValorProcedimento)
             existente.CodigoBeneficiario = item.get("codigo_beneficiario") or existente.CodigoBeneficiario
             existente.cod_procedimento_fat = item.get("cod_procedimento_fat") or existente.cod_procedimento_fat
@@ -185,6 +193,7 @@ def upsert_itens_conferencia(db: Session, job, res_data: dict, synced_counts: di
                 Guia=str(item.get("guia") or ""),
                 StatusConferencia=inteiro,
                 status_conferencia=letra,
+                tem_anexo=bool(item.get("tem_anexo", False)),
                 ValorProcedimento=item.get("ValorProcedimento", 0.0),
                 cod_procedimento_fat=item.get("cod_procedimento_fat", ""),
                 id_lote=lote.id_lote,
@@ -267,6 +276,30 @@ def marcar_itens_conferidos(db: Session, job, res_data: dict, synced_counts: dic
 
     print(f"[SYNC] Job {job.id} OP18: {atualizados} item(ns) atualizados "
           f"({len(res_data.get('itens_erro') or [])} erro(s) no worker).")
+
+    job.result_consumed = True
+    synced_counts["jobs_processed"] = synced_counts.get("jobs_processed", 0) + 1
+    db.commit()
+
+
+def marcar_guia_com_anexo(db: Session, job, res_data: dict, synced_counts: dict) -> None:
+    """Consome o resultado da OP19: marca tem_anexo=True nos itens da guia no lote."""
+    p_params = _parse_params(job)
+    inner = res_data.get("data") if isinstance(res_data, dict) and isinstance(res_data.get("data"), dict) else (res_data if isinstance(res_data, dict) else {})
+    protocolo = str(inner.get("protocolo") or p_params.get("protocolo") or "").strip()
+    guia = str(inner.get("guia") or p_params.get("numeroGuiaOperadora") or p_params.get("guia") or "").strip().lstrip("0")
+
+    if guia:
+        q = db.query(FaturamentoLote).filter(FaturamentoLote.Guia == guia)
+        if protocolo:
+            lote = db.query(LoteConvenio).filter(
+                LoteConvenio.protocolo == protocolo,
+                LoteConvenio.id_convenio == 6,
+            ).first()
+            if lote:
+                q = q.filter(FaturamentoLote.id_lote == lote.id_lote)
+        atualizados = q.update({FaturamentoLote.tem_anexo: True}, synchronize_session=False)
+        print(f"[SYNC] Job {job.id} OP19: guia {guia} marcada com tem_anexo=True em {atualizados} item(ns).")
 
     job.result_consumed = True
     synced_counts["jobs_processed"] = synced_counts.get("jobs_processed", 0) + 1

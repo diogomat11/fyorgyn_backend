@@ -142,7 +142,10 @@ def create_jobs_bulk(db: Session, carteirinha_ids: List[int], id_convenio: Optio
     if not carteirinha_ids:
         return 0
         
-    carteirinhas = db.query(Carteirinha).filter(Carteirinha.id.in_(carteirinha_ids)).all()
+    q_carts = db.query(Carteirinha).filter(Carteirinha.id.in_(carteirinha_ids))
+    if user_id is not None:
+        q_carts = q_carts.filter(Carteirinha.user_id == user_id)
+    carteirinhas = q_carts.all()
     if not carteirinhas:
         return 0
 

@@ -166,7 +166,16 @@ async def upload_carteirinhas(
                 try:
                     val = str(row['id_convenio']).strip()
                     if val and val.lower() != 'nan' and val.lower() != 'none':
-                        target_convenio = int(float(val))
+                        csv_conv = int(float(val))
+                        # Se o usuário não tem permissão para o id_convenio do CSV (ex.: CSV com 16 em vez de 6),
+                        # prioriza o id_convenio selecionado na tela se permitido
+                        if not user.is_admin and allowed_ids and csv_conv not in allowed_ids:
+                            if id_convenio and id_convenio in allowed_ids:
+                                target_convenio = id_convenio
+                            else:
+                                target_convenio = allowed_ids[0]
+                        else:
+                            target_convenio = csv_conv
                 except (ValueError, TypeError):
                     pass
             
@@ -659,3 +668,112 @@ def delete_carteirinha(carteirinha_id: int, db: Session = Depends(get_db), user:
     except Exception as e:
         print(f"Error invalidating cache: {e}")
     return {"message": "Deleted successfully"}
+
+
+@router.post("/validar-codigo-beneficiario")
+def iniciar_validacao_codigo_beneficiario(
+    payload: dict = Body(default={}),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Dispara a OP20 (IPASGO) em chunks isolados ao `user_id` do usuário autenticado.
+    """
+    from dependencies import get_effective_user_id
+    from services.carteirinha_codigo_service import criar_jobs_validacao_codigo_beneficiario
+
+    target_uid = get_effective_user_id(user)
+    carteirinha_ids = payload.get("carteirinha_ids") if isinstance(payload, dict) else None
+    modo = (payload.get("modo") if isinstance(payload, dict) else None) or "validar_e_atualizar"
+    apenas_sem_codigo = bool(payload.get("apenas_sem_codigo", False)) if isinstance(payload, dict) else False
+    confirmar_pesquisar = bool(payload.get("confirmar_pesquisar", False)) if isinstance(payload, dict) else False
+
+    try:
+        res = criar_jobs_validacao_codigo_beneficiario(
+            db=db,
+            user_id=target_uid,
+            carteirinha_ids=carteirinha_ids if isinstance(carteirinha_ids, list) else None,
+            modo=modo,
+            apenas_sem_codigo=apenas_sem_codigo,
+            confirmar_pesquisar=confirmar_pesquisar,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    if res["total_carteirinhas"] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhuma carteirinha do IPASGO encontrada para o seu usuário com os filtros selecionados.",
+        )
+    return res
+
+
+@router.get("/codigo-beneficiario/auditoria")
+def obter_auditoria_codigo_beneficiario(
+    status: Optional[str] = None,
+    apenas_divergentes: bool = False,
+    job_id: Optional[int] = None,
+    limit: int = 5000,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Lista o histórico/auditoria de validação de CodigoBeneficiario do `user_id` atual.
+    """
+    from dependencies import get_effective_user_id
+    from services.carteirinha_codigo_service import listar_auditoria_codigo_beneficiario, IPASGO_CONVENIO_ID
+
+    target_uid = get_effective_user_id(user)
+    itens = listar_auditoria_codigo_beneficiario(
+        db=db,
+        user_id=target_uid,
+        status=status,
+        apenas_divergentes=apenas_divergentes,
+        job_id=job_id,
+        limit=limit,
+    )
+    total_base = db.query(Carteirinha).filter(
+        Carteirinha.user_id == target_uid,
+        Carteirinha.id_convenio == IPASGO_CONVENIO_ID,
+        Carteirinha.is_temporary == False,
+    ).count()
+    return {"data": itens, "total": len(itens), "total_carteirinhas_base": total_base}
+
+
+@router.get("/codigo-beneficiario/duplicados")
+def obter_duplicados_codigo_beneficiario(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Retorna os grupos de carteirinhas do `user_id` atual (convênio IPASGO) que
+    possuem o mesmo `codigo_beneficiario`.
+    """
+    from dependencies import get_effective_user_id
+    from services.carteirinha_codigo_service import listar_duplicados_codigo_beneficiario
+
+    target_uid = get_effective_user_id(user)
+    grupos = listar_duplicados_codigo_beneficiario(db=db, user_id=target_uid)
+    return {"data": grupos, "total_grupos": len(grupos)}
+
+
+@router.post("/codigo-beneficiario/aplicar")
+def aplicar_codigos_auditoria(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Aplica manualmente os códigos de beneficiário de linhas de auditoria selecionadas,
+    estritamente para carteirinhas pertencentes ao `user_id` atual.
+    """
+    from dependencies import get_effective_user_id
+    from services.carteirinha_codigo_service import aplicar_auditoria_codigo_beneficiario
+
+    target_uid = get_effective_user_id(user)
+    auditoria_ids = payload.get("auditoria_ids") if isinstance(payload, dict) else []
+    if not isinstance(auditoria_ids, list) or not auditoria_ids:
+        raise HTTPException(status_code=400, detail="Informe 'auditoria_ids' (lista de IDs da auditoria).")
+
+    res = aplicar_auditoria_codigo_beneficiario(db=db, user_id=target_uid, auditoria_ids=auditoria_ids)
+    return res

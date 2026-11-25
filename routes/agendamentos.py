@@ -1637,3 +1637,175 @@ def gerar_op_impressao_ipasgo(
     db.refresh(new_job)
     return {"status": "success", "message": f"Job OP12 de impressão IPASGO #{new_job.id} enfileirado com sucesso!", "job_id": new_job.id}
 
+
+from fastapi import UploadFile, File, Form
+import csv
+import io
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+@router.post("/upload")
+async def upload_agendamentos_csv(
+    file: UploadFile = File(...),
+    id_convenio: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Importa planilha CSV de agendamentos ignorando linhas vazias (ex: ';;;;') e sanitizando campos inteiros/datas."""
+    if not file.filename.lower().endswith(('.csv', '.txt')):
+        raise HTTPException(status_code=400, detail="Envie um arquivo .csv")
+
+    contents = await file.read()
+    try:
+        decoded = contents.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        decoded = contents.decode("latin-1", errors="replace")
+
+    first_line = decoded.splitlines()[0] if decoded.splitlines() else ""
+    delimiter = ";" if ";" in first_line else ","
+    reader = csv.DictReader(io.StringIO(decoded), delimiter=delimiter)
+
+    target_user_id = get_effective_user_id(current_user)
+    from dependencies import get_allowed_convenio_ids
+    allowed_ids = get_allowed_convenio_ids(current_user) or []
+
+    def _safe_int(val, default=None):
+        if val is None:
+            return default
+        s = str(val).strip()
+        if not s:
+            return default
+        if s.endswith(".0"):
+            s = s[:-2]
+        try:
+            return int(s)
+        except ValueError:
+            return default
+
+    def _safe_date(val):
+        if not val:
+            return None
+        s = str(val).strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(s[:10], fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def _safe_time(val):
+        if not val:
+            return None
+        s = str(val).strip()
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(s[:8] if len(s) >= 8 else s[:5], fmt).time()
+            except ValueError:
+                continue
+        return None
+
+    # Mapa de carteirinhas do tenant para vínculo automático de id_carteirinha
+    carts_q = db.query(Carteirinha).filter(Carteirinha.user_id == target_user_id).all()
+    cart_map = {(c.carteirinha.strip(), c.id_convenio): c.id for c in carts_q if c.carteirinha}
+    cart_fallback_map = {c.carteirinha.strip(): c.id for c in carts_q if c.carteirinha}
+
+    records_with_id = {}
+    records_without_id = []
+    skipped_empty = 0
+    invalid_rows = 0
+
+    for row in reader:
+        if not row:
+            skipped_empty += 1
+            continue
+        cleaned = {(k.strip() if k else ""): (str(v).strip() if v is not None else "") for k, v in row.items() if k is not None}
+        if all(v == "" for v in cleaned.values()):
+            skipped_empty += 1
+            continue
+
+        # Busca case-insensitive
+        lower_map = {k.lower(): v for k, v in cleaned.items()}
+        id_ag = _safe_int(lower_map.get("id_agendamento"))
+        id_un = _safe_int(lower_map.get("id_unidade"))
+        row_conv = _safe_int(lower_map.get("id_convenio"), id_convenio)
+        if not current_user.is_admin and allowed_ids and row_conv not in allowed_ids:
+            if id_convenio and id_convenio in allowed_ids:
+                row_conv = id_convenio
+            elif len(allowed_ids) == 1:
+                row_conv = allowed_ids[0]
+
+        row_user = target_user_id if not current_user.is_admin else (_safe_int(lower_map.get("user_id")) or target_user_id)
+        cart_str = lower_map.get("carteirinha") or None
+        id_cart = _safe_int(lower_map.get("id_carteirinha"))
+        if not id_cart and cart_str:
+            id_cart = cart_map.get((cart_str, row_conv)) or cart_fallback_map.get(cart_str)
+
+        dt = _safe_date(lower_map.get("data"))
+        hr = _safe_time(lower_map.get("hora_inicio"))
+        if not dt and not cart_str and not lower_map.get("nome_paciente"):
+            invalid_rows += 1
+            continue
+
+        rec = {
+            "id_unidade": id_un,
+            "id_carteirinha": id_cart,
+            "carteirinha": cart_str,
+            "id_paciente": lower_map.get("id_paciente") or None,
+            "Nome_Paciente": cleaned.get("Nome_Paciente") or lower_map.get("nome_paciente") or None,
+            "nome_convenio": lower_map.get("nome_convenio") or None,
+            "data": dt,
+            "hora_inicio": hr,
+            "sala": lower_map.get("sala") or None,
+            "Tipo_atendimento": cleaned.get("Tipo_atendimento") or lower_map.get("tipo_atendimento") or None,
+            "Status": cleaned.get("Status") or lower_map.get("status") or "A Confirmar",
+            "cod_procedimento_aut": lower_map.get("cod_procedimento_aut") or None,
+            "numero_guia": lower_map.get("numero_guia") or None,
+            "id_convenio": row_conv,
+            "Id_profissional": cleaned.get("Id_profissional") or lower_map.get("id_profissional") or None,
+            "Nome_profissional": cleaned.get("Nome_profissional") or lower_map.get("nome_profissional") or None,
+            "cod_procedimento_fat": lower_map.get("cod_procedimento_fat") or None,
+            "cod_prestador": lower_map.get("cod_prestador") or None,
+            "user_id": row_user,
+        }
+        if id_ag is not None:
+            rec["id_agendamento"] = id_ag
+            records_with_id[id_ag] = rec
+        else:
+            records_without_id.append(rec)
+
+    try:
+        chunk_size = 500
+        with_id_list = list(records_with_id.values())
+        for i in range(0, len(with_id_list), chunk_size):
+            chunk = with_id_list[i:i + chunk_size]
+            stmt = pg_insert(Agendamento).values(chunk)
+            update_cols = {k: getattr(stmt.excluded, k) for k in chunk[0].keys() if k != "id_agendamento"}
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["id_agendamento"],
+                set_=update_cols
+            )
+            db.execute(stmt)
+
+        for rec in records_without_id:
+            db.add(Agendamento(**rec))
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro ao importar agendamentos: {str(e)}")
+
+    try:
+        from cache import cache
+        cache.invalidate_tenant(target_user_id)
+    except Exception:
+        pass
+
+    total_imported = len(with_id_list) + len(records_without_id)
+    return {
+        "status": "success",
+        "imported": total_imported,
+        "skipped_empty": skipped_empty,
+        "invalid_rows": invalid_rows,
+        "message": f"{total_imported} agendamento(s) importado(s)/atualizado(s) com sucesso ({skipped_empty} linhas vazias ignoradas)."
+    }
+
+

@@ -78,11 +78,34 @@ class Carteirinha(Base):
     is_temporary = Column(Boolean, default=False)
     expires_at = Column(DateTime(timezone=True), nullable=True)
     cid = Column(Text, nullable=True)  # CID do diagnóstico principal do paciente (usado na autorização IPASGO)
+    codigo_benef_validado_em = Column(DateTime(timezone=True), nullable=True)
+    codigo_benef_status = Column(Text, nullable=True)
 
     jobs = relationship("Job", primaryjoin="Carteirinha.id == Job.carteirinha_id", back_populates="carteirinha_rel", cascade="all, delete-orphan")
     guias = relationship("BaseGuia", back_populates="carteirinha_rel", cascade="all, delete-orphan")
     logs = relationship("Log", primaryjoin="Carteirinha.id == Log.carteirinha_id", back_populates="carteirinha_rel", cascade="all, delete-orphan")
     convenio_rel = relationship(lambda: Convenio)
+
+
+class CarteirinhaCodigoBenefAuditoria(Base):
+    __tablename__ = "carteirinha_codigo_benef_auditoria"
+    __table_args__ = {'extend_existing': True}
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    carteirinha_id = Column(Integer, ForeignKey("carteirinhas.id", ondelete="SET NULL"), nullable=True, index=True)
+    carteirinha = Column(Text, nullable=True)
+    paciente = Column(Text, nullable=True)
+    codigo_anterior = Column(Text, nullable=True)
+    codigo_portal = Column(Text, nullable=True)
+    titulo = Column(Text, nullable=True)
+    opcoes = Column(JSONB, nullable=True)
+    fonte = Column(Text, nullable=True)
+    status = Column(Text, nullable=False)
+    aplicado = Column(Boolean, nullable=False, default=False)
+    job_id = Column(Integer, nullable=True)
+    erro = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class Job(Base):
     __tablename__ = "jobs"
@@ -149,6 +172,8 @@ class BaseGuia(Base):
     # JSON {tipo_json, guias} resultado da validacao de vinculo do prestador
     # (Unimed Goiania via getErrosSapia). NULL quando nao validado.
     valida_prestador = Column(JSON, nullable=True)
+    # AMIL (convênio 9, migration 0120): pedidoConfirmado do detalhe da guia
+    status_token = Column(Boolean, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -626,6 +651,7 @@ class FaturamentoLote(Base):
     Guia = Column(Text)
     StatusConferencia = Column(Integer)
     status_conferencia = Column(Text)  # Novo portal ConferenciaFaturamento: A/P/R/I (I=Inapto, sem data); espelha StatusConferencia
+    tem_anexo = Column(Boolean, default=False)  # Guia possui anexo ativo no portal ConferenciaFaturamento (ListarAnexosGuia)
     ValorProcedimento = Column(Float)
     cod_procedimento_fat = Column(Text, nullable=True)
     agendamento_id = Column(Integer, ForeignKey("agendamentos.id_agendamento", ondelete="SET NULL"), nullable=True, index=True)

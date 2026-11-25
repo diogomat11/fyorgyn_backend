@@ -410,8 +410,13 @@ def create_jobs(
             # Rotina 1 (consulta/faturamento) ou rotinas de consulta
             if request.rotina in ['1', 'op1_consulta', 'op1_fature', 'op0_login', 'op1_consultar_guias', 'op1_consultar_guias_fature']:
                 is_bradesco_op1 = True
-        
-        p_dict["strict_session_affinity"] = p_dict.get("strict_session_affinity", is_bradesco_op1)
+
+        # AMIL: a sessão Akamai deve permanecer no mesmo slot/servidor Chrome (OP0/OP1)
+        is_amil_sessao = target_conv_id == 9 and request.rotina in [
+            '0', 'op0_login', '1', 'op1_consulta', 'op1_consulta_guias'
+        ]
+
+        p_dict["strict_session_affinity"] = p_dict.get("strict_session_affinity", is_bradesco_op1 or is_amil_sessao)
         
         request.params = json.dumps(p_dict)
     except Exception as e:
@@ -524,6 +529,66 @@ def create_jobs(
                 detail="Para criar o job da OP18, informe 'idServico'+'status' (unitário) ou 'itens' (lote)."
             )
 
+    # Validação para OP19 do IPASGO (anexar arquivo PDF à guia)
+    if request.rotina in ['19', 'op19_anexar_arquivo_guia']:
+        try:
+            p_dict = json.loads(request.params) if request.params else {}
+        except Exception:
+            p_dict = {}
+        if not str(p_dict.get("protocolo") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP19, informe 'protocolo' (capa do lote no portal)."
+            )
+        if not str(p_dict.get("numeroGuiaOperadora") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP19, informe 'numeroGuiaOperadora' (guia do anexo)."
+            )
+        if not str(p_dict.get("caminho_arquivo") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP19, informe 'caminho_arquivo' (PDF local nomeado com a senha da guia)."
+            )
+
+    # Validação para OP21 do IPASGO (anexar arquivo ao recurso de glosa)
+    if request.rotina in ['21', 'op21_anexar_recurso_glosa']:
+        try:
+            p_dict = json.loads(request.params) if request.params else {}
+        except Exception:
+            p_dict = {}
+        if not str(p_dict.get("protocolo") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP21, informe 'protocolo' (número do protocolo / capa do recurso de glosa)."
+            )
+        if not str(p_dict.get("caminho_arquivo") or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para criar o job da OP21, informe 'caminho_arquivo' (caminho local do PDF a ser anexado)."
+            )
+
+    # Validação para OP1 do AMIL (requer ao menos um filtro: datas, senha ou carteirinha)
+    if target_convenio_id == 9 and request.rotina in ['1', 'op1_consulta', 'op1_consulta_guias']:
+        has_filtro = False
+        if request.params:
+            try:
+                p_dict = json.loads(request.params)
+                if (
+                    p_dict.get("data_ini") or
+                    p_dict.get("data_fim") or
+                    p_dict.get("senha") or
+                    p_dict.get("carteirinha")
+                ):
+                    has_filtro = True
+            except Exception:
+                pass
+        if not has_filtro:
+            raise HTTPException(
+                status_code=400,
+                detail="Informe intervalo de datas, senha de autorização ou carteirinha."
+            )
+
     if request.rotina and "fature" in request.rotina:
         request.rotina = request.rotina.replace("_fature", "").replace("fature_", "")
         try:
@@ -580,6 +645,48 @@ def create_jobs(
         )
         return {"message": "Created/Queued jobs", "count": 1}
 
+    # ── OP20 IPASGO (Validar e Extrair CodigoBeneficiario): cria jobs em chunks
+    # estritamente isolados ao user_id do solicitante (get_effective_user_id). ──
+    if target_convenio == 6 and str(request.rotina or "").lower() in [
+        "20", "op20", "op20_validar_codigo_beneficiario"
+    ]:
+        from services.carteirinha_codigo_service import criar_jobs_validacao_codigo_beneficiario
+        target_uid = get_effective_user_id(current_user)
+        try:
+            p_op20 = json.loads(request.params) if request.params else {}
+        except Exception:
+            p_op20 = {}
+        if not isinstance(p_op20, dict):
+            p_op20 = {}
+
+        c_ids = None
+        if request.type in ("single", "multiple") and request.carteirinha_ids:
+            c_ids = request.carteirinha_ids
+
+        try:
+            res_op20 = criar_jobs_validacao_codigo_beneficiario(
+                db=db,
+                user_id=target_uid,
+                carteirinha_ids=c_ids,
+                modo=p_op20.get("modo", "validar_e_atualizar"),
+                apenas_sem_codigo=bool(p_op20.get("apenas_sem_codigo", False)),
+                confirmar_pesquisar=bool(p_op20.get("confirmar_pesquisar", False)),
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+        if res_op20["total_carteirinhas"] == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Nenhuma carteirinha do IPASGO encontrada para o seu usuário com os filtros selecionados."
+            )
+        return {
+            "message": f"{res_op20['jobs_created']} job(s) criados para validar {res_op20['total_carteirinhas']} carteirinha(s).",
+            "count": res_op20["jobs_created"],
+            "total_carteirinhas": res_op20["total_carteirinhas"],
+            "job_ids": res_op20["job_ids"],
+        }
+
     if request.type == 'all':
         created_count = job_service.create_all_jobs(db, id_convenio=target_convenio, rotina=request.rotina, params=request.params, user_id=current_user.id)
             
@@ -594,7 +701,9 @@ def create_jobs(
             '10', 'op10_recurso_glosa',
             '16', 'op16_enviar_recurso_glosa',
             '17', 'op17_importar_conferencia',
-            '18', 'op18_conferir_faturamento'
+            '18', 'op18_conferir_faturamento',
+            '19', 'op19_anexar_arquivo_guia',
+            '21', 'op21_anexar_recurso_glosa'
             # OP6/OP7 (rotinas '6'/'7') INATIVAS: endpoints LoadDetalhes e
             # ModificarDetalhe substituídos pelo módulo ConferenciaFaturamento (OPs 17/18).
         ]) or (target_convenio == 100 and request.rotina in [
@@ -612,6 +721,9 @@ def create_jobs(
             # Login Bradesco: operação de sessão — não exige carteirinha
             # ('0_fature' chega aqui já normalizado para '0' + contexto fature)
             '0', 'op0_login', '0_fature', 'op0_login_fature',
+        ]) or (target_convenio == 9 and request.rotina in [
+            # AMIL: OP0/OP1 são operações standalone de sessão/consulta — não exigem carteirinha
+            '0', 'op0_login', '1', 'op1_consulta', 'op1_consulta_guias',
         ])
 
         if not request.carteirinha_ids:
@@ -1282,6 +1394,8 @@ def list_jobs(
     }
     
     from cache import cache
+    from services.worker_service import sync_and_abort_op19_jobs
+    sync_and_abort_op19_jobs(db)
     cached_res = cache.get(current_user.id, "jobs", cache_params)
     if cached_res:
         return cached_res
@@ -1320,10 +1434,13 @@ def list_jobs(
     if created_at_end:
         query = query.filter(Job.created_at < data_local_para_utc_fim_exclusivo(created_at_end))
     
-    # Order by priority desc, created_at asc
     total = query.count()
-    jobs = query.order_by(Job.priority.desc(), Job.created_at.desc()).limit(limit).offset(skip).all()
-    # Note: Changed order to desc created_at to show newest first
+    # Novos primeiro: created_at DESC com priority só como desempate. Prioridade
+    # ANTES de created_at enterrava jobs recém-criados (priority=0) sob dezenas
+    # de jobs antigos com priority=5 — o usuário criava o job e ele não
+    # aparecia na primeira página (incidente 2026-11-18). Prioridade continua
+    # mandando na fila de execução do worker (dispatch), não nesta listagem.
+    jobs = query.order_by(Job.created_at.desc(), Job.priority.desc()).limit(limit).offset(skip).all()
     
     results = []
     
@@ -1356,7 +1473,7 @@ def list_jobs(
             "timeout": j.timeout,
             "created_at": localize_datetime(j.created_at),
             "updated_at": localize_datetime(j.updated_at),
-            "error_message": None,
+            "error_message": j.error_message,
             # valida_prestador: extrai do result_data (que esta com defer) apenas o
             # bloco de validacao de prestador, para alimentar o modal/tooltip do frontend
             # sem expor o result_data completo (que pode ser grande).
@@ -1375,7 +1492,7 @@ def list_jobs(
         results.append(j_dict)
     
     res_payload = {"data": results, "total": total, "skip": skip, "limit": limit}
-    cache.set(current_user.id, "jobs", cache_params, res_payload, ttl=15)
+    cache.set(current_user.id, "jobs", cache_params, res_payload, ttl=5)
     return res_payload
 
 @router.get("/{id}")

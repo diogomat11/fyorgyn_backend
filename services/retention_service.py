@@ -38,7 +38,13 @@ _WHERE_LOGS = "created_at < now() - make_interval(days => :idade)"
 
 
 def _purge_in_lotes(db: Session, tabela: str, where: str, params: dict) -> int:
-    """DELETE em lotes de BATCH até esvaziar o critério (ou atingir MAX_LOOPS)."""
+    """DELETE em lotes de BATCH até esvaziar o critério (ou atingir MAX_LOOPS).
+
+    Commit A CADA lote: transações curtas — um purge grande (17k+ logs) numa
+    única transação de minutos era morto pelo Supavisor (idle in transaction
+    / statement timeout → 'SSL connection has been closed unexpectedly',
+    incidente 2026-11-21) e TODO o expurgo voltava atrás.
+    """
     total = 0
     for _ in range(MAX_LOOPS):
         result = db.execute(text(
@@ -47,6 +53,7 @@ def _purge_in_lotes(db: Session, tabela: str, where: str, params: dict) -> int:
         ), {**params, "lote": BATCH})
         apagados = result.rowcount or 0
         total += apagados
+        db.commit()  # fecha a transação do lote imediatamente
         if apagados < BATCH:
             break
     return total
@@ -62,13 +69,19 @@ def run_retention(db: Session) -> dict:
         "logs": _purge_in_lotes(db, "worker.logs", _WHERE_LOGS,
                                 {"idade": LOGS_RETENTION_DAYS}),
     }
-    db.commit()
     if any(resumo.values()):
-        db.execute(text(
-            "INSERT INTO worker.logs (job_id, user_id, level, message) "
-            "VALUES (NULL, NULL, 'INFO', :m)"
-        ), {"m": f"[RETENTION] pending_stale={resumo['pending_stale']} (> {PENDING_MAX_AGE_HOURS}h); "
-                 f"jobs_finalizados={resumo['jobs_finalizados']} (> {JOBS_RETENTION_DAYS}d); "
-                 f"logs={resumo['logs']} (> {LOGS_RETENTION_DAYS}d)."})
-        db.commit()
+        # Telemetria — nunca pode derrubar o loop (a conexão pode ter sido
+        # reciclada entre os lotes; pre_ping reabre na próxima checkout).
+        try:
+            db.execute(text(
+                "INSERT INTO worker.logs (job_id, user_id, level, message) "
+                "VALUES (NULL, NULL, 'INFO', :m)"
+            ), {"m": f"[RETENTION] pending_stale={resumo['pending_stale']} (> {PENDING_MAX_AGE_HOURS}h); "
+                     f"jobs_finalizados={resumo['jobs_finalizados']} (> {JOBS_RETENTION_DAYS}d); "
+                     f"logs={resumo['logs']} (> {LOGS_RETENTION_DAYS}d)."})
+            db.commit()
+        except Exception as log_err:
+            try: db.rollback()
+            except Exception: pass
+            print(f"[RETENTION] falha ao registrar resumo (não fatal): {log_err}")
     return resumo

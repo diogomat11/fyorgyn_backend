@@ -1,3 +1,5 @@
+import os
+import json
 """
 Rotas do módulo Recurso de Glosa (IPASGO).
 
@@ -11,12 +13,13 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, cast, Text
 from sqlalchemy.orm import Session
 
 from database import get_db
 from dependencies import get_current_user, get_effective_user_id
 from models import (
+    Job,
     FaturamentoLote,
     LoteConvenio,
     RecursoGlosaItem,
@@ -471,3 +474,426 @@ def enviar_recurso(
         "protocolo": protocolo,
         "servicos": len(servicos),
     }
+
+
+# ══════════════ Anexos do Recurso de Glosa (OP21) ══════════════
+
+from routes.lotes import _expandir_caminhos_anexos, ANEXO_MAX_BYTES
+from services.worker_service import (
+    sync_and_abort_op21_jobs,
+    is_bloqueio_ipasgo,
+    is_instabilidade_portal,
+    e_cascata_op21,
+)
+
+
+class AnexosRecursoGlosaRequest(BaseModel):
+    caminhos: List[str]
+
+
+class ReprocessarAnexosRecursoRequest(BaseModel):
+    job_ids: Optional[List[int]] = None
+
+
+def _analisar_caminho_anexo_recurso(caminho: str) -> dict:
+    """Valida 1 caminho de anexo para recurso de glosa (qualquer PDF válido <= 5MB)."""
+    caminho = str(caminho or "").strip().strip('"')
+    nome = os.path.basename(caminho)
+
+    resultado = {
+        "caminho": caminho,
+        "arquivo": nome,
+        "valido": False,
+        "motivo": None,
+    }
+
+    if not caminho:
+        resultado["motivo"] = "Caminho vazio."
+        return resultado
+    if os.path.isdir(caminho):
+        resultado["motivo"] = "Caminho é uma pasta (esperado um PDF)."
+        return resultado
+    if not os.path.isfile(caminho):
+        resultado["motivo"] = "Arquivo não encontrado (o worker roda na mesma máquina dos PDFs)."
+        return resultado
+    if not nome.lower().endswith(".pdf"):
+        resultado["motivo"] = "Somente PDF."
+        return resultado
+    try:
+        tamanho = os.path.getsize(caminho)
+    except Exception as e:
+        resultado["motivo"] = f"Erro ao acessar arquivo: {e}"
+        return resultado
+
+    if tamanho == 0:
+        resultado["motivo"] = "Arquivo vazio."
+        return resultado
+    if tamanho > ANEXO_MAX_BYTES:
+        resultado["motivo"] = f"Arquivo de {tamanho/1024/1024:.1f}MB (limite 5MB)."
+        return resultado
+
+    resultado["valido"] = True
+    return resultado
+
+
+@router.post("/lotes/{id_lote}/anexos/analisar")
+def analisar_anexos_recurso(
+    id_lote: int,
+    request: AnexosRecursoGlosaRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Pré-visualiza validação dos caminhos de anexo do recurso de glosa (sem criar jobs).
+    Aceita PASTAS (expande para todos os .pdf do nível) e/ou arquivos avulsos.
+    """
+    lote = _lote_do_usuario(db, current_user, id_lote)
+    arquivos, resumo, ignorados = _expandir_caminhos_anexos(request.caminhos)
+    if not arquivos:
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhum PDF encontrado nas entradas informadas (pastas são varridas no nível atual).",
+        )
+    data = [_analisar_caminho_anexo_recurso(c) for c in arquivos]
+    return {
+        "data": data,
+        "validos": sum(1 for d in data if d["valido"]),
+        "expansao": resumo,
+        "ignorados_nao_pdf": ignorados,
+    }
+
+
+@router.post("/lotes/{id_lote}/anexos")
+def criar_jobs_anexos_recurso(
+    id_lote: int,
+    request: AnexosRecursoGlosaRequest,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Cria 1 job OP21 por PDF válido para anexar ao protocolo do recurso de glosa."""
+    lote = _lote_do_usuario(db, current_user, id_lote)
+    protocolo = (lote.protocolo or "").strip()
+    if not protocolo:
+        raise HTTPException(
+            status_code=400,
+            detail="Lote sem protocolo informado. Grave o protocolo (capa) antes de anexar arquivos.",
+        )
+
+    arquivos, _resumo, _ignorados = _expandir_caminhos_anexos(request.caminhos)
+    if not arquivos:
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhum PDF encontrado nas entradas informadas.",
+        )
+
+    validos, rejeitados = [], []
+    for caminho in arquivos:
+        analise = _analisar_caminho_anexo_recurso(caminho)
+        if analise["valido"]:
+            validos.append(analise)
+        else:
+            rejeitados.append({"arquivo": analise["arquivo"], "motivo": analise["motivo"]})
+
+    caminhos_novos = {os.path.normpath(a["caminho"]) for a in validos}
+    if caminhos_novos:
+        pendentes = db.query(Job).filter(
+            Job.rotina.in_(["21", "op21_anexar_recurso_glosa"]),
+            Job.status.in_(["pending", "running", "processing"]),
+        ).all()
+        for j_antigo in pendentes:
+            try:
+                p_raw = j_antigo.params
+                p_dict = json.loads(p_raw) if isinstance(p_raw, str) else (p_raw or {})
+                if (
+                    str(p_dict.get("protocolo") or "").strip() == protocolo
+                    and os.path.normpath(str(p_dict.get("caminho_arquivo") or "")) in caminhos_novos
+                ):
+                    j_antigo.status = "error"
+                    j_antigo.error_message = "Substituído por novo envio de anexo (OP21)."
+                    j_antigo.locked_by = None
+                    j_antigo.attempts = j_antigo.max_attempts or 3
+            except Exception:
+                pass
+
+    efetivo_id = get_effective_user_id(current_user)
+    uconv = db.query(UserConvenio).filter(
+        UserConvenio.user_id == efetivo_id,
+        UserConvenio.id_convenio == ID_CONVENIO_IPASGO,
+    ).first()
+    if not uconv or not uconv.login or not uconv.senha_criptografada:
+        raise HTTPException(
+            status_code=400,
+            detail="Credenciais não cadastradas para o convênio IPASGO. Cadastre em Credenciais Portais.",
+        )
+
+    cod_prestador = (lote.cod_prestador or uconv.cod_prestador or "").strip()
+    from services.job_service import MY_WEBHOOK_URL, _send_jobs_to_worker
+
+    job_payloads = []
+    for anexo in validos:
+        p_dict = {
+            "protocolo": protocolo,
+            "caminho_arquivo": anexo["caminho"],
+            "nome_arquivo": anexo["arquivo"],
+            "id_lote_interno": lote.id_lote,
+            "login": uconv.login,
+            "senha_criptografada": uconv.senha_criptografada,
+            "cod_prestador": cod_prestador,
+            "codigoPrestador": cod_prestador,
+            "webhook_url": MY_WEBHOOK_URL,
+        }
+        job_payloads.append({
+            "carteirinha_id": None,
+            "id_convenio": ID_CONVENIO_IPASGO,
+            "rotina": "21",
+            "params": p_dict,
+            "status": "pending",
+            "user_id": lote.user_id or current_user.id,
+            "priority": 0,
+            "max_attempts": 3,
+        })
+
+    if job_payloads:
+        _send_jobs_to_worker(job_payloads, db=db)
+        # Inserção nova de jobs: derruba o cache da lista de /jobs/ do(s)
+        # tenant(s) afetado(s) para o modal de importações exibi-los no
+        # próximo fetch (sem esperar o TTL expirar).
+        try:
+            from cache import cache
+            for uid in {current_user.id, lote.user_id or current_user.id}:
+                cache.invalidate_resource(uid, "jobs")
+        except Exception:
+            pass
+
+    return {"criados": len(validos), "rejeitados": rejeitados}
+
+
+@router.get("/lotes/{id_lote}/anexos/status")
+def status_anexos_recurso(
+    id_lote: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Consulta o status consolidado de envio de anexos (OP21) deste recurso de glosa."""
+    lote = _lote_do_usuario(db, current_user, id_lote)
+
+    protocolo = str(lote.protocolo or "").strip()
+    if not protocolo:
+        return {
+            "total": 0, "concluidos": 0, "processando": 0, "pendentes": 0,
+            "erros": 0, "abortados": 0, "bloqueio_detectado": False,
+            "sessao_rejeitada_detectada": False, "itens": []
+        }
+
+    try:
+        sync_and_abort_op21_jobs(db, protocolo=protocolo)
+    except Exception as e:
+        print(f"[OP21 status] sync_and_abort falhou silenciosamente: {e}")
+
+    jobs_query = db.query(Job).filter(
+        Job.rotina.in_(["21", "op21_anexar_recurso_glosa"]),
+        Job.id_convenio == ID_CONVENIO_IPASGO,
+        or_(
+            Job.params["protocolo"].astext == protocolo,
+            cast(Job.params, Text).ilike(f'%"{protocolo}"%'),
+        ),
+    )
+    if not current_user.is_admin:
+        jobs_query = jobs_query.filter(Job.user_id == current_user.id)
+
+    todos_jobs = jobs_query.order_by(Job.id.desc()).all()
+
+    itens = []
+    concluidos = 0
+    processando = 0
+    pendentes = 0
+    erros = 0
+    abortados = 0
+    bloqueio_detectado = False
+    sessao_rejeitada_detectada = False
+
+    for j in todos_jobs:
+        p_raw = j.params
+        p = json.loads(p_raw) if isinstance(p_raw, str) else (p_raw or {})
+        if str(p.get("protocolo") or "").strip() != protocolo:
+            continue
+
+        attempts = j.attempts or 0
+        max_attempts = j.max_attempts or 3
+        err_msg = str(j.error_message or "")
+
+        is_block = False
+        is_sessao = False
+        if j.status == "error" and not e_cascata_op21(err_msg):
+            is_block = is_bloqueio_ipasgo(err_msg)
+            is_sessao = not is_block and is_instabilidade_portal(err_msg)
+            if is_block:
+                bloqueio_detectado = True
+            elif is_sessao:
+                sessao_rejeitada_detectada = True
+
+        is_aborted = (j.status == "error" and (attempts >= max_attempts or "abortad" in err_msg.lower() or is_block or is_sessao))
+
+        if j.status == "success":
+            concluidos += 1
+        elif j.status in ("running", "processing"):
+            processando += 1
+        elif j.status == "pending":
+            pendentes += 1
+        elif j.status == "error":
+            erros += 1
+            if is_aborted:
+                abortados += 1
+
+        itens.append({
+            "id": j.id,
+            "protocolo": protocolo,
+            "arquivo": p.get("nome_arquivo") or (os.path.basename(str(p.get("caminho_arquivo") or "")) if p.get("caminho_arquivo") else "-"),
+            "caminho": p.get("caminho_arquivo"),
+            "status": j.status,
+            "attempts": attempts,
+            "max_attempts": max_attempts,
+            "error_message": err_msg,
+            "is_abortado": is_aborted,
+            "bloqueio": is_block,
+            "sessao_rejeitada": is_sessao,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "updated_at": j.updated_at.isoformat() if j.updated_at else None,
+        })
+
+    return {
+        "total": len(itens),
+        "concluidos": concluidos,
+        "processando": processando,
+        "pendentes": pendentes,
+        "erros": erros,
+        "abortados": abortados,
+        "bloqueio_detectado": bloqueio_detectado,
+        "sessao_rejeitada_detectada": sessao_rejeitada_detectada,
+        "itens": itens
+    }
+
+
+@router.post("/lotes/{id_lote}/anexos/reprocessar")
+def reprocessar_anexos_recurso(
+    id_lote: int,
+    request: Optional[ReprocessarAnexosRecursoRequest] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Reenvia para a fila (status='pending', attempts=0) os anexos pendentes ou abortados."""
+    lote = _lote_do_usuario(db, current_user, id_lote)
+    protocolo = str(lote.protocolo or "").strip()
+    if not protocolo:
+        raise HTTPException(status_code=400, detail="Lote sem protocolo.")
+
+    efetivo_id = get_effective_user_id(current_user)
+    uconv = db.query(UserConvenio).filter(
+        UserConvenio.user_id == efetivo_id,
+        UserConvenio.id_convenio == ID_CONVENIO_IPASGO,
+    ).first()
+    if not uconv or not uconv.login or not uconv.senha_criptografada:
+        raise HTTPException(
+            status_code=400,
+            detail="Credenciais não cadastradas para o convênio IPASGO. Cadastre em Credenciais Portais.",
+        )
+
+    cod_prestador = (lote.cod_prestador or uconv.cod_prestador or "").strip()
+    from services.job_service import MY_WEBHOOK_URL, _send_jobs_to_worker
+
+    jobs_query = db.query(Job).filter(
+        Job.rotina.in_(["21", "op21_anexar_recurso_glosa"]),
+        Job.id_convenio == ID_CONVENIO_IPASGO,
+        or_(
+            Job.params["protocolo"].astext == protocolo,
+            cast(Job.params, Text).ilike(f'%"{protocolo}"%'),
+        ),
+    )
+    if not current_user.is_admin:
+        jobs_query = jobs_query.filter(Job.user_id == current_user.id)
+
+    todos_jobs = jobs_query.all()
+    alvos = []
+    job_ids_filtro = set(request.job_ids) if (request and request.job_ids) else None
+
+    for j in todos_jobs:
+        p_raw = j.params
+        p = json.loads(p_raw) if isinstance(p_raw, str) else (p_raw or {})
+        if str(p.get("protocolo") or "").strip() != protocolo:
+            continue
+        if job_ids_filtro and j.id not in job_ids_filtro:
+            continue
+        if job_ids_filtro or j.status == "error":
+            alvos.append(j)
+
+    payloads_reenvio = []
+    for j in alvos:
+        j.status = "pending"
+        j.attempts = 0
+        j.error_message = None
+        j.locked_by = None
+        p_raw = j.params
+        p = json.loads(p_raw) if isinstance(p_raw, str) else (p_raw or {})
+        p["login"] = uconv.login
+        p["senha_criptografada"] = uconv.senha_criptografada
+        p["cod_prestador"] = cod_prestador
+        p["codigoPrestador"] = cod_prestador
+        p["webhook_url"] = MY_WEBHOOK_URL
+        j.params = p
+        payloads_reenvio.append({
+            "id": j.id,
+            "carteirinha_id": j.carteirinha_id,
+            "id_convenio": j.id_convenio,
+            "rotina": j.rotina,
+            "params": p,
+            "status": "pending",
+            "user_id": j.user_id,
+            "priority": j.priority or 0,
+            "max_attempts": j.max_attempts or 3,
+        })
+
+    db.commit()
+    if payloads_reenvio:
+        _send_jobs_to_worker(payloads_reenvio, db=db)
+
+    return {"reprocessados": len(alvos)}
+
+
+@router.post("/lotes/{id_lote}/anexos/abortar")
+def abortar_anexos_recurso(
+    id_lote: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Aborta todos os jobs OP21 pendentes deste recurso de glosa."""
+    lote = _lote_do_usuario(db, current_user, id_lote)
+    protocolo = str(lote.protocolo or "").strip()
+    if not protocolo:
+        raise HTTPException(status_code=400, detail="Lote sem protocolo.")
+
+    jobs_query = db.query(Job).filter(
+        Job.rotina.in_(["21", "op21_anexar_recurso_glosa"]),
+        Job.id_convenio == ID_CONVENIO_IPASGO,
+        or_(
+            Job.params["protocolo"].astext == protocolo,
+            cast(Job.params, Text).ilike(f'%"{protocolo}"%'),
+        ),
+        Job.status == "pending",
+    )
+    if not current_user.is_admin:
+        jobs_query = jobs_query.filter(Job.user_id == current_user.id)
+
+    pendentes = jobs_query.all()
+    abortados = 0
+    for j in pendentes:
+        p_raw = j.params
+        p = json.loads(p_raw) if isinstance(p_raw, str) else (p_raw or {})
+        if str(p.get("protocolo") or "").strip() != protocolo:
+            continue
+        j.status = "error"
+        j.error_message = "Abortado pelo usuário."
+        j.locked_by = None
+        j.attempts = j.max_attempts or 3
+        abortados += 1
+
+    db.commit()
+    return {"abortados": abortados}

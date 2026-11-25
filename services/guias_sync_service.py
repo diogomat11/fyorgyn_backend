@@ -283,6 +283,20 @@ def _normalize_status(status_raw, id_convenio: int, item: dict) -> str:
         if status.lower() in ["liberada", "exportada"]:
             return status
 
+    # Mapeamento AMIL - ID 9: situacao do portal em MAIÚSCULAS (com/sem acento)
+    if id_convenio == 9:
+        status_upper = status.upper()
+        status_map = {
+            "AUTORIZADO": "Autorizado",
+            "CANCELADO": "Cancelado",
+            "EM ANALISE": "Em análise",
+            "EM ANÁLISE": "Em análise",
+            "ANALISE": "Em análise",
+            "ANÁLISE": "Em análise",
+        }
+        if status_upper in status_map:
+            return status_map[status_upper]
+
     status_lower = status.lower()
     # Converte termos semelhantes a Liberado/Liberada para os padrões Autorizado/Autorizada/Parcialmente autorizada
     if "parcialmente" in status_lower and ("liberad" in status_lower or "autorizad" in status_lower):
@@ -324,7 +338,9 @@ def _apply_guia_update(existing: BaseGuia, record: dict, user_id: int) -> None:
     for key_attr in ["senha", "status_guia", "data_autorizacao", "data_solicitacao",
                      "validade", "qtde_solicitada", "sessoes_autorizadas",
                      "nome_terapia", "guia_prestador", "codigo_beneficiario",
-                     "cod_prestador", "timestamp_captura"]:
+                     "cod_prestador", "timestamp_captura",
+                     # AMIL (plano D2): pedidoConfirmado do detalhe da guia
+                     "status_token"]:
         if record.get(key_attr) is not None:
             setattr(existing, key_attr, record[key_attr])
     if record.get("carteirinha_id") is not None:
@@ -419,6 +435,123 @@ def backfill_carteirinha_em_guias(db: Session, pares: list) -> dict:
 
 
 
+def _ensure_carteirinha_amil(db: Session, item: dict, user_id: int):
+    """
+    AMIL (id_convenio=9): garante Carteirinha vinculada ao beneficiário do record
+    com o nome do paciente (numeroAssociado/nomeAssociado — plano AMIL §3, D1).
+
+    O fluxo genérico só casa por codigo_beneficiario já cadastrado; sem isto a
+    guia nova entraria órfã (sem paciente na aba Guias e fora do filtro por
+    paciente). Busca por codigo_beneficiario e depois pelo número da carteirinha;
+    existindo, apenas garante nome/número; não existindo, cria a carteirinha.
+
+    Retorna o id da carteirinha (existente ou criada) ou None.
+    """
+    from models import Carteirinha
+
+    cod_benef = str(item.get("codigo_beneficiario") or "").strip()
+    num_cart = str(item.get("carteirinha") or "").strip()
+    nome_pac = str(item.get("paciente") or "").strip()
+    if not cod_benef and not num_cart:
+        return None
+
+    cart = None
+    if cod_benef:
+        cart = db.query(Carteirinha).filter(
+            Carteirinha.codigo_beneficiario == cod_benef,
+            Carteirinha.user_id == user_id
+        ).first()
+    if not cart and num_cart:
+        cart = db.query(Carteirinha).filter(
+            Carteirinha.carteirinha == num_cart,
+            Carteirinha.user_id == user_id
+        ).first()
+
+    if cart:
+        # Apenas garante o nome do beneficiário (e o número, se ainda vazio)
+        if nome_pac and not (cart.paciente or "").strip():
+            cart.paciente = nome_pac
+        if num_cart and not (cart.carteirinha or "").strip():
+            cart.carteirinha = num_cart
+        return cart.id
+
+    # Criação com savepoint (mesmo padrão dos inserts de base_guias abaixo:
+    # corrida no índice único não pode derrubar o job inteiro)
+    nested = db.begin_nested()
+    nova = Carteirinha(
+        carteirinha=num_cart or None,
+        codigo_beneficiario=cod_benef or None,
+        paciente=nome_pac or None,
+        id_convenio=9,
+        user_id=user_id,
+        status="ativo",
+    )
+    db.add(nova)
+    try:
+        db.flush()
+        nested.commit()
+        return nova.id
+    except IntegrityError:
+        nested.rollback()
+        return None
+
+
+def _cadastrar_codigos_faturamento(db: Session, pares: list, id_convenio: int) -> int:
+    """
+    Cadastra o vínculo codigo_procedimento → faturamento na tabela de códigos
+    public.procedimentos (decisão D2 revisada do plano AMIL: o pacote de
+    faturamento da API AMIL — pacotesAutorizados[].codigo — NÃO vira coluna de
+    base_guias; é o código de faturamento do procedimento no portal).
+
+    Procedimento já existente para (codigo_procedimento, convenio): apenas
+    preenche/atualiza `faturamento` (e o `nome`, se vazio). Não existente:
+    cria com status ativo. Savepoint por insert — corrida não derruba o job.
+
+    Retorna a quantidade de vínculos garantidos.
+    """
+    from models import Procedimento
+
+    # Dedup por código (o worker emite o mesmo pacote para cada procedimento
+    # da guia; múltiplas guias repetem os pares)
+    vistos = {}
+    for p in pares:
+        cod = str(p.get("codigo_procedimento") or "").strip()
+        fat = str(p.get("faturamento") or "").strip()
+        if cod and fat:
+            vistos[cod] = {"faturamento": fat, "nome": str(p.get("nome") or "").strip()}
+    if not vistos:
+        return 0
+
+    garantidos = 0
+    for cod, info in vistos.items():
+        proc = db.query(Procedimento).filter(
+            Procedimento.codigo_procedimento == cod,
+            Procedimento.id_convenio == id_convenio
+        ).first()
+        if proc:
+            if (proc.faturamento or "").strip() != info["faturamento"]:
+                proc.faturamento = info["faturamento"]
+                garantidos += 1
+            if info["nome"] and not (proc.nome or "").strip():
+                proc.nome = info["nome"]
+        else:
+            nested = db.begin_nested()
+            try:
+                db.add(Procedimento(
+                    codigo_procedimento=cod,
+                    nome=info["nome"] or None,
+                    faturamento=info["faturamento"],
+                    status="ativo",
+                    id_convenio=id_convenio,
+                ))
+                db.flush()
+                nested.commit()
+                garantidos += 1
+            except IntegrityError:
+                nested.rollback()
+    return garantidos
+
+
 def bulk_upsert_guias_from_json(
     db: Session,
     results: list,
@@ -452,7 +585,8 @@ def bulk_upsert_guias_from_json(
             
     records = []
     skipped = 0
-    
+    codigos_faturamento = []
+
     for item in results:
         if not isinstance(item, dict):
             skipped += 1
@@ -474,6 +608,12 @@ def bulk_upsert_guias_from_json(
         current_cid = carteirinha_id or item.get("carteirinha_id")
         if not current_cid and item.get("codigo_beneficiario"):
             current_cid = carteirinha_map.get(item["codigo_beneficiario"])
+
+        # AMIL (9): o worker envia carteirinha=numeroAssociado e paciente=
+        # nomeAssociado — garante vínculo/criação da carteirinha com o nome do
+        # beneficiário (o fluxo genérico só casa codigo_beneficiario cadastrado)
+        if id_convenio == 9 and (item.get("carteirinha") or item.get("paciente")):
+            current_cid = _ensure_carteirinha_amil(db, item, user_id) or current_cid
 
         # Parse timestamp_captura
         ts_captura_raw = item.get("timestamp_captura")
@@ -515,13 +655,35 @@ def bulk_upsert_guias_from_json(
             ),
             "codigo_beneficiario": item.get("codigo_beneficiario"),
             "cod_prestador": item.get("cod_prestador"),
+            # AMIL (plano D2): pedidoConfirmado do detalhe da guia. O pacote de
+            # faturamento não é coluna de base_guias — vai para a tabela de
+            # códigos (procedimentos.faturamento) via _cadastrar_codigos_faturamento.
+            "status_token": item.get("status_token"),
             "user_id": user_id,
             "timestamp_captura": ts_captura_val
         })
-    
+
+        # AMIL: pacote de faturamento (pacotesAutorizados[].codigo) vinculado ao
+        # código do procedimento — coleta para cadastro em procedimentos (D2 revisada)
+        pacote_cod = str(item.get("codigo_faturamento") or "").strip()
+        if pacote_cod and codigo_terapia_val:
+            codigos_faturamento.append({
+                "codigo_procedimento": str(codigo_terapia_val).strip(),
+                "nome": str(item.get("nome_terapia") or "").strip(),
+                "faturamento": pacote_cod,
+            })
+
     if not records:
         return {"total": len(results), "inserted": 0, "updated": 0, "skipped": skipped, "affected_rows": 0}
-        
+
+    # AMIL (D2 revisada): cadastro dos vínculos proc→faturamento em procedimentos.
+    # Metadado de códigos — falha aqui não pode impedir a gravação das guias.
+    if codigos_faturamento:
+        try:
+            _cadastrar_codigos_faturamento(db, codigos_faturamento, id_convenio)
+        except Exception as cod_err:
+            print(f"[CODIGOS_FATURAMENTO] Erro no cadastro: {cod_err}")
+
     authorized_records = []
     non_authorized_records = []
     
@@ -716,9 +878,15 @@ def bulk_upsert_guias_from_json(
             key = (norm_guia, norm_conv, norm_ter)
             existing_sol = None
             if job_id:
+                # FIX (incidente AMIL 28845/28846): o filtro PRECISA incluir a
+                # guia — a AMIL tem múltiplos pedidos (guias distintas) com a
+                # MESMA terapia+carteirinha; sem a guia, o registro posterior
+                # achava a linha do anterior e o UPDATE sobrescrevia a guia
+                # (6 solicitacoes CANCELADO perdidas por run).
                 existing_sol = db.query(Solicitacao).filter(
                     Solicitacao.job_id == job_id,
                     Solicitacao.user_id == user_id,
+                    Solicitacao.guia == record["guia"],
                     Solicitacao.codigo_terapia == record["codigo_terapia"],
                     Solicitacao.carteirinha_id == record["carteirinha_id"]
                 ).first()
@@ -1559,7 +1727,9 @@ def _quarantine_job(db: Session, job_id: int, motivo: str) -> None:
 # OP5 demais convênios). O consumidor genérico tratava o payload de impressão
 # como import e criava linhas fantasma em base_guias — sem terapia, prestador
 # nem datas (caso guia 26260116 / job 19073).
-ROTINAS_NAO_IMPORTAVEIS = {"5", "12", "op5_imprimir_guia", "op12_imprimir_guia"}
+ROTINAS_NAO_IMPORTAVEIS = {
+    "5", "12", "op5_imprimir_guia", "op12_imprimir_guia",
+}
 
 
 def _rotina_nao_importavel(rotina) -> bool:
@@ -1623,6 +1793,22 @@ def _process_single_job(db: Session, job, synced_counts: dict) -> None:
         if rotina in ["18", "op18", "op18_conferir_faturamento"] and res_data:
             from services.faturamento_conferencia_service import marcar_itens_conferidos
             marcar_itens_conferidos(db, job, res_data, synced_counts)
+            return
+
+        if rotina in ["19", "op19", "op19_anexar_arquivo_guia"]:
+            from services.faturamento_conferencia_service import marcar_guia_com_anexo
+            marcar_guia_com_anexo(db, job, res_data or {}, synced_counts)
+            return
+
+        if rotina in ["21", "op21", "op21_anexar_recurso_glosa"]:
+            # OP21 anexa arquivo ao recurso de glosa no IPASGO.
+            # O worker já salva o resultado estruturado no job.
+            synced_counts["op21"] = synced_counts.get("op21", 0) + 1
+            return
+
+        if rotina in ["20", "op20", "op20_validar_codigo_beneficiario"]:
+            from services.carteirinha_codigo_service import consumir_resultado_op20
+            consumir_resultado_op20(db, job, res_data or {}, synced_counts)
             return
 
         if (rotina in ["6", "op6", "op6_check_baixados"]) and res_data:

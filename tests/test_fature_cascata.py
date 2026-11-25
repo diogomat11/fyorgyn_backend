@@ -90,6 +90,9 @@ def test_classificar_auth_401_403(op1):
     """Auditoria 2026-10-21: 'Authentication failed' = sessão expirada, NUNCA vazio."""
     assert op1.classificar_fetch(401, None) == "auth"
     assert op1.classificar_fetch(403, None) == "auth"
+    # Incidente 26223: HTTP 0 instantâneo (CORS) com navegador no login do
+    # Keycloak → _fetch_json devolve -401 → auth (dispara re-login/MFA)
+    assert op1.classificar_fetch(-401, None) == "auth"
 
 
 def test_classificar_transiente_rede_429_5xx(op1):
@@ -108,14 +111,22 @@ def test_classificar_invalido_200_nao_lista(op1):
 @pytest.fixture()
 def scraper_cls(monkeypatch):
     """BradescoScraper sem __init__ (sem banco) — database/security mockados."""
+    # Base declarativa REAL: models.py do worker define classes ORM no import e
+    # a relação User→UserConvenio acessa UserConvenio.user_id no corpo da classe —
+    # com Base MagicMock isso quebra (AttributeError). As classes nunca tocam o
+    # banco aqui (o db da instância é mock), então Base real é seguro.
+    from sqlalchemy.orm import declarative_base
     for nome in ("database", "security_utils", "server"):
-        if nome not in sys.modules:
-            fake = types.ModuleType(nome)
-            fake.SessionLocal = MagicMock()
-            fake.Base = MagicMock()  # models.py do worker importa Base daqui
-            fake.decrypt_password = MagicMock(return_value="x")
-            fake.sel_manager = MagicMock()  # process_job importa `from server import sel_manager`
-            monkeypatch.setitem(sys.modules, nome, fake)
+        # setitem INCONDICIONAL: na suíte completa esses módulos já foram
+        # importados (versões reais do backend) — pular o mock fazia o scraper
+        # carregar decrypt/SessionLocal reais e quebrar (AUTORIZE_SEM_CREDENCIAIS).
+        # monkeypatch restaura as entradas originais no teardown.
+        fake = types.ModuleType(nome)
+        fake.SessionLocal = MagicMock()
+        fake.Base = declarative_base()
+        fake.decrypt_password = MagicMock(return_value="x")
+        fake.sel_manager = MagicMock()  # process_job importa `from server import sel_manager`
+        monkeypatch.setitem(sys.modules, nome, fake)
     monkeypatch.syspath_prepend(_WORKER_ROOT)
     mod = _carregar_modulo_isolado(_SCRAPER_PATH, "bradesco_scraper_test")
     return mod.BradescoScraper

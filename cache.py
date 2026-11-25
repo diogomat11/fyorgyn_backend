@@ -105,9 +105,17 @@ class TenantCache:
             try:
                 val = self.redis_client.get(key)
                 if val:
-                    # Promote back to Tier 1 RAM cache
+                    # Promote back to Tier 1 RAM cache. CRÍTICO: usar o TTL
+                    # RESTANTE do Redis — fixar 60s aqui fazia entradas curtas
+                    # (ex.: lista de jobs, TTL 15s) ficarem obsoletas na RAM
+                    # por até 60s mesmo depois de expiradas no Redis.
+                    try:
+                        ttl_rest = self.redis_client.ttl(key)
+                    except Exception:
+                        ttl_rest = None
+                    segundos = ttl_rest if isinstance(ttl_rest, int) and ttl_rest > 0 else 60
                     with self.lock:
-                        self.in_memory_db[key] = (time.time() + 60, val)
+                        self.in_memory_db[key] = (time.time() + segundos, val)
                     return json.loads(val)
             except Exception as e:
                 logger.error(f"Erro ao ler do Redis para chave {key}: {e}")
@@ -167,6 +175,42 @@ class TenantCache:
                     self.redis_client.delete(*keys_to_delete)
             except Exception as e:
                 logger.error(f"Erro ao invalidar cache Redis para tenant {tenant_id}: {e}")
+
+        return True
+
+    def invalidate_resource(self, tenant_id: int, resource: str) -> bool:
+        """Invalida apenas as chaves de UM recurso (ex.: 'jobs') do tenant.
+        Mais barato que invalidate_tenant e adequado quando um endpoint altera
+        um único recurso (ex.: inserção de jobs → lista de /jobs/ do modal)."""
+        if not self.enabled:
+            return False
+
+        # 1. Wipe from Tier 1 (In-Memory RAM)
+        prefix = f"tenant:{tenant_id}:{resource}:"
+        with self.lock:
+            try:
+                keys_to_del = [k for k in self.in_memory_db.keys() if k.startswith(prefix)]
+                for k in keys_to_del:
+                    self.in_memory_db.pop(k, None)
+            except Exception as e:
+                logger.error(f"Erro ao invalidar cache RAM do recurso {resource} para tenant {tenant_id}: {e}")
+
+        # 2. Wipe from Tier 2 (Redis)
+        if self.redis_enabled and self.redis_client:
+            pattern = f"tenant:{tenant_id}:{resource}:*"
+            try:
+                cursor = 0
+                keys_to_delete = []
+                while True:
+                    cursor, keys = self.redis_client.scan(cursor=cursor, match=pattern, count=100)
+                    keys_to_delete.extend(keys)
+                    if cursor == 0:
+                        break
+
+                if keys_to_delete:
+                    self.redis_client.delete(*keys_to_delete)
+            except Exception as e:
+                logger.error(f"Erro ao invalidar cache Redis do recurso {resource} para tenant {tenant_id}: {e}")
 
         return True
 

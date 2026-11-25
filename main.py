@@ -1,5 +1,6 @@
 import os
 import asyncio
+import time
 from typing import Optional
 from fastapi import FastAPI, Depends, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,8 +12,29 @@ from sqlalchemy import text
 from database import engine, Base, get_db, SessionLocal
 from services.cleanup_service import delete_expired_patients, cleanup_expired_attachments
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+
+def _create_all_com_retry(tentativas: int = 5, espera_s: float = 3.0):
+    """create_all na inicialização com retry — o pooler do Supabase tem janelas
+    de instabilidade em que a 1ª conexão morre no handshake ('SSL connection
+    has been closed unexpectedly', incidente 2026-11-21); uma única falha
+    NÃO pode impedir o backend de subir. O pool descarta a conexão quebrada
+    entre tentativas (pool_pre_ping + reciclagem)."""
+    ultimo = None
+    for i in range(1, tentativas + 1):
+        try:
+            Base.metadata.create_all(bind=engine)
+            if i > 1:
+                print(f"create_all OK na tentativa {i}/{tentativas}")
+            return
+        except Exception as e:
+            ultimo = e
+            print(f"create_all falhou (tentativa {i}/{tentativas}): {str(e)[:120]}")
+            time.sleep(espera_s * i)
+    raise ultimo
+
+
+# Create tables (com retry — ver acima)
+_create_all_com_retry()
 
 # Ensure schema migrations for WorkerApiKey new columns
 try:
@@ -72,38 +94,69 @@ async def health_check():
     # (503). Sem I/O aqui, responde direto no event loop mesmo com pool cheio.
     return {"status": "ok"}
 
-async def run_cleanup_loop():
-    while True:
-        db = None
+def _run_cleanup_once():
+    """Um ciclo do cleanup com CADA etapa isolada: erro de conexão numa etapa
+    (ex.: Supavisor matou a conexão durante o purge — 'SSL connection has been
+    closed unexpectedly', incidente 2026-11-21) não pode pular as seguintes.
+    O rollback descarta a transação quebrada; o pool_pre_ping reabre conexão
+    nova na próxima checkout."""
+    db = None
+    try:
+        db = SessionLocal()
+    except Exception as e:
+        print(f"Cleanup Loop Error (checkout): {e}")
+        return
+
+    def _etapa(nome, fn):
+        nonlocal db
         try:
-            db = SessionLocal()
-            delete_expired_patients(db)
-            cleanup_expired_attachments(db)
-            # Retenção de worker.jobs/logs (2026-08): pending stale (>24h sem
-            # processar é apagado), finalizados e logs antigos (>30d).
-            from services.retention_service import run_retention
-            resumo = run_retention(db)
+            fn(db)
+        except Exception as e:
+            print(f"Cleanup Loop Error ({nome}): {e}")
+            try: db.rollback()  # descarta transação/conexão quebrada
+            except Exception: pass
+
+    try:
+        _etapa("pacientes", delete_expired_patients)
+        _etapa("anexos", cleanup_expired_attachments)
+        # Retenção de worker.jobs/logs (2026-08): pending stale (>24h sem
+        # processar é apagado), finalizados e logs antigos (>30d).
+        from services.retention_service import run_retention
+        def _ret(db_):
+            resumo = run_retention(db_)
             if any(resumo.values()):
                 print(f"[RETENTION] {resumo}")
-            # Re-checagem de solicitações pendentes (guia 25939699): enfileira
-            # job de importação por tenant quando o status está stale — nunca lança.
-            from services.solicitacao_reconcile_service import run_reconcile_pending_solicitacoes
-            resumo_reconcile = run_reconcile_pending_solicitacoes(db)
+        _etapa("retention", _ret)
+        # Re-checagem de solicitações pendentes (guia 25939699): enfileira
+        # job de importação por tenant quando o status está stale — nunca lança.
+        from services.solicitacao_reconcile_service import run_reconcile_pending_solicitacoes
+        def _reconcile(db_):
+            resumo_reconcile = run_reconcile_pending_solicitacoes(db_)
             if resumo_reconcile.get("jobs_criados"):
                 print(f"[RECONCILE] {resumo_reconcile}")
-            # Jobs 'processing' órfãos (incidente 2026-10-23): frota morta deixava
-            # locks sem dono — o recover do dispatcher só roda com a frota viva.
-            # O hub recupera quando o job está stale E o slot não heartbeata.
-            from services.cleanup_service import reclaim_orphaned_processing_jobs
-            resumo_reclaim = reclaim_orphaned_processing_jobs(db)
+        _etapa("reconcile", _reconcile)
+        # Jobs 'processing' órfãos (incidente 2026-10-23): frota morta deixava
+        # locks sem dono — o recover do dispatcher só roda com a frota viva.
+        # O hub recupera quando o job está stale E o slot não heartbeata.
+        from services.cleanup_service import reclaim_orphaned_processing_jobs
+        def _reclaim(db_):
+            resumo_reclaim = reclaim_orphaned_processing_jobs(db_)
             if resumo_reclaim.get("reclaimed_pending") or resumo_reclaim.get("reclaimed_error"):
                 print(f"[RECLAIM] {resumo_reclaim}")
-        except Exception as e:
-            print(f"Cleanup Loop Error: {e}")
-        finally:
-            if db:
-                try: db.close()
-                except Exception: pass
+        _etapa("reclaim", _reclaim)
+    finally:
+        if db:
+            try: db.close()
+            except Exception: pass
+
+
+async def run_cleanup_loop():
+    while True:
+        # DB+Storage são I/O síncrono (psycopg2/requests): rodar direto no
+        # event loop congelava o servidor INTEIRO (inclusive /health) por
+        # ~80s a cada ciclo (incidente 2026-11-18) — to_thread devolve o
+        # loop às requisições enquanto o cleanup roda em background.
+        await asyncio.to_thread(_run_cleanup_once)
 
         await asyncio.sleep(600)  # Run every 10 minutes
 
@@ -156,7 +209,9 @@ async def startup_event():
         from services.relatorio_rm_service import resume_stuck_extractions
         db = SessionLocal()
         try:
-            resume_stuck_extractions(db)
+            # to_thread: I/O síncrono de DB não pode bloquear o event loop
+            # durante o lifespan (atrasa o bind da porta e o health check).
+            await asyncio.to_thread(resume_stuck_extractions, db)
         finally:
             db.close()
     except Exception as e:
